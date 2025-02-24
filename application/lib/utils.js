@@ -29,4 +29,10 @@
     if (!exp) return value;
     return value * 10 ** exp;
   },
+
+  async wait(delay) {
+    return new Promise((resolve) => {
+      setTimeout(() => resolve('done'), delay);
+    });
+  },
 });

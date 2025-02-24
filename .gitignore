@@ -6,3 +6,5 @@ node_modules
 *.pem
 .DS_Store
 data/
+.idea/
+.env
