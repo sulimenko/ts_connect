@@ -3,10 +3,10 @@ async ({ client, contract, changes = true }) => {
   const data = { changes };
 
   const onData = (message) => {
-    console.debug('positions:', message);
+//    console.debug('positions:', message);
     if (message.StreamStatus === undefined) {
       const position = domain.ts.positions.setPosition({ account: message.AccountID, symbol: message.Symbol, data: message });
-      console.warn('domain positions:', position);
+//      console.warn('domain positions:', position);
     }
     //  else {}
   };
