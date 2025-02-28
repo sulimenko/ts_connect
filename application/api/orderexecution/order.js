@@ -2,7 +2,7 @@
   access: 'public',
   method: async ({
     contract, // { account: 11827414, live: true }
-    symbol,
+    instrument,
     qty,
     type, // Limit, Market, StopMarket
     side, // Buy, Sell, BUYTOCOVER, SELLSHORT, BUYTOOPEN, BUYTOCLOSE, SELLTOOPEN, SELLTOCLOSE
@@ -18,12 +18,14 @@
 
     const client = await domain.ts.client.getClient({});
 
+    const action = lib.utils.getAction(contract.account, instrument, side);
+
     const data = {
       AccountID: contract.account,
-      Symbol: symbol.toUpperCase(),
+      Symbol: instrument.symbol.toUpperCase(),
       Quantity: qty.toString(),
       OrderType: type,
-      TradeAction: side,
+      TradeAction: action,
       TimeInForce: { Duration: tif },
       Route: route,
     };
@@ -35,7 +37,7 @@
       method = 'PUT';
     }
 
-    // console.log(contract, endpoint, data);
+    console.log(contract, endpoint, data);
 
     return lib.ts.send({ method, live: contract.live, endpoint, token: client.tokens.access, data });
   },
