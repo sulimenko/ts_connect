@@ -47,13 +47,6 @@
       const decoder = new TextDecoder();
       let buffer = '';
 
-      const checkTimeout = () => {
-        if (this.timeoutHeartbeat) clearTimeout(this.timeoutHeartbeat);
-        this.timeoutHeartbeat = setTimeout(() => this.scheduleReconnect(), 30000);
-      };
-
-      checkTimeout();
-
       try {
         while (true) {
           const { done, value } = await reader.read();
@@ -68,7 +61,7 @@
 
               if (data.Heartbeat !== undefined) {
                 // console.log('Heartbeat:', data);
-                checkTimeout();
+                this.checkTimeout();
               } else if (data.StreamStatus === 'GoAway') {
                 console.log('Stream termination requested by server.');
                 this.scheduleReconnect();
@@ -97,6 +90,14 @@
 
       console.warn('Stream closed unexpectedly.');
       this.scheduleReconnect();
+    },
+
+    checkTimeout() {
+      if (this.timeoutHeartbeat) clearTimeout(this.timeoutHeartbeat);
+      this.timeoutHeartbeat = setTimeout(() => {
+        console.log('timeoutHeartbeat');
+        this.scheduleReconnect();
+      }, 30000);
     },
 
     async scheduleReconnect() {
