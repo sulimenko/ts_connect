@@ -1,17 +1,14 @@
 async ({ method, domain = null, live = false, ver = 'v3', endpoint, token, data = {}, type = 'application/json' }) => {
-  if (domain === null)
-    domain = [config.ts.url.protocol, (live ? config.ts.url.live : config.ts.url.sim) + config.ts.url.domen, ver].join('/');
-
-  let url = [domain, ...endpoint].join('/');
+  if (domain === null) domain = lib.utils.constructDomain(live);
+  endpoint.unshift(ver);
+  const url = lib.utils.constructURL(method, domain, endpoint, data);
 
   const options = { method, headers: {} };
 
   if (token !== null) options.headers.Authorization = 'Bearer ' + token;
   const urlEncodedData = new URLSearchParams(data).toString();
 
-  if (method === 'GET') {
-    if (urlEncodedData) url += '?' + urlEncodedData;
-  } else if (method === 'POST') {
+  if (method === 'POST') {
     options.headers['Content-Type'] = type;
     if (type === 'application/json') {
       options.body = JSON.stringify(data);

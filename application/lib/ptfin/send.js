@@ -1,5 +1,8 @@
 async ({ method, endpoint, data = {}, type = 'application/json' }) => {
-  let url = [config.ptfin.main.url, ...endpoint].filter((e) => e !== null).join('/');
+  // let url = [, ...endpoint].filter((e) => e !== null).join('/');
+  endpoint.unshift('api','ts');
+  const url = lib.utils.constructURL(method, config.ptfin.main.url, endpoint, data);
+
   const options = {
     method,
     headers: {
@@ -7,9 +10,7 @@ async ({ method, endpoint, data = {}, type = 'application/json' }) => {
     },
   };
 
-  if (method === 'GET') {
-    url += '?' + new URLSearchParams(data).toString();
-  } else if (method === 'PUT') {
+  if (method === 'PUT') {
     options.headers['Content-Type'] = type;
     options.body = JSON.stringify(data);
   } else if (method === 'POST') {

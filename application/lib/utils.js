@@ -36,6 +36,18 @@
     });
   },
 
+  constructDomain(live) {
+    const domainPart = live ? config.ts.url.live : config.ts.url.sim;
+    // console.log(live, config.ts.url.protocol, '://', domainPart, config.ts.url.domen);
+    return new URL(config.ts.url.protocol + '://' + domainPart + config.ts.url.domen).toString();
+  },
+
+  constructURL(method, domain, endpoint, data) {
+    let url = new URL(endpoint.join('/'), domain).toString();
+    if (method === 'GET' && Object.keys(data).length > 0) url += '?' + new URLSearchParams(data).toString();
+    return url;
+  },
+
   getAction(account, instrument, side) {
     const position = domain.ts.positions.getPosition({ account, symbol: instrument.symbol });
     if (instrument.type === 'OPT') {

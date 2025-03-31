@@ -1,84 +1,126 @@
-({
-  abortController: null,
-  timeoutHeartbeat: null,
+({ domain = null, live, ver = 'v3', endpoint, tokens, data = {}, onData, onError }) => {
+  return {
+    currentParams: { domain, live, ver, endpoint, tokens, data, onData, onError },
+    reconnectDelay: 5000,
+    maxReconnectDelay: 60000,
 
-  async initiateStream({ domain = null, live, ver = 'v3', endpoint, token, data = {}, onData, onError }) {
-    this.abortController = new AbortController();
+    abortController: null,
+    timeoutHeartbeat: null,
 
-    if (domain === null)
-      domain = [config.ts.url.protocol, (live ? config.ts.url.live : config.ts.url.sim) + config.ts.url.domen, ver].join('/');
+    async initiateStream() {
+      this.abortController = new AbortController();
+      const { signal } = this.abortController;
 
-    let url = [domain, ...endpoint].join('/');
+      let { domain, live, ver, endpoint, data, tokens, onData, onError } = this.currentParams;
 
-    if (Object.keys(data).length > 0) url += '?' + new URLSearchParams(data).toString();
-    // console.warn(url, token);
-    try {
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
-        signal: this.abortController.signal,
-      });
+      if (domain === null) domain = lib.utils.constructDomain(live);
+      const ep = [ver, ...endpoint];
+      const url = lib.utils.constructURL('GET', domain, ep, data);
 
-      if (!response.ok) throw new Error(`HTTP Error: ${response.status} ${response.statusText}`);
-      console.log('Connection established:', url);
-      this.processStream(response.body.getReader(), onData, onError);
-    } catch (err) {
-      console.error('Stream error:', err);
-      onError && onError(err.message);
-      this.scheduleReconnect();
-    }
-    return () => {
-      // console.log(this.abortController.signal.aborted);
-      !this.abortController.signal.aborted ? this.abortController.abort() : console.log('signal undefined');
-    };
-  },
+      console.warn('Connecting to:', url);
+      // console.warn(tokens.access);
 
-  async processStream(reader, onData, onError) {
-    const decoder = new TextDecoder();
+      try {
+        const response = await fetch(url, {
+          method: 'GET',
+          headers: { Authorization: 'Bearer ' + tokens.access, 'Content-Type': 'application/json' },
+          signal,
+        });
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      const chunk = decoder.decode(value, { stream: true }).replace(/\r/g, '');
-      const lines = chunk.split('\n').filter(Boolean);
-      for (const line of lines) {
-        try {
-          // console.warn(line);
-          // console.warn(encodeURI(line));
-          const data = JSON.parse(line);
-
-          // if (data.StreamStatus === 'EndSnapshot') {
-          // console.log('Snapshot complete.');
-          // } else
-          if (data.Heartbeat !== undefined) {
-            // console.log('Heartbeat:', data);
-            if (this.timeoutHeartbeat) clearTimeout(this.timeoutHeartbeat);
-            this.timeoutHeartbeat = setTimeout(() => this.scheduleReconnect(), 15 * 1000);
-          } else if (data.StreamStatus === 'GoAway') {
-            console.log('Stream termination requested by server.');
-            this.scheduleReconnect();
-            return;
-          } else if (data.Error) {
-            console.error(`Stream error: ${data.Error}`);
-            onError && onError(data.Error);
-            this.scheduleReconnect();
-            return;
-          } else {
-            onData && onData(data);
-          }
-        } catch (err) {
-          console.error('Failed to parse JSON:', err, line, encodeURI(line));
+        if (!response.ok) throw new Error(`HTTP Error: ${response.status} ${response.statusText}`);
+        console.log('Connection established:', url);
+        this.processStream(response.body.getReader(), onData, onError);
+      } catch (err) {
+        if (err.name === 'AbortError') {
+          console.warn('Stream aborted gracefully.');
+          return;
         }
+        console.error('Stream error:', err);
+        onError && onError(err.message);
+        this.scheduleReconnect();
       }
-    }
-  },
 
-  // Функция для планирования перезапуска
-  async scheduleReconnect() {
-    this.abortController.abort();
-    console.log('Reconnecting...');
-    await lib.utils.wait(5000); // Задержка перед повторным подключением
-    initiateStream();
-  },
-});
+      return () => this.stopStream();
+    },
+
+    async processStream(reader, onData, onError) {
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      const checkTimeout = () => {
+        if (this.timeoutHeartbeat) clearTimeout(this.timeoutHeartbeat);
+        this.timeoutHeartbeat = setTimeout(() => this.scheduleReconnect(), 30000);
+      };
+
+      checkTimeout();
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+          for (const line of lines.filter(Boolean)) {
+            try {
+              const data = JSON.parse(line);
+
+              if (data.Heartbeat !== undefined) {
+                // console.log('Heartbeat:', data);
+                checkTimeout();
+              } else if (data.StreamStatus === 'GoAway') {
+                console.log('Stream termination requested by server.');
+                this.scheduleReconnect();
+                return;
+              } else if (data.Error) {
+                console.error('Stream error:', data.Error);
+                onError && onError(data.Error);
+                this.scheduleReconnect();
+                return;
+              } else {
+                onData && onData(data);
+              }
+            } catch (err) {
+              console.error('Failed to parse JSON:', err, line);
+            }
+          }
+        }
+      } catch (err) {
+        if (err.name === 'AbortError') {
+          console.warn('Stream read aborted.');
+          return;
+        }
+        console.error('Unexpected stream error:', err);
+        this.scheduleReconnect();
+      }
+
+      console.warn('Stream closed unexpectedly.');
+      this.scheduleReconnect();
+    },
+
+    async scheduleReconnect() {
+      this.stopStream();
+
+      console.log('Reconnecting in', this.reconnectDelay / 1000, 'seconds...');
+      await lib.utils.wait(this.reconnectDelay);
+
+      try {
+        await this.initiateStream();
+        this.reconnectDelay = 5000;
+      } catch (err) {
+        this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
+        this.scheduleReconnect();
+      }
+    },
+
+    stopStream() {
+      if (this.abortController && !this.abortController.signal.aborted) {
+        console.log('Stopping stream...');
+        this.abortController.abort();
+        this.abortController = null;
+      }
+      clearTimeout(this.timeoutHeartbeat);
+    },
+  };
+};
