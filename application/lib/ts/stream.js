@@ -1,6 +1,6 @@
-({ domain = null, live, ver = 'v3', endpoint, tokens, data = {}, onData, onError }) => {
+({ domain = null, live, ver = 'v3', endpoint, tokens, data = {}, heartbeat = false, onData, onError }) => {
   return {
-    currentParams: { domain, live, ver, endpoint, tokens, data, onData, onError },
+    currentParams: { domain, live, ver, endpoint, tokens, data, heartbeat, onData, onError },
     reconnectDelay: 5000,
     maxReconnectDelay: 60000,
 
@@ -32,10 +32,10 @@
         this.processStream(response.body.getReader(), onData, onError);
       } catch (err) {
         if (err.name === 'AbortError') {
-          console.warn('Stream aborted gracefully.');
+          console.warn('Stream aborted gracefully:', this.currentParams.endpoint.join('/'));
           return;
         }
-        console.error('Stream error:', err);
+        console.error('Stream error:', this.currentParams.endpoint.join('/'), err);
         onError && onError(err.message);
         this.scheduleReconnect();
       }
@@ -60,14 +60,18 @@
               const data = JSON.parse(line);
 
               if (data.Heartbeat !== undefined) {
-                // console.log('Heartbeat:', data);
-                this.checkTimeout();
+                if (this.currentParams.heartbeat) {
+                  // console.log('Heartbeat:', data);
+                  this.checkTimeout();
+                } else {
+                  console.log('heartbeat = false:', this.currentParams.endpoint.join('/'), data);
+                }
               } else if (data.StreamStatus === 'GoAway') {
-                console.log('Stream termination requested by server.');
+                console.log('Stream termination requested by server.', this.currentParams.endpoint.join('/'));
                 this.scheduleReconnect();
                 return;
               } else if (data.Error) {
-                console.error('Stream error:', data.Error);
+                console.error('Stream error:', this.currentParams.endpoint.join('/'), data.Error);
                 onError && onError(data.Error);
                 this.scheduleReconnect();
                 return;
@@ -75,27 +79,27 @@
                 onData && onData(data);
               }
             } catch (err) {
-              console.error('Failed to parse JSON:', err, line);
+              console.error('Failed to parse JSON:', this.currentParams.endpoint.join('/'), err, line);
             }
           }
         }
       } catch (err) {
         if (err.name === 'AbortError') {
-          console.warn('Stream read aborted.');
+          console.warn('Stream read aborted:', this.currentParams.endpoint.join('/'));
           return;
         }
-        console.error('Unexpected stream error:', err);
+        console.error('Unexpected stream error:', this.currentParams.endpoint.join('/'), err);
         this.scheduleReconnect();
       }
 
-      console.warn('Stream closed unexpectedly.');
+      console.warn('Stream closed unexpectedly:', this.currentParams.endpoint.join('/'));
       this.scheduleReconnect();
     },
 
     checkTimeout() {
       if (this.timeoutHeartbeat) clearTimeout(this.timeoutHeartbeat);
       this.timeoutHeartbeat = setTimeout(() => {
-        console.log('timeoutHeartbeat');
+        console.log('timeoutHeartbeat:', this.currentParams.endpoint.join('/'));
         this.scheduleReconnect();
       }, 30000);
     },
@@ -117,7 +121,7 @@
 
     stopStream() {
       if (this.abortController && !this.abortController.signal.aborted) {
-        console.log('Stopping stream...');
+        console.log('Stopping stream...', this.currentParams.endpoint.join('/'));
         this.abortController.abort();
         this.abortController = null;
       }
