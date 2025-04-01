@@ -59,11 +59,11 @@
           for (const line of lines.filter(Boolean)) {
             try {
               const data = JSON.parse(line);
-
               this.checkTimeout();
-              // if (data.Heartbeat !== undefined) console.log('Heartbeat:', data);
 
-              if (data.StreamStatus === 'GoAway') {
+              if (data.Heartbeat !== undefined) {
+                // console.log('Heartbeat:', data);
+              } else if (data.StreamStatus === 'GoAway') {
                 console.log('Stream termination requested by server.', this.currentParams.endpoint.join('/'));
                 this.scheduleReconnect();
                 return;
