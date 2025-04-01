@@ -26,7 +26,7 @@ async ({ name }) => {
       };
       const onError = (err) => console.error('orders:', err);
 
-      const stream = lib.ts.stream({ live: contract.live, endpoint, tokens: this.tokens, heartbeat: true, onData, onError });
+      const stream = lib.ts.stream({ live: contract.live, endpoint, tokens: this.tokens, onData, onError });
       await stream.initiateStream();
       this.streams[contract.account].orders = stream;
     },

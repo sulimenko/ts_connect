@@ -1,6 +1,6 @@
-({ domain = null, live, ver = 'v3', endpoint, tokens, data = {}, heartbeat = false, onData, onError }) => {
+({ domain = null, live, ver = 'v3', endpoint, tokens, data = {}, onData, onError }) => {
   return {
-    currentParams: { domain, live, ver, endpoint, tokens, data, heartbeat, onData, onError },
+    currentParams: { domain, live, ver, endpoint, tokens, data, onData, onError },
     reconnectDelay: 5000,
     maxReconnectDelay: 60000,
 
@@ -29,6 +29,7 @@
 
         if (!response.ok) throw new Error(`HTTP Error: ${response.status} ${response.statusText}`);
         console.log('Connection established:', url);
+        this.checkTimeout();
         this.processStream(response.body.getReader(), onData, onError);
       } catch (err) {
         if (err.name === 'AbortError') {
@@ -59,14 +60,10 @@
             try {
               const data = JSON.parse(line);
 
-              if (data.Heartbeat !== undefined) {
-                if (this.currentParams.heartbeat) {
-                  // console.log('Heartbeat:', data);
-                  this.checkTimeout();
-                } else {
-                  console.log('heartbeat = false:', this.currentParams.endpoint.join('/'), data);
-                }
-              } else if (data.StreamStatus === 'GoAway') {
+              this.checkTimeout();
+              // if (data.Heartbeat !== undefined) console.log('Heartbeat:', data);
+
+              if (data.StreamStatus === 'GoAway') {
                 console.log('Stream termination requested by server.', this.currentParams.endpoint.join('/'));
                 this.scheduleReconnect();
                 return;
