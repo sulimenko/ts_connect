@@ -5,7 +5,7 @@
     const queryString = new URLSearchParams(criteria);
     const endpoint = ['data', 'symbols', 'search', queryString.toString()];
 
-    const client = await domain.ts.client.getClient({});
+    const client = await domain.ts.clients.getClient({});
 
     return lib.ts.send({ method: 'GET', domain: url, endpoint, token: client.tokens.access });
   },

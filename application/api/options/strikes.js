@@ -7,7 +7,7 @@
       strikeInterval: Number(interval),
     };
 
-    const client = await domain.ts.client.getClient({});
+    const client = await domain.ts.clients.getClient({});
 
     return lib.ts.send({ method: 'GET', endpoint, token: client.tokens.access, data });
   },

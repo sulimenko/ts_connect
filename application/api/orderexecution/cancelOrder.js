@@ -8,7 +8,7 @@
     let method = 'DELETE';
     contract.live = contract.live === 1 || contract.live === '1' || contract.live === true || contract.live === 'true';
 
-    const client = await domain.ts.client.getClient({});
+    const client = await domain.ts.clients.getClient({});
 
     // console.log(endpoint);
     return lib.ts.send({ method, live: contract.live, endpoint, token: client.tokens.access });

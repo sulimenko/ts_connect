@@ -16,7 +16,7 @@
     let method = 'POST';
     contract.live = contract.live === 1 || contract.live === '1' || contract.live === true || contract.live === 'true';
 
-    const client = await domain.ts.client.getClient({});
+    const client = await domain.ts.clients.getClient({});
 
     const action = lib.utils.getAction(contract.account, instrument, side);
 

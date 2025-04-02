@@ -1,7 +1,7 @@
 ({
   access: 'public',
   method: async ({ contracts, orders = [], limit = null }) => {
-    const client = await domain.ts.client.getClient({});
+    const client = await domain.ts.clients.getClient({});
     const result = [];
     for (const contract of contracts) {
       contract.live = contract.live === 1 || contract.live === '1' || contract.live === true || contract.live === 'true';

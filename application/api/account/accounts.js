@@ -5,7 +5,7 @@
 
     console.log(name, live);
     const endpoint = ['brokerage', 'accounts'];
-    const client = await domain.ts.client.getClient({ name });
+    const client = await domain.ts.clients.getClient({ name });
 
     return lib.ts.send({ method: 'GET', live, endpoint, token: client.tokens.access });
   },
