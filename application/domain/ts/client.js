@@ -36,7 +36,9 @@ async ({ name }) => {
 
       const onData = (message) => {
         // console.debug('positions:', message);
-        lib.ptfin.send({ method: 'POST', endpoint: ['response'], data: { type: 'position', data: message } });
+        if (message.StreamStatus === undefined) {
+          const position = domain.ts.positions.setPosition({ account: message.AccountID, symbol: message.Symbol, data: message });
+        }
       };
       const onError = (err) => console.error('positions:', err);
 

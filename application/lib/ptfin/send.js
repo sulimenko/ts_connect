@@ -1,6 +1,6 @@
 async ({ method, endpoint, data = {}, type = 'application/json' }) => {
   // let url = [, ...endpoint].filter((e) => e !== null).join('/');
-  endpoint.unshift('api','ts');
+  endpoint.unshift('api', 'ts');
   const url = lib.utils.constructURL(method, config.ptfin.main.url, endpoint, data);
 
   const options = {
@@ -18,7 +18,7 @@ async ({ method, endpoint, data = {}, type = 'application/json' }) => {
     if (type === 'application/json') options.body = JSON.stringify(data);
   }
 
-  // console.log(url, options);
+  // console.log('ptfin send:', url, method, JSON.stringify(options));
 
   const res = await fetch(url, options);
   return res.status === 200 ? res.json() : res.text();
