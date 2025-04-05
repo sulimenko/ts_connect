@@ -51,20 +51,24 @@
   getAction(account, instrument, side) {
     const position = domain.ts.positions.getPosition({ account, symbol: instrument.symbol });
     if (instrument.type === 'OPT') {
-      if (position.Quantity === undefined || parseFloat(position.Quantity) === 0.0) {
+      if (position.get('Quantity') === undefined || parseFloat(position.get('Quantity')) === 0.0) {
         return side === 'Buy' ? 'BUYTOOPEN' : 'SELLTOOPEN';
       }
-      const isLong = parseFloat(position.Quantity) > 0;
+      const isLong = parseFloat(position.get('Quantity')) > 0;
       if (side === 'Buy') {
         return isLong ? 'BUYTOOPEN' : 'BUYTOCLOSE';
       } else {
         return isLong ? 'SELLTOCLOSE' : 'SELLTOOPEN';
       }
     } else if (instrument.type === 'STK') {
-      if (position.Quantity === undefined || parseFloat(position.Quantity) === 0.0) {
+      // console.log(position);
+      // console.log(side);
+      if (position.get('Quantity') === undefined || parseFloat(position.get('Quantity')) === 0.0) {
+        // console.log(position.get('Quantity'), position.get('Quantity') === undefined, parseFloat(position.get('Quantity')) === 0.0);
         return side === 'Buy' ? side : 'SELLSHORT';
       }
-      const isLong = parseFloat(position.Quantity) > 0;
+      const isLong = parseFloat(position.get('Quantity')) > 0;
+      // console.log('isLong:', isLong);
       if (side === 'Buy') {
         return isLong ? side : 'BUYTOCOVER';
       } else {
