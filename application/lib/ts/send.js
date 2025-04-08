@@ -19,7 +19,7 @@ async ({ method, domain = null, live = false, ver = 'v3', endpoint, token, data 
     }
 
     console.debug('Request URL:', url);
-    console.debug('Request Options:', options);
+    // console.debug('Request Options:', options);
 
     const res = await fetch(url, options);
     if (res.ok) {
