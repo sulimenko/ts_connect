@@ -56,12 +56,14 @@
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split('\n');
           buffer = lines.pop();
+
           for (const line of lines.filter(Boolean)) {
             try {
               const data = JSON.parse(line);
               this.checkTimeout();
 
               if (data.Heartbeat !== undefined) {
+                // Heartbeat received, no action needed
                 // console.log('Heartbeat:', data);
               } else if (data.StreamStatus === 'GoAway') {
                 console.log('Stream termination requested by server.', this.currentParams.endpoint.join('/'));
@@ -69,11 +71,11 @@
                 return;
               } else if (data.Error) {
                 console.error('Stream error:', this.currentParams.endpoint.join('/'), data.Error);
-                onError && onError(data.Error);
+                if (onError) onError(data.Error);
                 this.scheduleReconnect();
                 return;
               } else {
-                onData && onData(data);
+                if (onData) onData(data);
               }
             } catch (err) {
               console.error('Failed to parse JSON:', this.currentParams.endpoint.join('/'), err, line);
@@ -109,8 +111,9 @@
 
       try {
         await this.initiateStream();
-        this.reconnectDelay = 5000;
+        this.reconnectDelay = 5000; // Reset delay on successful reconnect
       } catch (err) {
+        console.error('Reconnect failed:', err);
         this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
         this.scheduleReconnect();
       }
