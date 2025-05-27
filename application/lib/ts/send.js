@@ -13,6 +13,7 @@ async ({ method, domain = null, live = false, ver = 'v3', endpoint, token, data 
       options.headers['Content-Type'] = type;
       if (type === 'application/json') {
         options.body = JSON.stringify(data);
+        // options.json = true;
       } else if (type === 'application/x-www-form-urlencoded') {
         options.body = urlEncodedData;
       }
@@ -32,6 +33,6 @@ async ({ method, domain = null, live = false, ver = 'v3', endpoint, token, data 
     }
   } catch (error) {
     console.error('Error in send function:', error);
-    throw error; // Пробрасываем ошибку для дальнейшей обработки
+    throw error;
   }
 };
