@@ -6,7 +6,7 @@
     qty,
     type, // Limit, Market, StopMarket
     side, // Buy, Sell
-    tif = 'GTC', // GTC, Day, IOC
+    tif = 'GTC', // GTC, Day, IOC, GCP
     route = 'Intelligent',
     limit_price = null,
     stop_price = null,
@@ -41,7 +41,7 @@
         const { AccountID, Symbol, Quantity, Route } = data;
         const relatedOrder = { AccountID, Symbol, Quantity, Route };
         relatedOrder.TradeAction = lib.utils.getOppositActions(instrument, action);
-        relatedOrder.TimeInForce = { Duration: 'GTC+' };
+        relatedOrder.TimeInForce = { Duration: 'GTC' };
         if (brk.type === 'limit') {
           relatedOrder.OrderType = 'Limit';
           relatedOrder.LimitPrice = brk.limit_price.toString();
@@ -59,7 +59,7 @@
       method = 'PUT';
     }
 
-    console.log(contract, endpoint, data);
+    console.log(contract, endpoint, JSON.stringify(data));
 
     return lib.ts.send({ method, live: contract.live, endpoint, token: client.tokens.access, data });
   },
