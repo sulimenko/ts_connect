@@ -63,6 +63,28 @@
     }
   },
 
+  getOppositActions(instrument, action) {
+    if (instrument.type === 'STK') {
+      const groupActions = [
+        ['Buy', 'Sell'],
+        ['SELLSHORT', 'BUYTOCOVER'],
+      ];
+      for (const actions of groupActions) {
+        if (actions.includes(action)) return action === actions[0] ? actions[1] : actions[0];
+      }
+    }
+    if (instrument.type === 'OPT') {
+      const groupActions = [
+        ['BUYTOOPEN', 'SELLTOCLOSE'],
+        ['SELLTOOPEN', 'BUYTOCLOSE'],
+      ];
+      for (const actions of groupActions) {
+        if (actions.includes(action)) return action === actions[0] ? actions[1] : actions[0];
+      }
+    }
+    return null;
+  },
+
   getAction(account, instrument, side) {
     try {
       const position = domain.ts.positions.getPosition({ account, symbol: instrument.symbol });
