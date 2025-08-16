@@ -85,36 +85,33 @@
     return null;
   },
 
-  getAction(account, instrument, side) {
+  getAction(account, instrument, quantity) {
     try {
       const position = domain.ts.positions.getPosition({ account, symbol: instrument.symbol });
-      if (instrument.type === 'OPT') {
-        if (position.get('Quantity') === undefined || parseFloat(position.get('Quantity')) === 0.0) {
-          return side === 'Buy' ? 'BUYTOOPEN' : 'SELLTOOPEN';
-        }
-        const isLong = parseFloat(position.get('Quantity')) > 0;
-        if (side === 'Buy') {
-          return isLong ? 'BUYTOOPEN' : 'BUYTOCLOSE';
-        } else {
-          return isLong ? 'SELLTOCLOSE' : 'SELLTOOPEN';
-        }
-      } else if (instrument.type === 'STK') {
-        // console.log(position);
-        // console.log(side);
-        if (position.get('Quantity') === undefined || parseFloat(position.get('Quantity')) === 0.0) {
-          // console.log(position.get('Quantity'), position.get('Quantity') === undefined, parseFloat(position.get('Quantity')) === 0.0);
-          return side === 'Buy' ? side : 'SELLSHORT';
-        }
-        const isLong = parseFloat(position.get('Quantity')) > 0;
-        // console.log('isLong:', isLong);
-        if (side === 'Buy') {
-          return isLong ? side : 'BUYTOCOVER';
-        } else {
-          return isLong ? side : 'SELLSHORT';
-        }
-      }
+      const currentQuantity = parseFloat(position.get('Quantity')) || 0.0;
+      const currentLong = currentQuantity > 0;
+      const isBuy = quantity > 0;
 
-      return side;
+      const newQuantity = currentQuantity + quantity;
+      const isSignChanged = currentQuantity * newQuantity < 0;
+      // if (newQuantity === 0.0) {
+      //   domain.ts.positions.clearPosition({ account, symbol: instrument.symbol });
+      // } else {
+      //   position.set('Quantity', newQuantity);
+      // }
+
+      if (instrument.type === 'OPT') {
+        if (currentQuantity === 0.0) return isBuy ? 'BUYTOOPEN' : 'SELLTOOPEN';
+        if (isSignChanged) return isBuy ? 'BUYTOOPEN' : 'SELLTOOPEN'; // EC804: Boxed positions are not permitted. To close long position, try a \"Sell\" order.
+        if (isBuy) return currentLong ? 'BUYTOOPEN' : 'BUYTOCLOSE';
+        return currentLong ? 'SELLTOCLOSE' : 'SELLTOOPEN';
+      } else if (instrument.type === 'STK') {
+        if (currentQuantity === 0.0) return isBuy ? 'Buy' : 'SELLSHORT';
+        if (isSignChanged) return isBuy ? 'Buy' : 'SELLSHORT'; // EC804: Boxed positions are not permitted. To close long position, try a \"Sell\" order.
+        if (isBuy) return currentLong ? 'Buy' : 'BUYTOCOVER';
+        return currentLong ? 'Sell' : 'SELLSHORT';
+      }
+      return isBuy ? 'Buy' : 'Sell';
     } catch (error) {
       console.error('Error in getAction:', error);
       throw new Error('Invalid action determination');

@@ -5,7 +5,7 @@
     instrument,
     qty,
     type, // Limit, Market, StopMarket
-    side, // Buy, Sell
+    // side, // Buy, Sell
     tif = 'GTC', // GTC, Day, IOC, GCP
     route = 'Intelligent',
     limit_price = null,
@@ -13,54 +13,31 @@
     related = null,
     orderId = null,
   }) => {
-    let endpoint = ['orderexecution', 'orders'];
-    let method = 'POST';
-    contract.live = contract.live === 1 || contract.live === '1' || contract.live === true || contract.live === 'true';
-
-    const client = await domain.ts.clients.getClient({});
-
-    const action = lib.utils.getAction(contract.account, instrument, side);
+    const live = contract.live === 1 || contract.live === '1' || contract.live === true || contract.live === 'true';
+    qty = parseInt(qty);
 
     const data = {
       AccountID: contract.account,
       Symbol: instrument.symbol.toUpperCase(),
-      Quantity: qty.toString(),
+      // Quantity: parseInt(qty),
       OrderType: type,
-      TradeAction: action,
       TimeInForce: { Duration: tif },
       Route: route,
     };
 
     if (limit_price) data.LimitPrice = limit_price.toString();
     if (stop_price && typeof stop_price === 'number') data.StopPrice = stop_price.toString();
-    if (related && related.type === 'brk') {
-      console.debug(related);
-      data.OSOs = [];
-      const relatedOrders = { type: related.type.toUpperCase(), Orders: [] };
-      for (const brk of related.orders) {
-        const { AccountID, Symbol, Quantity, Route } = data;
-        const relatedOrder = { AccountID, Symbol, Quantity, Route };
-        relatedOrder.TradeAction = lib.utils.getOppositActions(instrument, action);
-        relatedOrder.TimeInForce = { Duration: 'GTC' };
-        if (brk.type === 'limit') {
-          relatedOrder.OrderType = 'Limit';
-          relatedOrder.LimitPrice = brk.limit_price.toString();
-        } else if (brk.type === 'stop') {
-          relatedOrder.OrderType = 'StopMarket';
-          relatedOrder.StopPrice = brk.stop_price.toString();
-        }
-        relatedOrders.Orders.push(relatedOrder);
-      }
-      data.OSOs.push(relatedOrders);
-    }
 
-    if (orderId && typeof orderId === 'string') {
-      endpoint.put(orderId);
-      method = 'PUT';
-    }
+    // return lib.ts.send({ method, live: contract.live, endpoint, token: client.tokens.access, data });
+    const response = await lib.ts.placeorder({ data, qty, instrument, live, related, orderId });
 
-    console.log(contract, endpoint, JSON.stringify(data));
+    const check = !response.Orders.some((order) => {
+      order.Error === 'FAILED' && order.Message && order.Message.includes('Order failed. Reason: You are');
+    });
+    if (check) return response;
 
-    return lib.ts.send({ method, live: contract.live, endpoint, token: client.tokens.access, data });
+    console.error('order', instrument.symbol, qty, type, JSON.stringify(related), JSON.stringify(response.Orders));
+    await api.account.positions({ contracts: [contract] });
+    return lib.ts.placeorder({ data, qty, instrument, live, related, orderId });
   },
 });
