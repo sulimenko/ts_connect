@@ -77,6 +77,6 @@
   },
   async send({ endpoint, data }, finish) {
     this.sent++;
-    finish(null, await lib.ptfin.sendPost({ method: 'POST', endpoint, data }));
+    finish(null, await lib.ptfin.send({ method: 'POST', endpoint, data }));
   },
 });

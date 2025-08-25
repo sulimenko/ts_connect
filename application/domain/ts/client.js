@@ -27,7 +27,7 @@ async ({ name }) => {
 
         const onData = (message) => {
           console.debug('orders:', message);
-          domain.ptfin.queue.addTask({ endpoint: ['response'], data: { type: 'order', data: message } });
+          domain.queue.addTask({ endpoint: ['response'], data: { type: 'order', data: message } });
           // lib.ptfin.send({ method: 'POST', endpoint: ['response'], data: { type: 'order', data: message } });
         };
 
