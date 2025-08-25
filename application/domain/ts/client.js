@@ -27,7 +27,8 @@ async ({ name }) => {
 
         const onData = (message) => {
           console.debug('orders:', message);
-          lib.ptfin.send({ method: 'POST', endpoint: ['response'], data: { type: 'order', data: message } });
+          domain.ptfin.queue.addTask({ endpoint: ['response'], data: { type: 'order', data: message } });
+          // lib.ptfin.send({ method: 'POST', endpoint: ['response'], data: { type: 'order', data: message } });
         };
 
         const onError = (err) => console.error('Stream orders error:', err);
