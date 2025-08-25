@@ -1,4 +1,4 @@
-FROM node:22.11.0-alpine
+FROM node:22.18.0-alpine
 WORKDIR /usr/server
 COPY package*.json .
 RUN apk add --no-cache git

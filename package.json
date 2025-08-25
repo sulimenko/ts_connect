@@ -1,45 +1,31 @@
 {
-  "name": "metarhia",
-  "version": "3.0.0",
-  "author": "Timur Shemsedinov <timur.shemsedinov@gmail.com>",
-  "description": "Metarhia Application Example",
-  "license": "MIT",
+  "name": "ts_connect",
+  "version": "1.0.0",
+  "author": "Alexey Sulimenko sulimenkoas@gmail.com>",
+  "description": "Connector for TradeStation API",
+  "contributors": [
+    "Alexey Sulimenko <sulimenkoas@gmail.com>"
+  ],
+  "license": "UNLICENSED",
+  "private": true,
   "keywords": [
-    "metarhia",
-    "starter",
-    "kit",
-    "cloud",
-    "impress",
-    "nodejs",
-    "example",
-    "websocket",
+    "trading",
     "api",
-    "application",
-    "server",
+    "connector",
+    "tradingstation",
+    "websocket",
     "rpc",
-    "soa",
-    "service",
-    "stateful",
-    "rest",
-    "restful",
-    "web",
-    "framework",
-    "router",
-    "routing",
-    "cluster",
-    "cache",
-    "http",
-    "https",
-    "websockets"
+    "internal",
+    "proprietary"
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/metarhia/Example"
+    "url": "https://github.com/sulimenko/ts_connect"
   },
   "bugs": {
-    "url": "https://github.com/metarhia/Example/issues"
+    "url": "https://github.com/sulimenko/ts_connect/issues"
   },
-  "homepage": "https://github.com/metarhia/Example",
+  "homepage": "https://github.com/sulimenko/ts_connect",
   "main": "server.js",
   "types": "types/global.d.ts",
   "scripts": {
@@ -55,15 +41,15 @@
     "node": "18 || 20 || 21 || 22"
   },
   "devDependencies": {
-    "@types/node": "^22.5.1",
-    "@types/ws": "^8.5.12",
-    "eslint": "^9.9.1",
-    "eslint-config-metarhia": "^9.0.5",
-    "prettier": "^3.3.3",
-    "typescript": "^5.5.4"
+    "@types/node": "^24.3.0",
+    "@types/ws": "^8.18.1",
+    "eslint": "^9.32.0",
+    "eslint-config-metarhia": "^9.1.2",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.2"
   },
   "dependencies": {
-    "impress": "^3.0.16",
-    "redis": "^4.7.0"
+    "impress": "^3.0.18",
+    "redis": "^5.8.2"
   }
 }
