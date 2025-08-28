@@ -19,13 +19,18 @@
   onDone: null,
   onDrain() {
     console.warn('send drain. size:', this.size, 'sent:', this.sent);
+    // console.warn('send drain. queue:', JSON.stringify(this.queue));
     this.size = 0;
     this.sent = 0;
   },
-  addTask(task) {
-    this.queue.push({ task, start: Date.now() });
-    this.size++;
-    if (this.queue.length === 1) this.takeNext();
+  finish(error, res) {
+    if (error) {
+      if (this.onFailure) this.onFailure(error, res);
+    } else if (this.onSuccess) {
+      this.onSuccess(res);
+    }
+    if (this.onDone) this.onDone(error, res);
+    if (this.count === 0 && this.onDrain) this.onDrain();
   },
   next(task) {
     this.count++;
@@ -56,27 +61,22 @@
       if (Date.now() - start > this.waitTimeout) {
         const error = new Error('Waiting timed out');
         this.finish(error, task);
-        if (this.queue.length > 0) {
-          setTimeout(() => {
-            if (this.queue.length > 0) this.takeNext();
-          }, 0);
-        }
+        if (this.queue.length > 0) setTimeout(() => { if (this.queue.length > 0) this.takeNext(); }, 0);
         return;
       }
     }
     if (this.count < this.concurrency) this.next(task);
+    else this.queue.unshift({ task, start: Date.now() });
   },
-  finish(error, res) {
-    if (error) {
-      if (this.onFailure) this.onFailure(error, res);
-    } else if (this.onSuccess) {
-      this.onSuccess(res);
-    }
-    // if (this.onDone) this.onDone(error, res);
-    if (this.count === 0 && this.onDrain) this.onDrain();
+  addTask(task) {
+    this.queue.push({ task, start: Date.now() });
+    this.size++;
+    // console.log('send addTask. size:', this.size, 'OrderID', task.data.data.OrderID)
+    if (this.queue.length === 1) this.takeNext();
   },
   async send({ endpoint, data }, finish) {
     this.sent++;
+    // console.log('send sent:', this.sent, 'OrderID', data.data.OrderID)
     finish(null, await lib.ptfin.send({ method: 'POST', endpoint, data }));
   },
 });

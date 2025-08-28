@@ -26,7 +26,9 @@ async ({ name }) => {
         if (ordersIds.length > 0) endpoint.push(ordersIds.join(','));
 
         const onData = (message) => {
-          console.debug('orders:', message);
+          if (message.StreamStatus && message.StreamStatus === 'EndSnapshot') return;
+          if (message.StreamStatus) console.debug('streamOrders onData:', message);
+          console.debug('orders:', message.OrderID ?? message);
           domain.queue.addTask({ endpoint: ['response'], data: { type: 'order', data: message } });
           // lib.ptfin.send({ method: 'POST', endpoint: ['response'], data: { type: 'order', data: message } });
         };
