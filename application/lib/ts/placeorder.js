@@ -7,7 +7,16 @@ async ({ data, qty, instrument, live, related = null, orderId = null }) => {
     method = 'PUT';
   }
 
-  data.TradeAction = lib.utils.getAction(data.AccountID, instrument, qty);
+  let current = 0.0;
+  try {
+    const position = domain.ts.positions.getPosition({ account, symbol: instrument.symbol });
+    current = parseFloat(position.get('Quantity')) || 0.0;
+  } catch (error) {
+    console.error('Error in getAction:', error);
+    throw new Error('Invalid action determination');
+  }
+
+  data.TradeAction = lib.utils.getAction(instrument, qty, current);
   data.Quantity = Math.abs(qty).toString();
 
   if (related && related.type === 'brk') {
@@ -30,9 +39,13 @@ async ({ data, qty, instrument, live, related = null, orderId = null }) => {
     data.OSOs.push(relatedOrders);
   }
 
-
   console.warn('placeorder', JSON.stringify(endpoint), JSON.stringify(data));
 
   const client = await domain.ts.clients.getClient({});
-  return lib.ts.send({ method, live, endpoint, token: client.tokens.access, data });
+  response = await lib.ts.send({ method, live, endpoint, token: client.tokens.access, data });
+  if (current + qty === 0.0) {
+    domain.ts.positions.clearPosition({ account, symbol: instrument.symbol });
+    api.account.positions({ contracts: [contract] });
+  }
+  return response;
 };

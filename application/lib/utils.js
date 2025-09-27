@@ -85,36 +85,24 @@
     return null;
   },
 
-  getAction(account, instrument, quantity) {
-    try {
-      const position = domain.ts.positions.getPosition({ account, symbol: instrument.symbol });
-      const currentQuantity = parseFloat(position.get('Quantity')) || 0.0;
-      const currentLong = currentQuantity > 0;
-      const isBuy = quantity > 0;
+  getAction(instrument, quantity, current = 0.0) {
+    const currentLong = current > 0;
+    const isBuy = quantity > 0;
 
-      const newQuantity = currentQuantity + quantity;
-      const isSignChanged = currentQuantity * newQuantity < 0;
-      // if (newQuantity === 0.0) {
-      //   domain.ts.positions.clearPosition({ account, symbol: instrument.symbol });
-      // } else {
-      //   position.set('Quantity', newQuantity);
-      // }
+    const newQuantity = current + quantity;
+    const isSignChanged = current * newQuantity < 0;
 
-      if (instrument.type === 'OPT') {
-        if (currentQuantity === 0.0) return isBuy ? 'BUYTOOPEN' : 'SELLTOOPEN';
-        if (isSignChanged) return isBuy ? 'BUYTOOPEN' : 'SELLTOOPEN'; // EC804: Boxed positions are not permitted. To close long position, try a \"Sell\" order.
-        if (isBuy) return currentLong ? 'BUYTOOPEN' : 'BUYTOCLOSE';
-        return currentLong ? 'SELLTOCLOSE' : 'SELLTOOPEN';
-      } else if (instrument.type === 'STK') {
-        if (currentQuantity === 0.0) return isBuy ? 'Buy' : 'SELLSHORT';
-        if (isSignChanged) return isBuy ? 'Buy' : 'SELLSHORT'; // EC804: Boxed positions are not permitted. To close long position, try a \"Sell\" order.
-        if (isBuy) return currentLong ? 'Buy' : 'BUYTOCOVER';
-        return currentLong ? 'Sell' : 'SELLSHORT';
-      }
-      return isBuy ? 'Buy' : 'Sell';
-    } catch (error) {
-      console.error('Error in getAction:', error);
-      throw new Error('Invalid action determination');
+    if (instrument.type === 'OPT') {
+      if (current === 0.0) return isBuy ? 'BUYTOOPEN' : 'SELLTOOPEN';
+      if (isSignChanged) return isBuy ? 'BUYTOOPEN' : 'SELLTOOPEN'; // EC804: Boxed positions are not permitted. To close long position, try a \"Sell\" order.
+      if (isBuy) return currentLong ? 'BUYTOOPEN' : 'BUYTOCLOSE';
+      return currentLong ? 'SELLTOCLOSE' : 'SELLTOOPEN';
+    } else if (instrument.type === 'STK') {
+      if (current === 0.0) return isBuy ? 'Buy' : 'SELLSHORT';
+      if (isSignChanged) return isBuy ? 'Buy' : 'SELLSHORT'; // EC804: Boxed positions are not permitted. To close long position, try a \"Sell\" order.
+      if (isBuy) return currentLong ? 'Buy' : 'BUYTOCOVER';
+      return currentLong ? 'Sell' : 'SELLSHORT';
     }
+    return isBuy ? 'Buy' : 'Sell';
   },
 });
