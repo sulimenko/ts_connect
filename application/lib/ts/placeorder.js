@@ -1,6 +1,7 @@
 async ({ data, qty, instrument, live, related = null, orderId = null }) => {
   let method = 'POST';
   let endpoint = ['orderexecution', 'orders'];
+  const account = data.AccountID;
 
   if (orderId && typeof orderId === 'string') {
     endpoint.put(orderId);
@@ -45,7 +46,7 @@ async ({ data, qty, instrument, live, related = null, orderId = null }) => {
   response = await lib.ts.send({ method, live, endpoint, token: client.tokens.access, data });
   if (current + qty === 0.0) {
     domain.ts.positions.clearPosition({ account, symbol: instrument.symbol });
-    api.account.positions({ contracts: [contract] });
+    // api.account.positions({ contracts: [contract] });
   }
   return response;
 };
