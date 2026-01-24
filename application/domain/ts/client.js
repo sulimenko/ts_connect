@@ -3,7 +3,14 @@ async ({ name }) => {
     key: { pkey: null, secret: null },
     tokens: { id: null, access: null, expires: null, refresh: null },
     timers: { rtoken: null },
-    streams: {},
+    streams: {
+      charts: {},
+      chains: {},
+      quotes: {},
+      orders: {},
+      positions: {},
+      matrix: {},
+    },
 
     lifetime: function () {
       clearTimeout(this.timers.rtoken);
@@ -65,6 +72,56 @@ async ({ name }) => {
         this.streams[contract.account].positions = stream;
       } catch (error) {
         console.error('Error in streamPositions:', error);
+      }
+    },
+    streamMatrix: async function ({ endpoint, symbol, data, onData, onError }) {
+      try {
+        const key = symbol.toUpperCase() + '_' + Object.values(data).join('_');
+
+        const stream = lib.ts.stream({ live: true, ver: 'v2', endpoint, tokens: this.tokens, data, onData, onError });
+        await stream.initiateStream();
+        this.streams.matrix[key] = stream;
+      } catch (error) {
+        console.error('Error in stream matrix:', error);
+      }
+    },
+    streamChains: async function ({ endpoint, symbol, data, onData, onError }) {
+      try {
+        const key = symbol.toUpperCase() + '_' + data.expiration;
+        if (this.streams.chains[key] !== undefined) {
+          console.warn('Stream chain already exists for key:', key);
+          await this.streams.chains[key].stopStream();
+          delete this.streams.chains[key];
+        }
+
+        const stream = lib.ts.stream({ live: true, endpoint, tokens: this.tokens, data, onData, onError });
+        await stream.initiateStream();
+        this.streams.chains[key] = stream;
+        return key;
+      } catch (error) {
+        console.error('Error in stream chain:', error);
+      }
+    },
+    streamQuotes: async function ({ endpoint, onData, onError }) {
+      try {
+        const key = endpoint.at(-1);
+
+        const stream = lib.ts.stream({ live: true, endpoint, tokens: this.tokens, onData, onError });
+        await stream.initiateStream();
+        this.streams.quotes[key] = stream;
+      } catch (error) {
+        console.error('Error in stream quotes:', error);
+      }
+    },
+    streamCharts: async function ({ endpoint, symbol, data, onData, onError }) {
+      try {
+        const key = symbol.toUpperCase() + '_' + Object.values(data).join('_');
+
+        const stream = lib.ts.stream({ live: true, endpoint, tokens: this.tokens, data, onData, onError });
+        await stream.initiateStream();
+        this.streams.charts[key] = stream;
+      } catch (error) {
+        console.error('Error in stream charts:', error);
       }
     },
   };

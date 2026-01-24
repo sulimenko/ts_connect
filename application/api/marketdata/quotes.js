@@ -5,6 +5,6 @@
 
     const client = await domain.ts.clients.getClient({});
 
-    return lib.ts.send({ method: 'GET', endpoint, token: client.tokens.access });
+    return lib.ts.send({ method: 'GET', live: true, endpoint, token: client.tokens.access });
   },
 });

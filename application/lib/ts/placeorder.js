@@ -43,7 +43,7 @@ async ({ data, qty, instrument, live, related = null, orderId = null }) => {
   console.warn('placeorder', JSON.stringify(endpoint), JSON.stringify(data));
 
   const client = await domain.ts.clients.getClient({});
-  response = await lib.ts.send({ method, live, endpoint, token: client.tokens.access, data });
+  const response = await lib.ts.send({ method, live, endpoint, token: client.tokens.access, data });
   if (current + qty === 0.0) {
     domain.ts.positions.clearPosition({ account, symbol: instrument.symbol });
     // api.account.positions({ contracts: [contract] });

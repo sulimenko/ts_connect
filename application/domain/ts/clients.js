@@ -1,8 +1,8 @@
 ({
-  storage: new Map(),
-  delClient: function ({ name }) {
+  values: {},
+  deleteClient: function ({ name }) {
     console.log('deleteClient:', name);
-    const client = this.storage.get(name);
+    const client = this.values[name];
     if (client) {
       for (const key of Object.keys(client.timers)) clearTimeout(client.timers[key]);
       if (client.streams) {
@@ -13,12 +13,12 @@
         }
       }
     }
-    this.storage.delete(name);
+    delete this.values[name];
+    return true;
   },
-  setClient: async function ({ name, update = false }) {
+  setClient: async function ({ name }) {
     console.log('setClient:', name);
     const client = await domain.ts.client({ name });
-
     if (config.ts[name] === undefined) return null;
 
     client.tokens.refresh = config.ts[name].rtoken;
@@ -28,13 +28,14 @@
     await lib.ts.refresh({ client });
     client.lifetime();
     // console.log(client);
-    return this.storage.set(name, client).get(name);
+    this.values[name] = client;
+    return this.values[name];
   },
   getClient: async function ({ name = 'ptfin', update = false }) {
-    name = name ?? 'ptfin';
-    if (update) this.delClient({ name });
-    let client = this.storage.get(name);
-    if (!client) client = await this.setClient({ name, update });
+    if (update) this.deleteClient({ name });
+    let client = this.values[name];
+    if (client) return client;
+    client = await this.setClient({ name });
     return client;
   },
 });

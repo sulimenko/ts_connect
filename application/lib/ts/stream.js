@@ -84,7 +84,7 @@
         }
       } catch (err) {
         if (err.name === 'AbortError') {
-          console.warn('Stream read aborted:', this.currentParams.endpoint.join('/'));
+          console.warn('Stream stopped gracefully:', this.currentParams.endpoint.join('/'));
           return;
         }
         console.error('Unexpected stream error:', this.currentParams.endpoint.join('/'), err);

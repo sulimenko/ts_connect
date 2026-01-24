@@ -1,7 +1,7 @@
 ({
   access: 'public',
-  method: async ({ instrument, period = 3600, limit = 1000 }) => {
-    const endpoint = ['marketdata', 'barcharts', lib.utils.makeTSSymbol(instrument.symbol, instrument.asset_category)];
+  method: async ({ symbol, period = 3600, limit = 1000 }) => {
+    const endpoint = ['marketdata', 'stream', 'barcharts', symbol.toUpperCase()];
     let interval = '1';
     let unit = 'Minute';
     if (period < 86400) interval = (period / 60).toString();
@@ -18,8 +18,14 @@
       sessiontemplate: 'USEQ24Hour', // `USEQPre`, `USEQPost`, `USEQPreAndPost`, `USEQ24Hour`,`Default`.
     };
 
+    const onData = (message) => {
+      console.debug('stream chart ' + symbol + ':', message);
+    };
+    const onError = (err) => console.error('stream chart error:', err);
+
     const client = await domain.ts.clients.getClient({});
 
-    return lib.ts.send({ method: 'GET', endpoint, live: true, token: client.tokens.access, data });
+    client.streamCharts({ endpoint, symbol, data, onData, onError });
+    return ['ok'];
   },
 });
