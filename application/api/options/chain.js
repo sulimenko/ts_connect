@@ -1,37 +1,83 @@
 ({
   access: 'public',
-  method: async ({ symbol, expiration, range = 0, stream = false, stop = false }) => {
-    const endpoint = ['marketdata', 'stream', 'options', 'chains', symbol.toUpperCase()];
-    // if (range === null) {
-    //   const strikes = await api.options.strikes({ symbol, expiration });
-    //   range = Math.ceil(strikes.Strikes.length / 2);
-    // }
+  parameters: 'json',
+  returns: 'json',
+  errors: {
+    EACTION: 'Invalid action: expected "subscribe", "unsubscribe", or "touch"',
+    ESPREADTYPE: 'Unsupported spreadType: only "Single" is supported',
+    ESYMBOL: 'Symbol is required for snapshot requests and for stream subscribe',
+  },
 
-    console.debug('range:', range);
-    const data = {
-      expiration,
-      strikeProximity: range,
+  method: async ({
+    symbol = null,
+    expiration = null,
+    expiration2 = null,
+    range = 0,
+    stream = false,
+    stop = false,
+    action = null,
+    streamKey = null,
+    idleMs = null,
+    spreadType = 'Single',
+    riskFreeRate = null,
+    priceCenter = null,
+    strikeInterval = 1,
+    enableGreeks = true,
+    strikeRange = 'All',
+    optionType = 'All',
+  }) => {
+    const actionSet = new Set(['subscribe', 'unsubscribe', 'touch']);
+    const toBoolean = (value) => value === true || value === 'true' || value === 1 || value === '1';
+    const toNumber = (value) => {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    };
+    const actionValue = lib.utils.normalizeAction({ action, stop });
+    const spreadValue = typeof spreadType === 'string' ? spreadType.trim() : spreadType;
+    const chainKey = typeof streamKey === 'string' ? streamKey.trim() || null : null;
+
+    if (actionValue !== null && !actionSet.has(actionValue)) return new DomainError('EACTION');
+    if (spreadValue !== 'Single') return new DomainError('ESPREADTYPE');
+
+    const chainSymbol = typeof symbol === 'string' ? symbol.trim().toUpperCase() : '';
+    const streamMode = toBoolean(stream) || actionValue !== null;
+    const symbolRequired = !actionValue || actionValue === 'subscribe';
+    if (!chainSymbol && (symbolRequired || !chainKey)) return new DomainError('ESYMBOL');
+
+    const proximity = Math.max(0, Number(range) || 0);
+    const interval = Math.max(1, Number(strikeInterval) || 1);
+    const chainData = {
+      strikeProximity: proximity,
       spreadType: 'Single',
-      strikeInterval: 1,
-      enableGreeks: true,
-      strikeRange: 'All',
-      optionType: 'All',
+      strikeInterval: interval,
+      enableGreeks: toBoolean(enableGreeks),
+      strikeRange,
+      optionType,
     };
 
-    if (!stream) return lib.ts.optionChain({ endpoint, symbol, data });
-    if (stop) {
-      const client = await domain.ts.clients.getClient({});
-      const streamKey = symbol.toUpperCase() + '_' + data.expiration;
-      if (client.streams.chains[streamKey] !== undefined) {
-        try {
-          await client.streams.chains[streamKey].stopStream();
-        } catch (err) {
-          console.warn('Failed to stop option chain stream:', err);
-        }
-        delete client.streams.chains[streamKey];
-      }
-      return { stopped: true };
+    if (expiration) chainData.expiration = expiration;
+    if (expiration2) chainData.expiration2 = expiration2;
+    const riskRate = toNumber(riskFreeRate);
+    const centerPrice = toNumber(priceCenter);
+    if (riskRate !== null) chainData.riskFreeRate = riskRate;
+    if (centerPrice !== null) chainData.priceCenter = centerPrice;
+
+    if (!streamMode) {
+      const endpoint = ['marketdata', 'stream', 'options', 'chains', chainSymbol];
+      return lib.ts.optionChain({ endpoint, symbol: chainSymbol, data: chainData });
     }
-    return lib.stream.optionChain({ responce: context.client, endpoint, symbol, data });
+
+    const endpoint = chainSymbol ? ['marketdata', 'stream', 'options', 'chains', chainSymbol] : [];
+    const streamAction = actionValue ?? 'subscribe';
+
+    return lib.stream.optionChain({
+      client: context.client,
+      endpoint,
+      symbol: chainSymbol,
+      data: chainData,
+      action: streamAction,
+      idleMs,
+      streamKey: chainKey,
+    });
   },
 });

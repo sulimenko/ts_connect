@@ -1,4 +1,16 @@
+/* eslint camelcase: "off" */
+
 ({ message }) => {
+  const toFixedString = (value, digits) => {
+    const number = Number(value);
+    return Number.isFinite(number) ? number.toFixed(digits) : null;
+  };
+
+  const toTimestamp = (value) => {
+    const time = Date.parse(value);
+    return Number.isNaN(time) ? null : time;
+  };
+
   if (!message) return {};
 
   const instrument = lib.utils.makeSymbol(message.Symbol);
@@ -7,23 +19,23 @@
     return {};
   }
   return {
-    ask: parseFloat(message.Ask).toFixed(2),
+    ask: toFixedString(message.Ask, 2),
     ask_size: message.AskSize,
-    bid: parseFloat(message.Bid).toFixed(2),
+    bid: toFixedString(message.Bid, 2),
     bid_size: message.BidSize,
-    lp: message.Last,
+    lp: message.Last ?? null,
     lp_size: message.LastSize,
-    lp_time: new Date(message.LastTradingDate).getTime(),
+    lp_time: toTimestamp(message.TradeTime ?? message.LastTradingDate),
     volume: message.Volume,
     rtc: null,
     rtc_time: null,
     regular_close: message.Close,
-    prev_close_price: parseFloat(message.PreviousClose).toFixed(2),
+    prev_close_price: toFixedString(message.PreviousClose, 2),
     prev_volume: message.PreviousVolume,
     open_interest: message.DailyOpenInterest,
     ch: message.NetChange,
     chp: message.NetChangePct,
-    date: new Date().getTime(),
+    date: Date.now(),
     listed_exchange: 'TS',
     currency: 'USD',
     currency_id: 'USD',

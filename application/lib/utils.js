@@ -41,6 +41,13 @@
     });
   },
 
+  normalizeAction({ action = null, stop = false }) {
+    let actionValue = stop ? 'unsubscribe' : action;
+    if (typeof actionValue === 'string') actionValue = actionValue.trim().toLowerCase() || null;
+    if (actionValue == null || actionValue === false || actionValue === 0) return null;
+    return actionValue;
+  },
+
   constructDomain(live) {
     try {
       const domainPart = live ? config.ts.url.live : config.ts.url.sim;
@@ -94,12 +101,16 @@
 
     if (instrument.type === 'OPT') {
       if (current === 0.0) return isBuy ? 'BUYTOOPEN' : 'SELLTOOPEN';
-      if (isSignChanged) return isBuy ? 'BUYTOOPEN' : 'SELLTOOPEN'; // EC804: Boxed positions are not permitted. To close long position, try a \"Sell\" order.
+      if (isSignChanged) {
+        return isBuy ? 'BUYTOOPEN' : 'SELLTOOPEN'; // Boxed positions are not permitted. To close long position, try a Sell order.
+      }
       if (isBuy) return currentLong ? 'BUYTOOPEN' : 'BUYTOCLOSE';
       return currentLong ? 'SELLTOCLOSE' : 'SELLTOOPEN';
     } else if (instrument.type === 'STK') {
       if (current === 0.0) return isBuy ? 'Buy' : 'SELLSHORT';
-      if (isSignChanged) return isBuy ? 'Buy' : 'SELLSHORT'; // EC804: Boxed positions are not permitted. To close long position, try a \"Sell\" order.
+      if (isSignChanged) {
+        return isBuy ? 'Buy' : 'SELLSHORT'; // Boxed positions are not permitted. To close long position, try a Sell order.
+      }
       if (isBuy) return currentLong ? 'Buy' : 'BUYTOCOVER';
       return currentLong ? 'Sell' : 'SELLSHORT';
     }
@@ -107,7 +118,7 @@
   },
 
   convertSymbol({ symbol, type = 'STK' }) {
-    if ((type = 'OPT')) {
+    if (type === 'OPT') {
       const symbolMatch = symbol.match(/^([A-Z]+)\s*(\d{6})([CP])((\d+)?(?:\.\d+)?)$/i);
       if (!symbolMatch) return null;
       const [, underlying, expCode, optType, strikePrice] = symbolMatch;

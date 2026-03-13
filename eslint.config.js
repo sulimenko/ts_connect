@@ -8,7 +8,7 @@ module.exports = [
     files: ['application/**/*.js'],
     rules: {
       strict: 'off',
-      code: 140,
+      'max-len': ['error', { code: 140 }],
     },
     languageOptions: {
       sourceType: 'module',

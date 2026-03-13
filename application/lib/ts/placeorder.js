@@ -1,10 +1,10 @@
 async ({ data, qty, instrument, live, related = null, orderId = null }) => {
   let method = 'POST';
-  let endpoint = ['orderexecution', 'orders'];
+  const endpoint = ['orderexecution', 'orders'];
   const account = data.AccountID;
 
   if (orderId && typeof orderId === 'string') {
-    endpoint.put(orderId);
+    endpoint.push(orderId);
     method = 'PUT';
   }
 

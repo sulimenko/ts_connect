@@ -1,31 +1,100 @@
 ({
   access: 'public',
-  method: async ({ symbol, period = 3600, limit = 1000 }) => {
-    const endpoint = ['marketdata', 'stream', 'barcharts', symbol.toUpperCase()];
+  parameters: 'json',
+  returns: 'json',
+  errors: {
+    EACTION: 'Invalid action: expected "subscribe", "unsubscribe", or "touch"',
+    ELIMIT: 'Limit must be a positive number of bars from 1 to 57600',
+    EPERIOD: 'Period must be aligned to supported minute, day, week, or month intervals',
+    ESYMBOL: 'Symbol is required for barchart subscribe requests',
+  },
+
+  method: async ({ symbol = null, period = 3600, limit = 1000, action = 'subscribe', stop = false, idleMs = null, streamKey = null }) => {
+    const actionSet = new Set(['subscribe', 'unsubscribe', 'touch']);
+    const toNumber = (value) => {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : null;
+    };
+    const actionValue = lib.utils.normalizeAction({ action, stop });
+    const chartSymbol = typeof symbol === 'string' ? symbol.trim().toUpperCase() : '';
+    const chartKey = typeof streamKey === 'string' ? streamKey.trim() || null : null;
+    const periodValue = toNumber(period);
+    const limitValue = toNumber(limit);
+
+    if (actionValue !== null && !actionSet.has(actionValue)) return new DomainError('EACTION');
+    if (periodValue === null || periodValue <= 0) return new DomainError('EPERIOD');
+    if (limitValue === null || limitValue <= 0 || limitValue > 57600) return new DomainError('ELIMIT');
+
+    const symbolRequired = !actionValue || actionValue === 'subscribe';
+    if (!chartSymbol && (symbolRequired || !chartKey)) return new DomainError('ESYMBOL');
+
+    const minute = 60;
+    const day = 86400;
+    const week = 604800;
+    const month = 2592000;
     let interval = '1';
     let unit = 'Minute';
-    if (period < 86400) interval = (period / 60).toString();
-    else if (period === 86400) unit = 'Daily';
-    else if (period === 604800) unit = 'Weekly';
-    else if (period > 604800) unit = 'Monthly';
+    if (periodValue < day) {
+      if (periodValue < minute || periodValue % minute !== 0) return new DomainError('EPERIOD');
+      interval = (periodValue / minute).toString();
+    } else if (periodValue % month === 0) {
+      interval = (periodValue / month).toString();
+      unit = 'Monthly';
+    } else if (periodValue % week === 0) {
+      interval = (periodValue / week).toString();
+      unit = 'Weekly';
+    } else if (periodValue % day === 0) {
+      interval = (periodValue / day).toString();
+      unit = 'Daily';
+    } else {
+      return new DomainError('EPERIOD');
+    }
 
-    const data = {
-      interval, // string 1 to 1440 minute
-      unit, // string 'Minute, Daily, Weekly, Monthly'
-      barsback: limit.toString(), // string 1 to 57600
-      // firstdate, // The first date formatted as `YYYY-MM-DD`,`2020-04-20T18:00:00Z`. This parameter is mutually exclusive with barsback
-      // lastdate, // The last date formatted as `YYYY-MM-DD`,`2020-04-20T18:00:00Z`. This parameter is mutually exclusive with barsback
-      sessiontemplate: 'USEQ24Hour', // `USEQPre`, `USEQPost`, `USEQPreAndPost`, `USEQ24Hour`,`Default`.
+    const chartData = {
+      interval,
+      unit,
+      barsback: Math.floor(limitValue).toString(),
+      sessiontemplate: 'USEQ24Hour',
     };
+    const tsClient = await domain.ts.clients.getClient({});
+    const key = chartKey || tsClient.buildStreamKey({ group: 'charts', symbol: chartSymbol, data: chartData });
 
-    const onData = (message) => {
-      console.debug('stream chart ' + symbol + ':', message);
-    };
-    const onError = (err) => console.error('stream chart error:', err);
+    if (actionValue === 'unsubscribe') {
+      return domain.ts.streams.unsubscribe({ kind: 'charts', key, client: context.client });
+    }
+    if (actionValue === 'touch') {
+      return domain.ts.streams.touch({ kind: 'charts', key, client: context.client, idleMs });
+    }
 
-    const client = await domain.ts.clients.getClient({});
+    const endpoint = ['marketdata', 'stream', 'barcharts', chartSymbol];
 
-    client.streamCharts({ endpoint, symbol, data, onData, onError });
-    return ['ok'];
+    return domain.ts.streams.subscribe({
+      kind: 'charts',
+      key,
+      client: context.client,
+      idleMs,
+      metadata: { symbol: chartSymbol, period: periodValue, limit: Math.floor(limitValue) },
+      start: async ({ notifyError, emit }) => {
+        const onData = (message) => {
+          emit('stream/barchart', { streamKey: key, symbol: chartSymbol, bar: message });
+        };
+        const onError = (error) => {
+          console.error('stream chart error:', error);
+          notifyError(error);
+        };
+        const registeredKey = await tsClient.streamCharts({
+          endpoint,
+          symbol: chartSymbol,
+          data: chartData,
+          onData,
+          onError,
+        });
+        return {
+          stop: async () => {
+            await tsClient.stopStoredStream({ group: 'charts', key: registeredKey });
+          },
+        };
+      },
+    });
   },
 });

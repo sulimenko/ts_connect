@@ -2,11 +2,19 @@
   access: 'public',
   method: async () => {
     const client = await domain.ts.clients.getClient({});
-    for (const name of Object.keys(client.streams)) {
-      for (const key of Object.keys(client.streams[name])) {
-        console.debug('Keys:', key, 'data:', client.streams[name][key].currentParams.data);
-      }
+
+    const upstream = {};
+    for (const group of Object.keys(client.streams)) {
+      upstream[group] = Object.keys(client.streams[group]).map((key) => ({
+        key,
+        data: client.streams[group][key].currentParams?.data ?? {},
+        endpoint: client.streams[group][key].currentParams?.endpoint ?? [],
+      }));
     }
-    return ['OK'];
+
+    return {
+      upstream,
+      subscriptions: domain.ts.streams.list(),
+    };
   },
 });

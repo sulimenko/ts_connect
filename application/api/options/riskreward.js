@@ -1,11 +1,12 @@
 ({
   access: 'public',
   method: async ({ spread, legs }) => {
-    const endpoint = 'marketdata/options/riskreward';
+    const endpoint = ['marketdata', 'options', 'riskreward'];
     const data = {
       SpreadPrice: spread,
       Legs: legs,
     };
-    return lib.ts.send({ method: 'POST', endpoint, data });
+    const client = await domain.ts.clients.getClient({});
+    return lib.ts.send({ method: 'POST', live: true, endpoint, token: client.tokens.access, data });
   },
 });

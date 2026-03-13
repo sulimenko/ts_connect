@@ -1,25 +1,49 @@
 ({
   access: 'public',
-  method: async ({ instruments }) => {
-    const symbolsString = instruments
-      .map((instrument) => {
-        const { asset_category: type, symbol } = instrument;
-        return lib.utils.makeTSSymbol(symbol, type);
-      })
-      .join(',');
-    const endpoint = ['marketdata', 'stream', 'quotes', symbolsString];
+  method: async ({ instruments = [], action = 'subscribe', stop = false, idleMs = null, streamKey = null }) => {
+    const actionValue = lib.utils.normalizeAction({ action, stop });
+    const symbols = instruments.map((instrument) => {
+      const { asset_category: type, symbol } = instrument;
+      return lib.utils.makeTSSymbol(symbol, type);
+    });
+    const key = streamKey || Array.from(new Set(symbols)).sort().join(',');
 
-    const onData = (message) => {
-      // console.debug('stream matrix ' + symbol + ':', message);
-      const packet = lib.ts.readQuote({ message });
-      // console.debug('stream quote ' + symbolsString + ':', packet);
-      context.client.emit('stream/quote', packet);
-    };
-    const onError = (err) => console.error('stream quote error:', err);
+    if (!key) throw new Error('Instruments are required');
+    if (actionValue === 'unsubscribe') {
+      return domain.ts.streams.unsubscribe({ kind: 'quotes', key, client: context.client });
+    }
+    if (actionValue === 'touch') {
+      return domain.ts.streams.touch({ kind: 'quotes', key, client: context.client, idleMs });
+    }
 
-    const client = await domain.ts.clients.getClient({});
+    const endpoint = ['marketdata', 'stream', 'quotes', key];
+    const tsClient = await domain.ts.clients.getClient({});
 
-    client.streamQuotes({ endpoint, onData, onError });
-    return ['ok'];
+    return domain.ts.streams.subscribe({
+      kind: 'quotes',
+      key,
+      client: context.client,
+      idleMs,
+      metadata: { symbols: key },
+      start: async ({ notifyError, emit }) => {
+        const onData = (message) => {
+          const packet = lib.ts.readQuote({ message });
+          if (!packet.symbol) return;
+          emit('stream/quote', packet);
+        };
+
+        const onError = (error) => {
+          console.error('stream quote error:', error);
+          notifyError(error);
+        };
+
+        const registeredKey = await tsClient.streamQuotes({ endpoint, onData, onError });
+        return {
+          stop: async () => {
+            await tsClient.stopStoredStream({ group: 'quotes', key: registeredKey });
+          },
+        };
+      },
+    });
   },
 });

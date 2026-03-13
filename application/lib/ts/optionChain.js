@@ -1,58 +1,70 @@
 async ({ endpoint, symbol, data }) => {
   const client = await domain.ts.clients.getClient({});
-  return new Promise(async (resolve, reject) => {
-    const res = { symbol, expiration: data.expiration, stirkes: strikeProximity * 2, chain: {} };
-    let timeoutId = null;
+  return new Promise((resolve, reject) => {
+    const expectedStrikes = Math.max(0, Number(data.strikeProximity) || 0) * 2;
+    const expectedLegsPerStrike = data.optionType === 'All' ? 2 : 1;
+    const response = {
+      symbol: symbol.toUpperCase(),
+      expiration: data.expiration ?? null,
+      strikes: expectedStrikes,
+      chain: {},
+    };
+
     let streamKey = null;
+    let timeoutId = null;
+    let settled = false;
+
+    const finalize = async (result, error = null) => {
+      if (settled) return;
+      settled = true;
+
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+
+      if (streamKey) await client.stopStoredStream({ group: 'chains', key: streamKey });
+
+      if (error) reject(error);
+      else resolve(result);
+    };
 
     const onData = (message) => {
       const option = lib.ts.readOptionChain({ message });
-      if (res.chain[option.strike] === undefined) res.chain[option.strike] = {};
-      res.chain[option.strike][option.type] = option;
+      if (!option) return;
+      if (response.chain[option.strike] === undefined) response.chain[option.strike] = {};
+      response.chain[option.strike][option.type] = option;
 
-      // clearTimeout(timeoutId);
-      // timeoutId = null;
       if (timeoutId === null) {
         timeoutId = setTimeout(() => {
-          console.debug('chains responce by time', Object.keys(chain.length));
-          responce(chain, streamKey, timeoutId);
-          return;
+          void finalize(response);
         }, 5000);
       }
 
-      const keys = Object.keys(chain);
-      if (keys.length > data.strikeProximity * 2 * 0.95) {
-        if (keys.every((key) => Object.keys(chain[key]).length === 2)) {
-          console.debug('chains responce by count', keys.length);
-          responce(res, streamKey, timeoutId);
-          return;
-        }
+      if (expectedStrikes === 0) return;
+
+      const keys = Object.keys(response.chain);
+      const enoughStrikes = keys.length >= Math.ceil(expectedStrikes * 0.95);
+      if (!enoughStrikes) return;
+
+      const hasEnoughLegs = keys.every((key) => Object.keys(response.chain[key]).length >= expectedLegsPerStrike);
+      if (hasEnoughLegs) {
+        console.debug('chains response by count', keys.length);
+        void finalize(response);
       }
     };
 
     const onError = (err) => {
-      responce(chain, streamKey, timeoutId);
-      reject(err);
+      void finalize(response, err instanceof Error ? err : new Error(String(err)));
     };
 
-    const responce = async function (res, streamKey, timeoutId) {
-      resolve(res);
-      clearTimeout(timeoutId);
-      timeoutId = null;
-      if (streamKey && client.streams.chains[streamKey]) {
-        try {
-          await client.streams.chains[streamKey].stopStream();
-        } catch (err) {
-          console.warn('Failed to stop stream:', err);
-        }
-        delete client.streams.chains[streamKey];
-      }
-    };
-
-    try {
-      streamKey = await client.streamChains({ endpoint, symbol, data, onData, onError });
-    } catch (err) {
-      reject(err);
-    }
+    client
+      .streamChains({ endpoint, symbol, data, onData, onError })
+      .then((key) => {
+        streamKey = key;
+      })
+      .catch((error) => {
+        void finalize(response, error);
+      });
   });
 };
