@@ -2,6 +2,7 @@ async () => {
   if (application.worker.id === 'W1') {
     setTimeout(async () => {
       for (const name of ['ptfin']) {
+        void name;
         // api.marketdata.streamBarchart({ symbol: 'TSLA', period: 900, limit: 10 });
         // api.marketdata.streamMatrix({ symbol: 'TSLA' });
         // api.marketdata.streamMatrix({ symbol: 'AAPL' });

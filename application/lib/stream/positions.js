@@ -1,4 +1,7 @@
 async ({ client, contract, changes = true }) => {
+  void client;
+  void contract;
+  void changes;
   // const endpoint = ['brokerage', 'stream', 'accounts', contract.account, 'positions'];
   // const data = { changes };
 

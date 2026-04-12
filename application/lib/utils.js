@@ -44,7 +44,7 @@
   normalizeAction({ action = null, stop = false }) {
     let actionValue = stop ? 'unsubscribe' : action;
     if (typeof actionValue === 'string') actionValue = actionValue.trim().toLowerCase() || null;
-    if (actionValue == null || actionValue === false || actionValue === 0) return null;
+    if (actionValue === null || actionValue === undefined || actionValue === false || actionValue === 0) return null;
     return actionValue;
   },
 
@@ -137,11 +137,31 @@
       if (!match) throw new Error('Invalid option symbol format');
       const [, sym, date, cp, strike] = match;
       const year = date.slice(0, 2);
-      const month = date.slice(2, 4).replace(/^0/, '');
-      const day = date.slice(4, 6).replace(/^0/, '');
-      return sym.toUpperCase() + ' ' + year + month + day + cp.toUpperCase() + parseFloat(strike) / 1000;
+      const month = date.slice(2, 4);
+      const day = date.slice(4, 6);
+      const tsSymbol = sym.toUpperCase() + ' ' + year + month + day + cp.toUpperCase() + parseFloat(strike) / 1000;
+      console.debug('makeTSSymbol:', symbol, '->', tsSymbol, 'date:', year + month + day, 'len:', (year + month + day).length);
+      return tsSymbol;
     }
     throw new Error('Unsupported instrument type');
+  },
+
+  normalizeBarPeriod(period) {
+    const periodValue = Number(period);
+    if (!Number.isFinite(periodValue) || periodValue <= 0) return new DomainError('EPERIOD');
+
+    if (periodValue >= 60 && periodValue < 86400) {
+      if (periodValue % 60 !== 0) return new DomainError('EPERIOD');
+      const interval = (periodValue / 60).toString();
+      if (Number(interval) < 1 || Number(interval) > 1440) return new DomainError('EPERIOD');
+      return { interval, unit: 'Minute' };
+    }
+
+    if (periodValue === 86400) return { interval: '1', unit: 'Daily' };
+    if (periodValue === 604800) return { interval: '1', unit: 'Weekly' };
+    if (periodValue === 2592000) return { interval: '1', unit: 'Monthly' };
+
+    return new DomainError('EPERIOD');
   },
 
   makeSymbol(symbol) {

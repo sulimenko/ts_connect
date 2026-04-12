@@ -156,6 +156,18 @@ API-слой не должен:
 Первый закрепленный пример внутри этого репозитория: `application/api/options/chain.js` и `application/api/options/chain.d.ts`. Для этого метода `.d.ts` считается reference pattern для публичной процедуры с доменными кодами ошибок.
 Второй reference pattern для stream-метода: `application/api/stream/addBarchart.js` и `application/api/stream/addBarchart.d.ts`.
 
+## Источник TradeStation OpenAPI
+
+Для snapshot TradeStation OpenAPI от 2026-04-11 в репозитории есть компактный индекс
+`doc/openapi_20260411.md`. Перед изменением TradeStation endpoint-а нужно сначала
+сверяться с этим индексом, а сырой `/Users/alexey/Downloads/openapi_20260411.json`
+открывать только если нужны полные schemas или examples.
+
+Индекс фиксирует важные для сервиса инварианты: v2/v3 endpoint mapping, bearer auth,
+stream packet shape, heartbeat, `GoAway`, `StreamStatus`, `{ Error, Message }` и
+`{ Symbol, Error }` error packets, а также различие между
+`/v3/marketdata/stream/options/quotes` и `/v3/marketdata/stream/quotes/{symbols}`.
+
 ## Правила для stream API
 
 Stream-методы сервиса должны выглядеть как управляемый lifecycle, а не как одноразовый старт потока.
@@ -195,7 +207,7 @@ Stream-методы сервиса должны выглядеть как упр
 - после review нужно обновить все файлы в `doc/`, а не только один затронутый документ;
 - task считается закрытым только в последовательности `implement -> review -> update doc/*`.
 
-### Правила ведения doc/*
+### Правила ведения doc/\*
 
 - `blueprint.md` — текущее состояние продукта, целевой контракт, обязательные правила. Историю и закрытые фазы не хранит — для этого есть git history.
 - `task.md` — рабочий журнал задач блоками; архивируется при накоплении >30 завершённых задач или закрытии крупного цикла.

@@ -15,9 +15,8 @@
         for (const symbol of exist.keys()) {
           const internal = exist.get(symbol);
           const external =
-            responce.Positions?.find((each) => {
-              return each.AccountID === internal.get('AccountID') && each.Symbol === internal.get('Symbol');
-            }) || {};
+            responce.Positions?.find((each) => each.AccountID === internal.get('AccountID') && each.Symbol === internal.get('Symbol')) ||
+            {};
           try {
             // console.info('positions', symbol, 'internal', internal.get('Quantity'), '=', external.Quantity ?? 'empty', 'external');
             if (parseFloat(internal.get('Quantity') ?? 0) !== parseFloat(external.Quantity ?? 0)) {

@@ -18,41 +18,21 @@
     const actionValue = lib.utils.normalizeAction({ action, stop });
     const chartSymbol = typeof symbol === 'string' ? symbol.trim().toUpperCase() : '';
     const chartKey = typeof streamKey === 'string' ? streamKey.trim() || null : null;
-    const periodValue = toNumber(period);
+    const periodValue = Number(period);
     const limitValue = toNumber(limit);
 
     if (actionValue !== null && !actionSet.has(actionValue)) return new DomainError('EACTION');
-    if (periodValue === null || periodValue <= 0) return new DomainError('EPERIOD');
     if (limitValue === null || limitValue <= 0 || limitValue > 57600) return new DomainError('ELIMIT');
 
     const symbolRequired = !actionValue || actionValue === 'subscribe';
     if (!chartSymbol && (symbolRequired || !chartKey)) return new DomainError('ESYMBOL');
 
-    const minute = 60;
-    const day = 86400;
-    const week = 604800;
-    const month = 2592000;
-    let interval = '1';
-    let unit = 'Minute';
-    if (periodValue < day) {
-      if (periodValue < minute || periodValue % minute !== 0) return new DomainError('EPERIOD');
-      interval = (periodValue / minute).toString();
-    } else if (periodValue % month === 0) {
-      interval = (periodValue / month).toString();
-      unit = 'Monthly';
-    } else if (periodValue % week === 0) {
-      interval = (periodValue / week).toString();
-      unit = 'Weekly';
-    } else if (periodValue % day === 0) {
-      interval = (periodValue / day).toString();
-      unit = 'Daily';
-    } else {
-      return new DomainError('EPERIOD');
-    }
+    const periodData = lib.utils.normalizeBarPeriod(period);
+    if (periodData instanceof DomainError) return periodData;
 
     const chartData = {
-      interval,
-      unit,
+      interval: periodData.interval,
+      unit: periodData.unit,
       barsback: Math.floor(limitValue).toString(),
       sessiontemplate: 'USEQ24Hour',
     };

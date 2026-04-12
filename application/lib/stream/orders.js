@@ -1,4 +1,7 @@
 async ({ client, contract, ordersIds = [] }) => {
+  void client;
+  void contract;
+  void ordersIds;
   // const endpoint = ['brokerage', 'stream', 'accounts', contract.account, 'orders'];
   // if (ordersIds.length > 0) endpoint.push(ordersIds.join(','));
 

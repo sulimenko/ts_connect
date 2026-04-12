@@ -4,8 +4,8 @@
     contract, // { account: 11827414, live: true }
     orderId,
   }) => {
-    let endpoint = ['orderexecution', 'orders', orderId.toString()];
-    let method = 'DELETE';
+    const endpoint = ['orderexecution', 'orders', orderId.toString()];
+    const method = 'DELETE';
     contract.live = contract.live === 1 || contract.live === '1' || contract.live === true || contract.live === 'true';
 
     const client = await domain.ts.clients.getClient({});

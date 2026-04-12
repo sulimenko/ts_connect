@@ -61,7 +61,11 @@
       if (Date.now() - start > this.waitTimeout) {
         const error = new Error('Waiting timed out');
         this.finish(error, task);
-        if (this.queue.length > 0) setTimeout(() => { if (this.queue.length > 0) this.takeNext(); }, 0);
+        if (this.queue.length > 0) {
+          setTimeout(() => {
+            if (this.queue.length > 0) this.takeNext();
+          }, 0);
+        }
         return;
       }
     }

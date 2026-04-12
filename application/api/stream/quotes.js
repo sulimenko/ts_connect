@@ -19,12 +19,14 @@
     const endpoint = ['marketdata', 'stream', 'quotes', key];
     const tsClient = await domain.ts.clients.getClient({});
 
+    // Managed ownership stays at client + kind + streamKey.
+    // metaterminal owns consumer counts and uses touch/unsubscribe/clear explicitly.
     return domain.ts.streams.subscribe({
       kind: 'quotes',
       key,
       client: context.client,
       idleMs,
-      metadata: { symbols: key },
+      metadata: { symbols: key, owner: 'metaterminal', streamKey: key },
       start: async ({ notifyError, emit }) => {
         const onData = (message) => {
           const packet = lib.ts.readQuote({ message });
@@ -33,7 +35,8 @@
         };
 
         const onError = (error) => {
-          console.error('stream quote error:', error);
+          const message = error?.Error || error?.message || String(error);
+          console.error('stream quote error:', message, error?.Symbol ?? '');
           notifyError(error);
         };
 

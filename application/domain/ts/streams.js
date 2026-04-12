@@ -23,6 +23,15 @@
     return Math.max(1000, Math.floor(timeout));
   },
 
+  logStop({ kind, key, reason, clientCount = null }) {
+    const suffix = clientCount === null ? '' : ` subscribers=${clientCount}`;
+    console.info(`Managed stream stop: ${kind}:${key} reason=${reason}${suffix}`);
+  },
+
+  logUnsubscribe({ kind, key, reason, remaining }) {
+    console.info(`Subscriber removed: ${kind}:${key} reason=${reason} remaining=${remaining}`);
+  },
+
   serializeError(error) {
     if (error instanceof Error) {
       return {
@@ -33,7 +42,10 @@
     }
 
     if (typeof error === 'string') return { message: error };
-    return { message: String(error?.message ?? error) };
+    if (error?.Error) return { message: error.Error, symbol: error.Symbol ?? null };
+    const fallback = String(error?.message ?? error);
+    console.warn('serializeError fallback:', fallback, 'original type:', typeof error);
+    return { message: fallback };
   },
 
   emit(entry, eventName, payload) {
@@ -69,7 +81,7 @@
     subscription.idleMs = timeout;
     subscription.touchedAt = Date.now();
     subscription.idleTimer = setTimeout(() => {
-      this.unsubscribe({ kind, key, client }).catch((error) => {
+      this.unsubscribe({ kind, key, client, reason: 'idle' }).catch((error) => {
         console.error(`Failed to cleanup idle subscription ${kind}:${key}:`, error);
       });
     }, timeout);
@@ -83,12 +95,13 @@
     };
   },
 
-  async stopEntry({ kind, key }) {
+  async stopEntry({ kind, key, reason = 'unknown' }) {
     const bucket = this.getBucket({ kind });
     const entry = bucket.get(key);
     if (!entry) return false;
 
     bucket.delete(key);
+    this.logStop({ kind, key, reason, clientCount: entry.subscribers.size });
 
     for (const subscription of entry.subscribers.values()) {
       clearTimeout(subscription.idleTimer);
@@ -98,7 +111,7 @@
 
     if (entry.upstream?.stop) {
       try {
-        await entry.upstream.stop();
+        await entry.upstream.stop({ reason });
       } catch (error) {
         console.error(`Failed to stop managed stream ${kind}:${key}:`, error);
       }
@@ -107,7 +120,7 @@
     return true;
   },
 
-  async unsubscribe({ kind, key, client }) {
+  async unsubscribe({ kind, key, client, reason = 'unsubscribe' }) {
     const entry = this.getEntry({ kind, key });
     if (!entry) return { active: false, kind, streamKey: key, subscribers: 0, removed: false };
 
@@ -122,14 +135,15 @@
 
     const subscribers = entry.subscribers.size;
     if (subscribers === 0) {
-      await this.stopEntry({ kind, key });
+      await this.stopEntry({ kind, key, reason });
       return { active: false, kind, streamKey: key, subscribers, removed: true };
     }
 
+    this.logUnsubscribe({ kind, key, reason, remaining: subscribers });
     return { active: true, kind, streamKey: key, subscribers, removed: true };
   },
 
-  async unsubscribeAll({ client }) {
+  async unsubscribeAll({ client, reason = 'clear' }) {
     const removed = [];
 
     for (const kind of Object.keys(this.entries)) {
@@ -137,7 +151,7 @@
       for (const key of keys) {
         const entry = this.getEntry({ kind, key });
         if (!entry || !entry.subscribers.has(client)) continue;
-        removed.push(await this.unsubscribe({ kind, key, client }));
+        removed.push(await this.unsubscribe({ kind, key, client, reason }));
       }
     }
 
@@ -148,6 +162,8 @@
     if (!client) throw new Error('Metacom client is required');
 
     const bucket = this.getBucket({ kind });
+    // One managed entry per client + kind + streamKey.
+    // Consumer counts live above this helper in metaterminal.
     let entry = bucket.get(key);
     const created = entry === undefined;
 
@@ -188,7 +204,7 @@
 
     if (!subscription) {
       const onClose = () => {
-        this.unsubscribe({ kind, key, client }).catch((error) => {
+        this.unsubscribe({ kind, key, client, reason: 'client.close' }).catch((error) => {
           console.error(`Failed to cleanup closed client subscription ${kind}:${key}:`, error);
         });
       };
@@ -206,6 +222,9 @@
     }
 
     const state = this.touch({ kind, key, client, idleMs });
+    console.info(
+      `Stream subscribe: ${kind}:${key} created=${created} subscribed=${subscribed} total=${state.subscribers} idleMs=${state.idleMs}`,
+    );
     return { ...state, created, subscribed, metadata: entry.metadata };
   },
 

@@ -35,4 +35,10 @@ module.exports = [
       },
     },
   },
+  {
+    files: ['application/lib/ts/refresh.js'],
+    rules: {
+      camelcase: 'off',
+    },
+  },
 ];

@@ -24,16 +24,16 @@
     this.timeoutHeartbeat = null;
   },
 
-  abortActiveStream() {
+  abortActiveStream(reason = 'unknown') {
     if (!this.abortController || this.abortController.signal.aborted) return;
-    console.log('Stopping stream...', this.endpointName());
+    console.log('Stopping stream...', this.endpointName(), 'reason:', reason);
     this.abortController.abort();
   },
 
   async initiateStream() {
     this.clearReconnectTimer();
     this.clearHeartbeatTimer();
-    this.abortActiveStream();
+    this.abortActiveStream('restart');
 
     const abortController = new AbortController();
     this.abortController = abortController;
@@ -87,8 +87,15 @@
     }
 
     if (packet.Error) {
-      console.error('Stream error:', this.endpointName(), packet.Error, packet.Message ?? '');
+      const errorText = `${packet.Error} ${packet.Message ?? ''}`.trim();
+      console.error('Stream error:', this.endpointName(), errorText);
       if (onError) onError(packet);
+      const permanent = /INVALID/i.test(packet.Error) && !/GoAway/i.test(errorText);
+      console.warn('Stream error classification:', this.endpointName(), permanent ? 'PERMANENT -> stop' : 'TRANSIENT -> reconnect');
+      if (permanent) {
+        this.stopStream('permanent-error');
+        return false;
+      }
       void this.scheduleReconnect();
       return false;
     }
@@ -160,7 +167,7 @@
     if (!this.shouldReconnect || this.reconnectTimer) return;
 
     this.clearHeartbeatTimer();
-    this.abortActiveStream();
+    this.abortActiveStream('reconnect');
 
     const delay = this.reconnectDelay;
     console.log('Reconnecting in', delay / 1000, 'seconds...');
@@ -173,11 +180,11 @@
     this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
   },
 
-  stopStream() {
+  stopStream(reason = 'unknown') {
     this.shouldReconnect = false;
     this.clearReconnectTimer();
     this.clearHeartbeatTimer();
-    this.abortActiveStream();
+    this.abortActiveStream(reason);
     this.abortController = null;
   },
 });

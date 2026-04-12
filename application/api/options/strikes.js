@@ -1,6 +1,7 @@
 ({
   access: 'public',
   method: async ({ symbol, type = 'Single', interval = 1, expiration = null, expiration2 = null }) => {
+    void expiration2;
     const endpoint = ['marketdata', 'options', 'strikes', symbol.toUpperCase()];
     const data = {
       spreadType: type,

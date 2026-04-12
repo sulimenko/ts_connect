@@ -8,8 +8,8 @@
     // side, // Buy, Sell
     tif = 'GTC', // GTC, Day, IOC, GCP
     route = 'Intelligent',
-    limit_price = null,
-    stop_price = null,
+    limit_price: limitPrice = null,
+    stop_price: stopPrice = null,
     related = null,
     orderId = null,
   }) => {
@@ -25,8 +25,8 @@
       Route: route,
     };
 
-    if (limit_price) data.LimitPrice = limit_price.toString();
-    if (stop_price && typeof stop_price === 'number') data.StopPrice = stop_price.toString();
+    if (limitPrice) data.LimitPrice = limitPrice.toString();
+    if (stopPrice && typeof stopPrice === 'number') data.StopPrice = stopPrice.toString();
 
     // return lib.ts.send({ method, live: contract.live, endpoint, token: client.tokens.access, data });
     const response = await lib.ts.placeorder({ data, qty, instrument, live, related, orderId });
