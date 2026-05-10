@@ -24,7 +24,10 @@
     enableGreeks = true,
     strikeRange = 'All',
     optionType = 'All',
+    traceId = null,
+    requestId = null,
   }) => {
+    const trace = lib.utils.resolveTraceId({ traceId, requestId, prefix: 'stream' });
     const actionSet = new Set(['subscribe', 'unsubscribe', 'touch']);
     const toBoolean = (value) => value === true || value === 'true' || value === 1 || value === '1';
     const toNumber = (value) => {
@@ -75,6 +78,12 @@
       action: streamAction,
       idleMs,
       streamKey: chainKey,
+      trace: {
+        traceId: trace,
+        scope: 'stream/options/chains',
+        symbol: chainSymbol,
+        action: streamAction,
+      },
     });
   },
 });

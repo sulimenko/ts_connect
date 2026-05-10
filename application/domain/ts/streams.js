@@ -99,10 +99,26 @@
 
   touch({ kind, key, client, idleMs = null }) {
     const entry = this.getEntry({ kind, key });
-    if (!entry) return { active: false, kind, streamKey: key, subscribers: 0 };
+    if (!entry) {
+      lib.utils.traceLog({
+        scope: `stream/${kind}`,
+        phase: 'touch',
+        streamKey: key,
+        extra: { active: false, subscribers: 0, idleMs: this.resolveIdleMs(idleMs) },
+      });
+      return { active: false, kind, streamKey: key, subscribers: 0 };
+    }
 
     const subscription = entry.subscribers.get(client);
-    if (!subscription) return { active: false, kind, streamKey: key, subscribers: entry.subscribers.size };
+    if (!subscription) {
+      lib.utils.traceLog({
+        scope: `stream/${kind}`,
+        phase: 'touch',
+        streamKey: key,
+        extra: { active: false, subscribers: entry.subscribers.size, idleMs: this.resolveIdleMs(idleMs, this.defaultIdleMs) },
+      });
+      return { active: false, kind, streamKey: key, subscribers: entry.subscribers.size };
+    }
 
     const timeout = this.resolveIdleMs(idleMs, subscription.idleMs);
     clearTimeout(subscription.idleTimer);
@@ -114,6 +130,13 @@
         console.error(`Failed to cleanup idle subscription ${kind}:${key}:`, error);
       });
     }, timeout);
+
+    lib.utils.traceLog({
+      scope: `stream/${kind}`,
+      phase: 'touch',
+      streamKey: key,
+      extra: { active: true, subscribers: entry.subscribers.size, idleMs: timeout },
+    });
 
     return {
       active: true,

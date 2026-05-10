@@ -29,10 +29,10 @@ Review обязателен после любого task. После review ну
 - метод бросает `Error` там, где клиент ожидает стабильный код ошибки;
 - метод возвращает `DomainError`, но `errors` не содержит его code;
 - shape ответа может расходиться с `returns`;
-- параметры принимаются "как есть", хотя реально ожидается нормализация строк в boolean/number.
-- новая строгая проверка ломает legacy falsey/string входы, которые раньше осознанно принимались методом.
-- новые локальные переменные названы тяжело, многословно, не в `camelCase` или их именование зависит от субъективного "веса" сущности.
-- неподдержанный interval, mode или format тихо переводится в дефолт вместо явного domain error.
+- параметры принимаются "как есть", хотя реально ожидается нормализация строк в boolean/number;
+- новая строгая проверка ломает legacy falsey/string входы, которые раньше осознанно принимались методом;
+- новые локальные переменные названы тяжело, многословно, не в `camelCase` или их именование зависит от субъективного "веса" сущности;
+- неподдержанный interval, mode или format тихо переводится в дефолт вместо явного domain error;
 - одинаковая нормализация action-like полей скопирована по нескольким endpoint-ам вместо общего helper-а.
 
 ## 2. Проверка `DomainError` и `.d.ts`
@@ -63,8 +63,8 @@ Review обязателен после любого task. После review ну
 - stream restart происходит после осознанного stop;
 - ключ подписки зависит от неполного набора параметров;
 - повторный subscribe плодит лишние upstream stream-ы;
-- после unsubscribe subscription исчезает, но upstream stream остается висеть без подписчиков.
-- managed stream stop logs должны отличать `idle`, `unsubscribe`, `clear`, `client.close` и `permanent-error`, чтобы эксплуатация не теряла причину остановки.
+- после unsubscribe subscription исчезает, но upstream stream остается висеть без подписчиков;
+- managed stream stop logs должны отличать `idle`, `unsubscribe`, `clear`, `client.close` и `permanent-error`, чтобы эксплуатация не теряла причину остановки;
 - если операция может быть корректно отклонена на уровне контракта, она должна возвращать `DomainError` с явным `errors` block, а не generic `Error`.
 
 ## 4. Проверка совместимости публичного API
@@ -85,8 +85,8 @@ Review обязателен после любого task. После review ну
 - код не доверяет shape внешнего ответа без defensive guards;
 - массивы и поля ошибок проверяются до чтения `.length`, индексации и доступа к вложенным полям;
 - parser-ы устойчивы к неполным numeric fields, нестандартным symbol format и неожиданным timestamp;
-- ошибки transport/read/parse отделены от доменных ошибок сервиса.
-- snapshot quote endpoints принимают instruments-only контракт, если это зафиксировано для клиента; перед upstream вызовом internal instruments всегда нормализуются в TS symbol format.
+- ошибки transport/read/parse отделены от доменных ошибок сервиса;
+- snapshot quote endpoints принимают instruments-only контракт, если это зафиксировано для клиента; перед upstream вызовом internal instruments всегда нормализуются в TS symbol format;
 - stream errors нормализуются из `{ Error, Message }` и `{ Symbol, Error }`, а не через `String(object)`;
 - `INVALID SYMBOL` не должен запускать бесконечный reconnect к тому же upstream symbol;
 - `GoAway` и `StreamStatus: 'GoAway'` остаются транзиентными stream-событиями, для которых reconnect ожидаем.
@@ -102,7 +102,8 @@ Review обязателен после любого task. После review ну
 - изменение оставляет способ увидеть текущее server-side состояние;
 - при необходимости обновлены info/introspection методы;
 - есть ручной сценарий smoke-проверки до деплоя;
-- ограничения сервиса отражены в документации, а не только в коде.
+- ограничения сервиса отражены в документации, а не только в коде;
+- worker не добавляет новый test coverage внутри обычного функционального блока; если review принимает блок, architect при необходимости создаёт отдельный test-block.
 
 Минимум для stream-изменения:
 
@@ -112,6 +113,7 @@ Review обязателен после любого task. После review ну
 4. `unsubscribe` очищает downstream subscription.
 5. После последнего unsubscribe upstream stream остановлен.
 6. `client.close` и idle timeout не оставляют висящих подписок.
+7. По логам можно восстановить lifecycle `subscribe -> touch -> unsubscribe/clear/client.close/idle -> stop`.
 
 ## 7. Постоянные review-вопросы для `ts_connect`
 
@@ -128,118 +130,6 @@ Review обязателен после любого task. После review ну
 
 ## Заключения по блокам
 
-### Заключение: Блок 7 — Stop reason propagation for managed streams
+Архив review-заключений по закрытым блокам перенесён в `doc/changelog.md`.
 
-passed with notes
-
-Проверка по блоку показала, что:
-
-- `application/domain/ts/client.js::stopStoredStream` принимает `reason = 'unknown'` и передаёт его в `stream.stopStream(reason)`;
-- managed stream wrappers для `quotes`, `charts`, `matrix`, `chains` принимают `stop({ reason })` и прокидывают причину в `stopStoredStream`;
-- старый wrapper pattern `stop: async () =>` для managed streams не найден;
-- `npm run lint` проходит;
-- `npm run types` проходит.
-
-Ограничение review:
-
-- свежего запуска после T-013 в `log/` ещё нет, поэтому runtime-строку `Stopping stream... reason: client.close` нужно подтвердить следующим контрольным запуском.
-
-Проверка задержек по `log/2026-04-13-W1.log`:
-
-- `marketdata/barcharts` первичные snapshot-запросы занимали `3517ms`, `3586ms`, `5662ms`, `1248ms`;
-- quote snapshot и stream connect занимали примерно `729ms..971ms`;
-- текущих логов достаточно, чтобы увидеть вероятную основную задержку в TradeStation barcharts upstream, но недостаточно, чтобы точно разложить полный путь до UI render в `metaterminal`.
-
-Задачи по итогам: Блок 8 (T-014) — добавить correlation-aware latency logs для загрузки графика.
-
-### Заключение: Блок 8 — Chart latency diagnostics
-
-passed with notes
-
-Проверка по блоку показала, что:
-
-- `application/api/marketdata/barcharts.js` и `application/api/marketdata/quotes.js` принимают optional `traceId` / `requestId`, генерируют локальный trace id при отсутствии входного id и логируют `api.start`, `ts.request.done` и `api.done`;
-- `application/domain/ts/barcharts.js` логирует `cache.hit`, `cache.miss`, `singleFlight.reuse`, `ts.request.done`, `redis.set.done` и `redis.set.failed` с тем же trace id;
-- `application/api/stream/quotes.js`, `application/domain/ts/client.js` и `application/lib/ts/stream.js` передают trace в stream lifecycle и логируют `stream.connect.start`, `stream.connect.done` и `stream.subscribe.done`;
-- `npm run lint` проходит;
-- `npm run types` проходит.
-
-Ограничение review:
-
-- живой контрольный прогон с медленным графиком в этой сессии не выполнялся, поэтому цепочку trace-логов нужно подтвердить на runtime в следующем smoke run.
-
-Задачи по итогам: активных задач в текущем блоке больше нет.
-
-### Заключение: Блок 9 — TS client prewarm on service start
-
-passed with notes
-
-Проверка по блоку показала, что:
-
-- `application/lib/ts/start.js` запускает best-effort фоновый prewarm только для `application.worker.id === 'W1'`;
-- prewarm вызывает `domain.ts.clients.getClient({ name: 'ptfin' })` один раз после старта, не блокируя bootstrap;
-- при отсутствии клиента или ошибке setup процесс не падает и получает только `warn/error` лог;
-- `npm run lint` проходит;
-- `npm run types` проходит.
-
-Ограничение review:
-
-- runtime-снятие cold-start gap после следующего запуска ещё требуется, чтобы подтвердить снижение первой задержки на реальном chart request.
-
-Задачи по итогам: активных задач в текущем блоке больше нет.
-
-### Заключение: Блок 10 — marketdata quotes response contract for metaterminal
-
-passed with notes
-
-Проверка по блоку показала, что:
-
-- `application/api/marketdata/quotes.js` больше не возвращает raw TradeStation callback envelope и собирает per-instrument rows в стабильном порядке входного списка;
-- `application/lib/ts/readQuote.js` теперь участвует в формировании normalized `data`/`quote` для snapshot rows;
-- `row.symbol` и `row.data.symbol` идут в internal symbol format, а `quote` хранит lowercase contract с `bid`, `bid_size`, `ask`, `ask_size`;
-- `npm run lint` проходит;
-- `npm run types` проходит.
-
-Ограничение review:
-
-- живой контрольный вызов `marketdata/quotes` для OPT instruments в этой сессии не выполнялся, поэтому runtime shape ответа нужно подтвердить следующим smoke run.
-
-Задачи по итогам: активных задач в текущем блоке больше нет.
-
-### Заключение: Блок 11 — Option chain upstream error handling
-
-passed with notes
-
-Проверка по блоку показала, что:
-
-- `application/lib/ts/stream.js` теперь нормализует upstream packet `{ Error, Message }` в `Error`-объект с полями `code`, `details`, `upstreamMessage`, `symbol` и `packet`;
-- классификация packet-error для `Failed / Internal server error` переведена в `PERMANENT -> stop`, поэтому option chain stream больше не должен уходить в бесконечный reconnect loop;
-- `application/domain/ts/streams.js::serializeError()` сохраняет читабельное `message` и дополнительные поля, не теряя upstream `Error` / `Message`;
-- `application/lib/ts/optionChain.js` больше не превращает object-error в `[object Object]` и передаёт читаемый `Error` в snapshot reject path;
-- `npm run lint` проходит;
-- `npm run types` проходит.
-
-Ограничение review:
-
-- live smoke `options.chain({ symbol: 'TSLA', expiration: '2026-05-15', range: 94, stream: true })` в этой сессии не выполнялся, поэтому runtime подтверждение остановки reconnect loop остаётся следующим контрольным шагом.
-
-Задачи по итогам: активных задач в текущем блоке больше нет.
-
-### Заключение: Блок 12 — Option chain riskFreeRate suppression
-
-passed with notes
-
-Проверка по блоку показала, что:
-
-- `application/api/options/chain.js` больше не принимает `riskFreeRate` как часть рабочего contract-а;
-- закомментированный dead code вокруг `riskFreeRate` удалён, а downstream `chainData` больше не содержит этот параметр;
-- `streamKey` для managed chain stream не получает `riskFreeRate`, потому что ключ строится из реального `data`-payload без этого поля;
-- `doc/openapi_20260411.md` теперь явно разделяет upstream TradeStation capability и текущий connector contract: `riskFreeRate` есть в upstream `GetOptionChain`, но отключён в `ts_connect`;
-- `npm run lint` проходит;
-- `npm run types` проходит.
-
-Ограничение review:
-
-- live smoke `options.chain` без `riskFreeRate` в query string в этой сессии не запускался, поэтому runtime подтверждение нового request shape остаётся следующим контрольным шагом.
-
-Задачи по итогам: активных задач в текущем блоке больше нет.
+Новые заключения добавляются сюда только для текущего активного цикла.
