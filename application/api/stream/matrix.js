@@ -1,5 +1,11 @@
 ({
   access: 'public',
+  parameters: 'json',
+  returns: 'json',
+  errors: {
+    EACTION: 'Invalid action: expected "subscribe", "unsubscribe", or "touch"',
+    ESYMBOL: 'Symbol is required for matrix subscribe requests',
+  },
   method: async ({
     symbol = null,
     type = 'STK',
@@ -12,15 +18,22 @@
   }) => {
     const trace = lib.utils.resolveTraceId({ traceId, requestId, prefix: 'stream' });
     const startedAt = Date.now();
+    const actionSet = new Set(['subscribe', 'unsubscribe', 'touch']);
     const actionValue = lib.utils.normalizeAction({ action, stop });
-    if (!symbol && !(streamKey && actionValue)) throw new Error('Symbol is required');
+    const actionLabel = actionValue ?? 'subscribe';
 
     const data = { heartbeat: true, limit: 50, increment: 0.01, enableVolume: true };
-    const rawSymbolData = symbol ? lib.utils.convertSymbol({ symbol, type }) : null;
-    const symbolData = typeof rawSymbolData === 'string' ? { symbol: rawSymbolData.toUpperCase() } : rawSymbolData;
-    const tsClient = await domain.ts.clients.getClient({});
-    const key = streamKey || tsClient.buildStreamKey({ group: 'matrix', symbol: symbolData?.symbol ?? symbol, data });
-    const actionLabel = actionValue ?? 'subscribe';
+    const rawSymbol = typeof symbol === 'string' ? symbol.trim() : '';
+    const rawSymbolData = rawSymbol ? lib.utils.convertSymbol({ symbol: rawSymbol, type }) : null;
+    let normalizedSymbol = null;
+    if (typeof rawSymbolData === 'string') {
+      normalizedSymbol = rawSymbolData.toUpperCase();
+    } else {
+      normalizedSymbol = rawSymbolData?.symbol?.toUpperCase() ?? null;
+    }
+    const providedKey = typeof streamKey === 'string' ? streamKey.trim() || null : null;
+    let key = providedKey;
+    let status = 'ok';
 
     lib.utils.traceLog({
       scope: 'stream/matrix',
@@ -28,32 +41,47 @@
       traceId: trace,
       action: actionLabel,
       streamKey: key,
-      symbol: symbolData?.symbol ?? (typeof symbol === 'string' ? symbol.toUpperCase() : null),
+      symbol: normalizedSymbol,
       extra: { idleMs, type },
     });
 
     try {
+      if (actionValue !== null && !actionSet.has(actionValue)) {
+        status = 'error:EACTION';
+        return new DomainError('EACTION');
+      }
+
+      const symbolRequired = actionValue === null || actionValue === 'subscribe';
+      if (!normalizedSymbol && (symbolRequired || !key)) {
+        status = 'error:ESYMBOL';
+        return new DomainError('ESYMBOL');
+      }
+
+      const tsClient = await domain.ts.clients.getClient({});
+      if (!key) {
+        key = tsClient.buildStreamKey({ group: 'matrix', symbol: normalizedSymbol, data });
+      }
+
       if (actionValue === 'unsubscribe') {
-        return domain.ts.streams.unsubscribe({ kind: 'matrix', key, client: context.client });
+        return await domain.ts.streams.unsubscribe({ kind: 'matrix', key, client: context.client });
       }
       if (actionValue === 'touch') {
-        return domain.ts.streams.touch({ kind: 'matrix', key, client: context.client, idleMs });
+        return await domain.ts.streams.touch({ kind: 'matrix', key, client: context.client, idleMs });
       }
 
-      if (!symbolData) throw new Error('Invalid symbol for matrix stream');
-      const endpoint = ['stream', 'matrix', 'changes', symbol];
+      const endpoint = ['stream', 'matrix', 'changes', normalizedSymbol];
 
-      return domain.ts.streams.subscribe({
+      return await domain.ts.streams.subscribe({
         kind: 'matrix',
         key,
         client: context.client,
         idleMs,
-        metadata: { symbol: symbolData.symbol },
+        metadata: { symbol: normalizedSymbol, owner: 'metaterminal', streamKey: key },
         start: async ({ notifyError, emit }) => {
           const onData = (message) => {
             if (message.AskSize === undefined && message.BidSize === undefined) return;
 
-            const packet = { symbol: symbolData.symbol, price: message.Price };
+            const packet = { symbol: normalizedSymbol, price: message.Price };
             if (message.BidSize > 0) {
               packet.type = 'bid';
               packet.size = message.BidSize;
@@ -77,7 +105,13 @@
             notifyError(error);
           };
 
-          const registeredKey = await tsClient.streamMatrix({ endpoint, symbol: symbolData.symbol, data, onData, onError });
+          const registeredKey = await tsClient.streamMatrix({
+            endpoint,
+            symbol: normalizedSymbol,
+            data,
+            onData,
+            onError,
+          });
           return {
             stop: async ({ reason = 'unknown' } = {}) => {
               await tsClient.stopStoredStream({ group: 'matrix', key: registeredKey, reason });
@@ -85,6 +119,9 @@
           };
         },
       });
+    } catch (error) {
+      status = error instanceof DomainError ? `error:${error.code}` : 'error:internal';
+      throw error;
     } finally {
       lib.utils.traceLog({
         scope: 'stream/matrix',
@@ -92,9 +129,9 @@
         traceId: trace,
         action: actionLabel,
         streamKey: key,
-        symbol: symbolData?.symbol ?? (typeof symbol === 'string' ? symbol.toUpperCase() : null),
+        symbol: normalizedSymbol,
         durationMs: Date.now() - startedAt,
-        extra: { idleMs, type },
+        extra: { idleMs, type, status },
       });
     }
   },

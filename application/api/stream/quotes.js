@@ -1,5 +1,11 @@
 ({
   access: 'public',
+  parameters: 'json',
+  returns: 'json',
+  errors: {
+    EACTION: 'Invalid action: expected "subscribe", "unsubscribe", or "touch"',
+    EINSTRUMENTS: 'At least one valid instrument is required for quote subscribe requests',
+  },
   method: async ({
     instruments = [],
     action = 'subscribe',
@@ -11,24 +17,61 @@
   }) => {
     const trace = lib.utils.resolveTraceId({ traceId, requestId, prefix: 'stream' });
     const startedAt = Date.now();
+    const actionSet = new Set(['subscribe', 'unsubscribe', 'touch']);
     const actionValue = lib.utils.normalizeAction({ action, stop });
-    const symbols = instruments.map((instrument) => {
-      const { asset_category: type, symbol } = instrument;
-      return lib.utils.makeTSSymbol(symbol, type);
-    });
-    const key = streamKey || Array.from(new Set(symbols)).sort().join(',');
+    const actionLabel = actionValue ?? 'subscribe';
+    const providedKey = typeof streamKey === 'string' ? streamKey.trim() || null : null;
+    let key = providedKey;
+    let status = 'ok';
+    let validInstrumentCount = 0;
+    let tsSymbolCount = 0;
 
     lib.utils.traceLog({
       scope: 'stream/quotes',
       phase: 'api.start',
       traceId: trace,
       streamKey: key,
-      action: actionValue ?? 'subscribe',
-      extra: { symbolCount: instruments.length, tsSymbolCount: symbols.length },
+      action: actionLabel,
+      extra: { instrumentCount: instruments.length },
     });
 
     try {
-      if (!key) throw new Error('Instruments are required');
+      if (actionValue !== null && !actionSet.has(actionValue)) {
+        status = 'error:EACTION';
+        return new DomainError('EACTION');
+      }
+
+      const normalizedSymbols = [];
+      for (const instrument of instruments) {
+        if (!instrument || typeof instrument !== 'object') continue;
+        const symbol = typeof instrument.symbol === 'string' ? instrument.symbol.trim() : '';
+        if (!symbol) continue;
+
+        const type = typeof instrument.asset_category === 'string' ? instrument.asset_category : 'STK';
+        try {
+          normalizedSymbols.push(lib.utils.makeTSSymbol(symbol, type));
+          validInstrumentCount += 1;
+        } catch (error) {
+          console.error('Invalid quote instrument:', instrument, error);
+        }
+      }
+
+      const symbols = Array.from(new Set(normalizedSymbols)).sort();
+      tsSymbolCount = symbols.length;
+
+      if (actionValue === 'subscribe' && symbols.length === 0) {
+        status = 'error:EINSTRUMENTS';
+        return new DomainError('EINSTRUMENTS');
+      }
+
+      if (!key) {
+        if (symbols.length === 0) {
+          status = 'error:EINSTRUMENTS';
+          return new DomainError('EINSTRUMENTS');
+        }
+        key = symbols.join(',');
+      }
+
       if (actionValue === 'unsubscribe') {
         return await domain.ts.streams.unsubscribe({ kind: 'quotes', key, client: context.client });
       }
@@ -77,15 +120,23 @@
           };
         },
       });
+    } catch (error) {
+      status = error instanceof DomainError ? `error:${error.code}` : 'error:internal';
+      throw error;
     } finally {
       lib.utils.traceLog({
         scope: 'stream/quotes',
         phase: 'api.done',
         traceId: trace,
         streamKey: key,
-        action: actionValue ?? 'subscribe',
+        action: actionLabel,
         durationMs: Date.now() - startedAt,
-        extra: { symbolCount: instruments.length, tsSymbolCount: symbols.length },
+        extra: {
+          instrumentCount: instruments.length,
+          validInstrumentCount,
+          tsSymbolCount,
+          status,
+        },
       });
     }
   },

@@ -132,4 +132,22 @@ Review обязателен после любого task. После review ну
 
 Архив review-заключений по закрытым блокам перенесён в `doc/changelog.md`.
 
+### Заключение: Блок 16 — Managed Level II streams for metaterminal
+
+Статус: passed with notes
+Проблемы: live TradeStation runtime smoke для `stream/quotes` и `stream/matrix` в этом workspace не запускался.
+Задачи:
+
+- `stream/quotes` и `stream/matrix` получили явный contract metadata, action validation, независимые stream keys и stop diagnostics
+- lifecycle stop semantics теперь видны по `api.start` / `api.done` с различимым `streamKey` и `status`
+
+### Заключение: Блок 17 — Tickbars contract and diagnostics parity
+
+Статус: passed with notes
+Проблемы: live TradeStation runtime smoke для `marketdata/tickbars` в этом workspace не запускался.
+Задачи:
+
+- `marketdata/tickbars` теперь валидирует `symbol`, `interval`, `bars`, логирует `api.start` / `ts.request.done` / `api.done` и использует корректный v2 stream path
+- endpoint читает JSON-lines stream и возвращает parsed packet array вместо прежнего broken passthrough
+
 Новые заключения добавляются сюда только для текущего активного цикла.
