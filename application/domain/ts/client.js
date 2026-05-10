@@ -34,13 +34,13 @@ async () => ({
     return suffix ? `${prefix}?${suffix}` : prefix;
   },
 
-  async stopStoredStream({ group, key }) {
+  async stopStoredStream({ group, key, reason = 'unknown' }) {
     const bucket = this.getStreamBucket(group);
     const stream = bucket[key];
     if (!stream) return false;
 
     try {
-      await stream.stopStream();
+      await stream.stopStream(reason);
     } catch (error) {
       console.warn(`Failed to stop stream ${group}:${key}:`, error);
     }
@@ -148,11 +148,11 @@ async () => ({
     }
   },
 
-  async streamQuotes({ endpoint, onData, onError }) {
+  async streamQuotes({ endpoint, onData, onError, trace = null }) {
     try {
       const key = this.buildStreamKey({ group: 'quotes', endpoint });
 
-      const stream = lib.ts.stream({ live: true, endpoint, tokens: this.tokens, onData, onError });
+      const stream = lib.ts.stream({ live: true, endpoint, tokens: this.tokens, onData, onError, trace });
       await stream.initiateStream();
       await this.setStoredStream({ group: 'quotes', key, stream });
       return key;

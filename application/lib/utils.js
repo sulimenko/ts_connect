@@ -41,6 +41,58 @@
     });
   },
 
+  makeTraceId(prefix = 'tr') {
+    const time = Date.now().toString(36);
+    const random = Math.random().toString(36).slice(2, 8);
+    return `${prefix}-${time}-${random}`;
+  },
+
+  resolveTraceId({ traceId = null, requestId = null, prefix = 'tr' } = {}) {
+    for (const value of [traceId, requestId]) {
+      if (typeof value !== 'string') continue;
+      const trimmed = value.trim();
+      if (trimmed) return trimmed;
+    }
+    return this.makeTraceId(prefix);
+  },
+
+  traceLog({
+    scope,
+    phase,
+    traceId = null,
+    endpoint = null,
+    action = null,
+    symbol = null,
+    streamKey = null,
+    period = null,
+    limit = null,
+    durationMs = null,
+    extra = {},
+  }) {
+    if (!scope || !phase) return;
+
+    const parts = [`${scope}`, phase];
+    const fields = [];
+    if (traceId) fields.push(`traceId=${traceId}`);
+    if (endpoint) fields.push(`endpoint=${endpoint}`);
+    if (action) fields.push(`action=${action}`);
+    if (symbol) fields.push(`symbol=${symbol}`);
+    if (streamKey) fields.push(`streamKey=${streamKey}`);
+    if (period !== null && period !== undefined) fields.push(`period=${period}`);
+    if (limit !== null && limit !== undefined) fields.push(`limit=${limit}`);
+    if (durationMs !== null && durationMs !== undefined) fields.push(`durationMs=${durationMs}`);
+
+    if (extra && typeof extra === 'object') {
+      for (const [key, value] of Object.entries(extra)) {
+        if (value === undefined || value === null || value === '') continue;
+        fields.push(`${key}=${value}`);
+      }
+    }
+
+    const line = fields.length > 0 ? `${parts.join(' ')} ${fields.join(' ')}` : parts.join(' ');
+    console.info(line);
+  },
+
   normalizeAction({ action = null, stop = false }) {
     let actionValue = stop ? 'unsubscribe' : action;
     if (typeof actionValue === 'string') actionValue = actionValue.trim().toLowerCase() || null;
@@ -140,7 +192,7 @@
       const month = date.slice(2, 4);
       const day = date.slice(4, 6);
       const tsSymbol = sym.toUpperCase() + ' ' + year + month + day + cp.toUpperCase() + parseFloat(strike) / 1000;
-      console.debug('makeTSSymbol:', symbol, '->', tsSymbol, 'date:', year + month + day, 'len:', (year + month + day).length);
+      // console.debug('makeTSSymbol:', symbol, '->', tsSymbol, 'date:', year + month + day, 'len:', (year + month + day).length);
       return tsSymbol;
     }
     throw new Error('Unsupported instrument type');

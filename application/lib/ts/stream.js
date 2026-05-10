@@ -1,5 +1,5 @@
-({ domain = null, live, ver = 'v3', endpoint, tokens, data = {}, onData, onError }) => ({
-  currentParams: { domain, live, ver, endpoint, tokens, data, onData, onError },
+({ domain = null, live, ver = 'v3', endpoint, tokens, data = {}, onData, onError, trace = null }) => ({
+  currentParams: { domain, live, ver, endpoint, tokens, data, onData, onError, trace },
   reconnectDelay: 5000,
   maxReconnectDelay: 60000,
 
@@ -10,6 +10,20 @@
 
   endpointName() {
     return this.currentParams.endpoint.join('/');
+  },
+
+  traceLog(phase, { startedAt = null, extra = {} } = {}) {
+    const trace = this.currentParams.trace;
+    if (!trace?.traceId) return;
+    lib.utils.traceLog({
+      scope: trace.scope ?? 'stream',
+      phase,
+      traceId: trace.traceId,
+      endpoint: this.endpointName(),
+      streamKey: trace.streamKey ?? null,
+      durationMs: startedAt === null ? null : Date.now() - startedAt,
+      extra,
+    });
   },
 
   clearReconnectTimer() {
@@ -34,6 +48,8 @@
     this.clearReconnectTimer();
     this.clearHeartbeatTimer();
     this.abortActiveStream('restart');
+    const startedAt = Date.now();
+    this.traceLog('stream.connect.start');
 
     const abortController = new AbortController();
     this.abortController = abortController;
@@ -59,8 +75,10 @@
       if (signal.aborted || !this.shouldReconnect) return () => this.stopStream();
 
       console.log('Connection established:', url);
+      this.traceLog('stream.connect.done', { startedAt });
       this.reconnectDelay = 5000;
       this.checkTimeout();
+      this.traceLog('stream.subscribe.done', { startedAt });
       void this.processStream(response.body.getReader(), onData, onError, signal);
     } catch (err) {
       if (err.name === 'AbortError' || signal.aborted || !this.shouldReconnect) {
@@ -89,8 +107,15 @@
     if (packet.Error) {
       const errorText = `${packet.Error} ${packet.Message ?? ''}`.trim();
       console.error('Stream error:', this.endpointName(), errorText);
-      if (onError) onError(packet);
-      const permanent = /INVALID/i.test(packet.Error) && !/GoAway/i.test(errorText);
+      const error = new Error(errorText);
+      error.code = packet.Error;
+      error.upstreamMessage = packet.Message ?? null;
+      error.details = packet.Message ?? null;
+      error.symbol = packet.Symbol ?? null;
+      error.packet = packet;
+      if (onError) onError(error);
+      const permanent =
+        /INVALID/i.test(packet.Error) || (/Failed/i.test(packet.Error) && /Internal server error/i.test(packet.Message ?? ''));
       console.warn('Stream error classification:', this.endpointName(), permanent ? 'PERMANENT -> stop' : 'TRANSIENT -> reconnect');
       if (permanent) {
         this.stopStream('permanent-error');

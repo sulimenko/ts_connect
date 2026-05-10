@@ -56,8 +56,8 @@ async ({
 
       const registeredKey = await tsClient.streamChains({ endpoint, symbol, data, onData, onError });
       return {
-        stop: async () => {
-          await tsClient.stopStoredStream({ group: 'chains', key: registeredKey });
+        stop: async ({ reason = 'unknown' } = {}) => {
+          await tsClient.stopStoredStream({ group: 'chains', key: registeredKey, reason });
         },
       };
     },

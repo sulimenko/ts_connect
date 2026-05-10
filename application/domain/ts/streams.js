@@ -34,15 +34,44 @@
 
   serializeError(error) {
     if (error instanceof Error) {
-      return {
+      const serialized = {
         message: error.message,
         name: error.name,
         stack: error.stack,
       };
+
+      if (error.code !== undefined) serialized.code = error.code;
+      if (error.code !== undefined) serialized.error = error.code;
+      if (error.details !== undefined) serialized.details = error.details;
+      if (error.upstreamMessage !== undefined) serialized.upstreamMessage = error.upstreamMessage;
+      if (error.symbol !== undefined) serialized.symbol = error.symbol;
+      return serialized;
     }
 
     if (typeof error === 'string') return { message: error };
-    if (error?.Error) return { message: error.Error, symbol: error.Symbol ?? null };
+    if (error?.Error) {
+      const message = error.Message ? `${error.Error}: ${error.Message}` : error.Error;
+      const serialized = {
+        message,
+        error: error.Error,
+        details: error.Message ?? null,
+        upstreamMessage: error.Message ?? null,
+        symbol: error.Symbol ?? null,
+      };
+      if (error.code !== undefined) serialized.code = error.code;
+      return serialized;
+    }
+
+    if (error?.message) {
+      const serialized = { message: error.message };
+      if (error.name !== undefined) serialized.name = error.name;
+      if (error.code !== undefined) serialized.code = error.code;
+      if (error.details !== undefined) serialized.details = error.details;
+      if (error.upstreamMessage !== undefined) serialized.upstreamMessage = error.upstreamMessage;
+      if (error.symbol !== undefined) serialized.symbol = error.symbol;
+      return serialized;
+    }
+
     const fallback = String(error?.message ?? error);
     console.warn('serializeError fallback:', fallback, 'original type:', typeof error);
     return { message: fallback };

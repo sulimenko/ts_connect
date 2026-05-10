@@ -19,7 +19,6 @@
     streamKey = null,
     idleMs = null,
     spreadType = 'Single',
-    riskFreeRate = null,
     priceCenter = null,
     strikeInterval = 1,
     enableGreeks = true,
@@ -57,9 +56,7 @@
 
     if (expiration) chainData.expiration = expiration;
     if (expiration2) chainData.expiration2 = expiration2;
-    const riskRate = toNumber(riskFreeRate);
     const centerPrice = toNumber(priceCenter);
-    if (riskRate !== null) chainData.riskFreeRate = riskRate;
     if (centerPrice !== null) chainData.priceCenter = centerPrice;
 
     if (!streamMode) {

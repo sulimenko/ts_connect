@@ -1,6 +1,33 @@
 async ({ endpoint, symbol, data }) => {
   const client = await domain.ts.clients.getClient({});
   return new Promise((resolve, reject) => {
+    const normalizeError = (err) => {
+      if (err instanceof Error) return err;
+
+      if (err?.Error) {
+        const message = err.Message ? `${err.Error}: ${err.Message}` : err.Error;
+        const error = new Error(message);
+        error.code = err.Error;
+        error.details = err.Message ?? null;
+        error.upstreamMessage = err.Message ?? null;
+        error.symbol = err.Symbol ?? null;
+        error.packet = err;
+        return error;
+      }
+
+      if (err?.message) {
+        const error = new Error(err.message);
+        if (err.name !== undefined) error.name = err.name;
+        if (err.code !== undefined) error.code = err.code;
+        if (err.details !== undefined) error.details = err.details;
+        if (err.upstreamMessage !== undefined) error.upstreamMessage = err.upstreamMessage;
+        if (err.symbol !== undefined) error.symbol = err.symbol;
+        return error;
+      }
+
+      return new Error(String(err));
+    };
+
     const expectedStrikes = Math.max(0, Number(data.strikeProximity) || 0) * 2;
     const expectedLegsPerStrike = data.optionType === 'All' ? 2 : 1;
     const response = {
@@ -55,7 +82,7 @@ async ({ endpoint, symbol, data }) => {
     };
 
     const onError = (err) => {
-      void finalize(response, err instanceof Error ? err : new Error(String(err)));
+      void finalize(response, normalizeError(err));
     };
 
     client

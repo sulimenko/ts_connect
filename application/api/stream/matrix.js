@@ -56,8 +56,8 @@
 
         const registeredKey = await tsClient.streamMatrix({ endpoint, symbol: symbolData.symbol, data, onData, onError });
         return {
-          stop: async () => {
-            await tsClient.stopStoredStream({ group: 'matrix', key: registeredKey });
+          stop: async ({ reason = 'unknown' } = {}) => {
+            await tsClient.stopStoredStream({ group: 'matrix', key: registeredKey, reason });
           },
         };
       },

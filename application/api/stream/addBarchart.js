@@ -70,8 +70,8 @@
           onError,
         });
         return {
-          stop: async () => {
-            await tsClient.stopStoredStream({ group: 'charts', key: registeredKey });
+          stop: async ({ reason = 'unknown' } = {}) => {
+            await tsClient.stopStoredStream({ group: 'charts', key: registeredKey, reason });
           },
         };
       },

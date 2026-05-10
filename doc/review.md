@@ -128,4 +128,118 @@ Review обязателен после любого task. После review ну
 
 ## Заключения по блокам
 
-Активных заключений нет. Заключения по завершённому циклу T-001..T-012 перенесены в `doc/changelog.md`.
+### Заключение: Блок 7 — Stop reason propagation for managed streams
+
+passed with notes
+
+Проверка по блоку показала, что:
+
+- `application/domain/ts/client.js::stopStoredStream` принимает `reason = 'unknown'` и передаёт его в `stream.stopStream(reason)`;
+- managed stream wrappers для `quotes`, `charts`, `matrix`, `chains` принимают `stop({ reason })` и прокидывают причину в `stopStoredStream`;
+- старый wrapper pattern `stop: async () =>` для managed streams не найден;
+- `npm run lint` проходит;
+- `npm run types` проходит.
+
+Ограничение review:
+
+- свежего запуска после T-013 в `log/` ещё нет, поэтому runtime-строку `Stopping stream... reason: client.close` нужно подтвердить следующим контрольным запуском.
+
+Проверка задержек по `log/2026-04-13-W1.log`:
+
+- `marketdata/barcharts` первичные snapshot-запросы занимали `3517ms`, `3586ms`, `5662ms`, `1248ms`;
+- quote snapshot и stream connect занимали примерно `729ms..971ms`;
+- текущих логов достаточно, чтобы увидеть вероятную основную задержку в TradeStation barcharts upstream, но недостаточно, чтобы точно разложить полный путь до UI render в `metaterminal`.
+
+Задачи по итогам: Блок 8 (T-014) — добавить correlation-aware latency logs для загрузки графика.
+
+### Заключение: Блок 8 — Chart latency diagnostics
+
+passed with notes
+
+Проверка по блоку показала, что:
+
+- `application/api/marketdata/barcharts.js` и `application/api/marketdata/quotes.js` принимают optional `traceId` / `requestId`, генерируют локальный trace id при отсутствии входного id и логируют `api.start`, `ts.request.done` и `api.done`;
+- `application/domain/ts/barcharts.js` логирует `cache.hit`, `cache.miss`, `singleFlight.reuse`, `ts.request.done`, `redis.set.done` и `redis.set.failed` с тем же trace id;
+- `application/api/stream/quotes.js`, `application/domain/ts/client.js` и `application/lib/ts/stream.js` передают trace в stream lifecycle и логируют `stream.connect.start`, `stream.connect.done` и `stream.subscribe.done`;
+- `npm run lint` проходит;
+- `npm run types` проходит.
+
+Ограничение review:
+
+- живой контрольный прогон с медленным графиком в этой сессии не выполнялся, поэтому цепочку trace-логов нужно подтвердить на runtime в следующем smoke run.
+
+Задачи по итогам: активных задач в текущем блоке больше нет.
+
+### Заключение: Блок 9 — TS client prewarm on service start
+
+passed with notes
+
+Проверка по блоку показала, что:
+
+- `application/lib/ts/start.js` запускает best-effort фоновый prewarm только для `application.worker.id === 'W1'`;
+- prewarm вызывает `domain.ts.clients.getClient({ name: 'ptfin' })` один раз после старта, не блокируя bootstrap;
+- при отсутствии клиента или ошибке setup процесс не падает и получает только `warn/error` лог;
+- `npm run lint` проходит;
+- `npm run types` проходит.
+
+Ограничение review:
+
+- runtime-снятие cold-start gap после следующего запуска ещё требуется, чтобы подтвердить снижение первой задержки на реальном chart request.
+
+Задачи по итогам: активных задач в текущем блоке больше нет.
+
+### Заключение: Блок 10 — marketdata quotes response contract for metaterminal
+
+passed with notes
+
+Проверка по блоку показала, что:
+
+- `application/api/marketdata/quotes.js` больше не возвращает raw TradeStation callback envelope и собирает per-instrument rows в стабильном порядке входного списка;
+- `application/lib/ts/readQuote.js` теперь участвует в формировании normalized `data`/`quote` для snapshot rows;
+- `row.symbol` и `row.data.symbol` идут в internal symbol format, а `quote` хранит lowercase contract с `bid`, `bid_size`, `ask`, `ask_size`;
+- `npm run lint` проходит;
+- `npm run types` проходит.
+
+Ограничение review:
+
+- живой контрольный вызов `marketdata/quotes` для OPT instruments в этой сессии не выполнялся, поэтому runtime shape ответа нужно подтвердить следующим smoke run.
+
+Задачи по итогам: активных задач в текущем блоке больше нет.
+
+### Заключение: Блок 11 — Option chain upstream error handling
+
+passed with notes
+
+Проверка по блоку показала, что:
+
+- `application/lib/ts/stream.js` теперь нормализует upstream packet `{ Error, Message }` в `Error`-объект с полями `code`, `details`, `upstreamMessage`, `symbol` и `packet`;
+- классификация packet-error для `Failed / Internal server error` переведена в `PERMANENT -> stop`, поэтому option chain stream больше не должен уходить в бесконечный reconnect loop;
+- `application/domain/ts/streams.js::serializeError()` сохраняет читабельное `message` и дополнительные поля, не теряя upstream `Error` / `Message`;
+- `application/lib/ts/optionChain.js` больше не превращает object-error в `[object Object]` и передаёт читаемый `Error` в snapshot reject path;
+- `npm run lint` проходит;
+- `npm run types` проходит.
+
+Ограничение review:
+
+- live smoke `options.chain({ symbol: 'TSLA', expiration: '2026-05-15', range: 94, stream: true })` в этой сессии не выполнялся, поэтому runtime подтверждение остановки reconnect loop остаётся следующим контрольным шагом.
+
+Задачи по итогам: активных задач в текущем блоке больше нет.
+
+### Заключение: Блок 12 — Option chain riskFreeRate suppression
+
+passed with notes
+
+Проверка по блоку показала, что:
+
+- `application/api/options/chain.js` больше не принимает `riskFreeRate` как часть рабочего contract-а;
+- закомментированный dead code вокруг `riskFreeRate` удалён, а downstream `chainData` больше не содержит этот параметр;
+- `streamKey` для managed chain stream не получает `riskFreeRate`, потому что ключ строится из реального `data`-payload без этого поля;
+- `doc/openapi_20260411.md` теперь явно разделяет upstream TradeStation capability и текущий connector contract: `riskFreeRate` есть в upstream `GetOptionChain`, но отключён в `ts_connect`;
+- `npm run lint` проходит;
+- `npm run types` проходит.
+
+Ограничение review:
+
+- live smoke `options.chain` без `riskFreeRate` в query string в этой сессии не запускался, поэтому runtime подтверждение нового request shape остаётся следующим контрольным шагом.
+
+Задачи по итогам: активных задач в текущем блоке больше нет.
