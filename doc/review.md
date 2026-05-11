@@ -39,8 +39,9 @@ Review обязателен после любого task. После review ну
 
 - доменные ошибки используются только для предсказуемых ограничений контракта;
 - внутренние дефекты, поломки интеграции и unexpected cases не маскируются под `DomainError`;
+- `.d.ts` рядом с `application/api/*` не требуется по умолчанию;
 - если рядом есть `.d.ts`, коды ошибок синхронизированы с `errors` в `.js`;
-- если `.d.ts` отсутствует у публичного метода со стабильными доменными кодами ошибок, это должно быть осознанное решение.
+- отсутствие `.d.ts` у публичного метода само по себе не является проблемой.
 
 Нужно помнить:
 
@@ -149,5 +150,14 @@ Review обязателен после любого task. После review ну
 
 - `marketdata/tickbars` теперь валидирует `symbol`, `interval`, `bars`, логирует `api.start` / `ts.request.done` / `api.done` и использует корректный v2 stream path
 - endpoint читает JSON-lines stream и возвращает parsed packet array вместо прежнего broken passthrough
+
+### Заключение: Блок 18 — Options API style alignment
+
+Статус: passed with notes
+Проблемы: live TradeStation runtime smoke для option snapshot methods в этом workspace не запускался.
+Задачи:
+
+- `application/api/options/strikes.js`, `application/api/options/expirations.js`, `application/api/options/riskreward.js` и `application/api/options/spreadtypes.js` получили явные contract fields и predictable domain validation where applicable
+- legacy option wrappers приведены к более uniform snapshot style без изменения business meaning endpoint-ов
 
 Новые заключения добавляются сюда только для текущего активного цикла.

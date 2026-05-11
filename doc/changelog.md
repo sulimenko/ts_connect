@@ -31,6 +31,7 @@
 | T-020 | Добавить uniform lifecycle logs для stream request / touch / stop                        | [x]    | 2026-05-10 | Lifecycle-логи покрывают `api.start/api.done`, `touch`, `clear`, `unsubscribe`, `idle`, `client.close` и `permanent-error`.             |
 | T-022 | Довести contract для `stream/matrix` и `stream/quotes` до metaterminal-managed lifecycle | [x]    | 2026-05-10 | `stream/quotes` и `stream/matrix` получили contract metadata, action validation и независимые stream keys.                              |
 | T-023 | Привести `marketdata/tickbars` к contract/logging parity с `marketdata/quotes`           | [x]    | 2026-05-10 | `marketdata/tickbars` теперь валидирует вход, читает v2 JSON-lines stream и логирует `api.start` / `ts.request.done` / `api.done`.      |
+| T-024 | Привести option snapshot endpoints к стилю `application/api/options/chain.js`            | [x]    | 2026-05-10 | `strikes`, `expirations`, `riskreward` и `spreadtypes` выровнены по contract-first style с predictable domain validation.               |
 
 ---
 
@@ -57,3 +58,4 @@
 | 2026-05-10 | Блок 14 — Stream lifecycle observability                                | passed with notes   | Lifecycle-логи теперь позволяют восстановить `subscribe -> touch -> unsubscribe/clear/client.close/idle -> stop` по пустому логу одного запуска.       |
 | 2026-05-10 | Блок 16 — Managed Level II streams for metaterminal                     | passed with notes   | `stream/quotes` и `stream/matrix` теперь имеют explicit contract metadata, action validation и независимые stop/reuse keys.                            |
 | 2026-05-10 | Блок 17 — Tickbars contract and diagnostics parity                      | passed with notes   | `marketdata/tickbars` стал contract-aware stream reader с trace-логами и predictable domain validation.                                                |
+| 2026-05-10 | Блок 18 — Options API style alignment                                   | passed with notes   | `application/api/options/*` получил uniform contract metadata и predictable invalid-input handling там, где это применимо.                             |
