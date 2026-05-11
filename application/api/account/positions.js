@@ -14,9 +14,11 @@
         const exist = domain.ts.positions.getAccount({ account: contract.account });
         for (const symbol of exist.keys()) {
           const internal = exist.get(symbol);
+          const internalSymbol = lib.utils.makeSymbol(internal.get('Symbol') ?? symbol)?.symbol ?? null;
           const external =
-            responce.Positions?.find((each) => each.AccountID === internal.get('AccountID') && each.Symbol === internal.get('Symbol')) ||
-            {};
+            responce.Positions?.find(
+              (each) => each.AccountID === internal.get('AccountID') && lib.utils.makeSymbol(each.Symbol)?.symbol === internalSymbol,
+            ) || {};
           try {
             // console.info('positions', symbol, 'internal', internal.get('Quantity'), '=', external.Quantity ?? 'empty', 'external');
             if (parseFloat(internal.get('Quantity') ?? 0) !== parseFloat(external.Quantity ?? 0)) {

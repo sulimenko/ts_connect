@@ -100,6 +100,64 @@
     return actionValue;
   },
 
+  formatStrike(strike) {
+    const value = Number(strike);
+    if (!Number.isFinite(value)) return null;
+    const partStrike = value.toFixed(3).split('.');
+    return partStrike[0].padStart(5, 0) + partStrike[1].padEnd(3, '0');
+  },
+
+  parseSymbol(symbol) {
+    if (typeof symbol !== 'string') return null;
+    const trimmed = symbol.trim();
+    if (!trimmed) return null;
+
+    const tsOptMatch = trimmed.match(/^([A-Z]+)\s+(\d{6})([CP])((\d+)?(?:\.\d+)?)$/i);
+    if (tsOptMatch) {
+      const [, underlying, expCode, optType, strikeRaw] = tsOptMatch;
+      const strike = this.formatStrike(strikeRaw);
+      if (!strike) return null;
+      const normalized = underlying.toUpperCase() + expCode + optType + strike;
+      return {
+        type: 'OPT',
+        underlying: underlying.toUpperCase(),
+        expCode,
+        optType,
+        strike,
+        strikeValue: Number(strike) / 1000,
+        symbol: normalized,
+        tsSymbol: `${underlying.toUpperCase()} ${expCode}${optType}${Number(strike) / 1000}`,
+      };
+    }
+
+    const canonicalOptMatch = trimmed.match(/^([A-Z]+)(\d{6})([CP])(\d+)$/i);
+    if (canonicalOptMatch) {
+      const [, underlying, expCode, optType, strikeRaw] = canonicalOptMatch;
+      const strikeValue = Number(strikeRaw) / 1000;
+      if (!Number.isFinite(strikeValue)) return null;
+      const strike = this.formatStrike(strikeValue);
+      if (!strike) return null;
+      const normalized = underlying.toUpperCase() + expCode + optType + strike;
+      return {
+        type: 'OPT',
+        underlying: underlying.toUpperCase(),
+        expCode,
+        optType,
+        strike,
+        strikeValue,
+        symbol: normalized,
+        tsSymbol: `${underlying.toUpperCase()} ${expCode}${optType}${strikeValue}`,
+      };
+    }
+
+    return {
+      type: 'STK',
+      symbol: trimmed.toUpperCase(),
+      underlying: trimmed.toUpperCase(),
+      tsSymbol: trimmed.toUpperCase(),
+    };
+  },
+
   constructDomain(live) {
     try {
       const domainPart = live ? config.ts.url.live : config.ts.url.sim;
@@ -169,33 +227,12 @@
     return isBuy ? 'Buy' : 'Sell';
   },
 
-  convertSymbol({ symbol, type = 'STK' }) {
-    if (type === 'OPT') {
-      const symbolMatch = symbol.match(/^([A-Z]+)\s*(\d{6})([CP])((\d+)?(?:\.\d+)?)$/i);
-      if (!symbolMatch) return null;
-      const [, underlying, expCode, optType, strikePrice] = symbolMatch;
-      const partStrike = parseFloat(strikePrice).toFixed(3).toString().split('.');
-      const strike = partStrike[0].padStart(5, 0) + partStrike[1].padEnd(3, '0');
-      return { symbol: underlying.toUpperCase() + expCode + optType + strike, underlying: underlying.toUpperCase(), strike };
-    }
-    return symbol;
-  },
-
-  // MSTR 251010C352.5
   makeTSSymbol(symbol, type = 'STK') {
-    if (type === 'STK') return symbol.toUpperCase();
-    if (type === 'OPT') {
-      const match = symbol.match(/^([A-Z]+)(\d{6})([CP])(\d+(?:\.\d+)?)$/i);
-      if (!match) throw new Error('Invalid option symbol format');
-      const [, sym, date, cp, strike] = match;
-      const year = date.slice(0, 2);
-      const month = date.slice(2, 4);
-      const day = date.slice(4, 6);
-      const tsSymbol = sym.toUpperCase() + ' ' + year + month + day + cp.toUpperCase() + parseFloat(strike) / 1000;
-      // console.debug('makeTSSymbol:', symbol, '->', tsSymbol, 'date:', year + month + day, 'len:', (year + month + day).length);
-      return tsSymbol;
-    }
-    throw new Error('Unsupported instrument type');
+    const parsed = this.parseSymbol(symbol);
+    if (type !== 'OPT' && type !== 'STK') throw new Error('Unsupported instrument type');
+    if (!parsed) throw new Error('Invalid option symbol format');
+    if (type === 'OPT' && parsed.type !== 'OPT') throw new Error('Invalid option symbol format');
+    return parsed.tsSymbol;
   },
 
   normalizeBarPeriod(period) {
@@ -217,18 +254,28 @@
   },
 
   makeSymbol(symbol) {
-    const symbolMatch = symbol.match(/^([A-Z]+)\s*(\d{6})([CP])((\d+)?(?:\.\d+)?)$/i);
-    if (!symbolMatch) return { type: 'STK', symbol: symbol.toUpperCase() };
-    const [, underlying, expCode, optType, strikeRaw] = symbolMatch;
-    const partStrike = parseFloat(strikeRaw).toFixed(3).toString().split('.'); // "450" → "450.00"
-    const strike = partStrike[0].padStart(5, 0) + partStrike[1].padEnd(3, '0');
+    const parsed = this.parseSymbol(symbol);
+    if (!parsed) return null;
     return {
-      type: 'OPT',
-      underlying,
-      expCode,
-      optType,
-      strike,
-      symbol: underlying.toUpperCase() + expCode + optType + strike,
+      type: parsed.type,
+      symbol: parsed.symbol,
+      underlying: parsed.underlying ?? null,
+      expCode: parsed.expCode ?? null,
+      optType: parsed.optType ?? null,
+      strike: parsed.strike ?? null,
+      strikeValue: parsed.strikeValue ?? null,
+      tsSymbol: parsed.tsSymbol ?? null,
     };
+  },
+
+  normalizePositionSymbol(symbol) {
+    return this.makeSymbol(symbol)?.symbol?.toUpperCase() ?? null;
+  },
+
+  readPositionQuantity(position) {
+    if (!position || typeof position.get !== 'function') return 0;
+    // TradeStation position payload already carries signed Quantity; keep the sign intact.
+    const quantity = Number(position.get('Quantity'));
+    return Number.isFinite(quantity) ? quantity : 0;
   },
 });

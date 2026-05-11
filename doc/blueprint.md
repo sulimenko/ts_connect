@@ -240,6 +240,28 @@ Stream-методы сервиса должны выглядеть как упр
 - коды доменных ошибок не изменены без синхронного обновления клиентов;
 - ограничения и неподдержанные режимы задокументированы явно.
 
+### Symbol parsing and formatting
+
+Все преобразования symbol должны идти через единый helper в `lib.utils`.
+
+- нельзя вручную собирать OPT symbol через локальные regex + `padStart` / `padEnd` в endpoint-ах, stream parsers или response mappers;
+- общий parser `parseSymbol()` может быть внутренней деталью реализации; публичные точки входа остаются `makeSymbol()` и `makeTSSymbol()`;
+- `makeSymbol()` формирует canonical symbol back-системы; это правильный контракт `metaterminal` / `ts_connect` для internal exchange between services;
+- `makeTSSymbol()` формирует symbol в формате, который ожидает TradeStation upstream;
+- helper должен возвращать canonical internal symbol, TradeStation symbol и parsed parts там, где это нужно вызывающему коду;
+- helper должен быть идемпотентным: повторная нормализация уже canonical symbol не должна менять strike или date;
+- дополнительные symbol conversion wrappers допустимы только при реальном caller-е и не должны дублировать parsing/formatting logic;
+- endpoint-ы и parsers могут выбирать нужный output format, но не должны повторно реализовывать parsing/formatting.
+
+### Position registry
+
+Для `domain.ts.positions` действует отдельный инвариант:
+
+- ключ позиции должен быть canonical и вычисляться через общую нормализацию symbol, а не через raw TradeStation format;
+- `getPosition()` не должен создавать запись на miss и не должен скрывать отсутствие позиции;
+- `setPosition()` может хранить raw `Symbol` внутри payload для диагностики и сравнения с upstream response;
+- `Quantity` читается как signed value из TradeStation payload и используется без дополнительного изменения знака.
+
 ### Ограничения должны фиксироваться в документации
 
 Если сервис чего-то не поддерживает, это нужно фиксировать явно. Для текущего состояния `ts_connect` это особенно важно для:

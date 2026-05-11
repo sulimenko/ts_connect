@@ -160,4 +160,68 @@ Review обязателен после любого task. После review ну
 - `application/api/options/strikes.js`, `application/api/options/expirations.js`, `application/api/options/riskreward.js` и `application/api/options/spreadtypes.js` получили явные contract fields и predictable domain validation where applicable
 - legacy option wrappers приведены к более uniform snapshot style без изменения business meaning endpoint-ов
 
+### Заключение: Блок 19 — Position current normalization for placeorder
+
+Статус: failed
+Проблемы:
+
+- [P1] `lib.utils.normalizePositionSymbol()` не идемпотентен для internal OPT symbol. `CRWV 280121C80` нормализуется в `CRWV280121C00080000`, но повторная нормализация `CRWV280121C00080000` даёт `CRWV280121C80000000`, а следующий прогон ещё сильнее портит strike. В `placeorder` symbol нормализуется до lookup, а `domain.ts.positions.getPosition()` нормализует вход ещё раз, поэтому для опционов canonical lookup может промахиваться даже после исправления T-025.
+- [P2] Order path всё ещё принимает `current = 0` на `position === null` только по cache miss и `console.info`, без подтверждения verified absence. Это лучше прежнего silent auto-create, но не полностью закрывает invariant из T-025 для критичного определения `TradeAction`.
+- Live TradeStation runtime smoke для position snapshot / stream / order placement в этом workspace не запускался.
+
+Задачи:
+
+- Создать следующий блок на исправление idempotent symbol normalization и verified absence semantics для order placement.
+
+### Заключение: Блок 20 — Idempotent position symbol normalization
+
+Статус: failed
+Проблемы:
+
+- [P1] `application/lib/ts/placeorder.js` вычисляет `instrumentType`, но всё ещё вызывает `lib.utils.getAction(instrument, qty, current)` с исходным `instrument`. Если caller присылает `{ symbol, asset_category: 'OPT' }`, `getAction()` не видит `instrument.type === 'OPT'` и возвращает stock action. Воспроизведение: `getAction({ symbol: 'CRWV280121C00080000', asset_category: 'OPT' }, -1, 1)` возвращает `Sell`, а должен быть `SELLTOCLOSE`.
+- Live TradeStation runtime smoke для option symbol normalization, position registry, order execution и marketdata/request formatting в этом workspace не запускался.
+
+Задачи:
+
+- `lib.utils` теперь держит единый parser/formatter для STK и OPT, а `makeSymbol()` / `makeTSSymbol()` работают idempotently на display и internal OPT form
+- `application/lib/ts/readOptionChain.js`, `application/api/marketdata/quotes.js`, `application/api/marketdata/barcharts.js`, `application/api/stream/quotes.js`, `application/api/stream/matrix.js`, `application/api/orderexecution/order.js`, `application/lib/ts/placeorder.js` и `application/domain/ts/positions.js` используют общий symbol contract вместо локальных ручных сборок
+- regression coverage в `application/test/run.js` теперь проверяет idempotent normalization, shared canonical option symbol contract и shared formatter usage in order / quotes paths
+- Создать T-029 на передачу нормализованного instrument type в `getAction()` и regression coverage для option close actions с `asset_category`.
+
+### Заключение: Блок 21 — Matrix instruments contract parity
+
+Статус: passed with notes
+Проблемы: live TradeStation runtime smoke для `stream/matrix` в этом workspace не запускался.
+Задачи:
+
+- `application/api/stream/matrix.js` теперь принимает `instruments = []` вместо public `symbol` / `type`
+- empty subscribe input возвращает `EINSTRUMENTS`, как `application/api/stream/quotes.js`
+- lifecycle `subscribe` / `touch` / `unsubscribe`, `streamKey`, `idleMs`, trace fields и stop reason propagation сохранены
+- regression coverage подтверждает instruments-only input и построение matrix stream key из первого валидного инструмента
+
+### Заключение: Блок 22 — Order action type normalization
+
+Статус: passed with notes
+Проблемы:
+
+- Live TradeStation runtime smoke для option order placement в этом workspace не запускался.
+- [P2] Во время review найден unrelated regression в `application/api/marketdata/barcharts.js`: endpoint читает `instrument.asset_category` до проверки `instrument`, поэтому `{ instrument: null }` даёт `TypeError` вместо `DomainError('EINSTRUMENT')`. Создана T-030.
+
+Задачи:
+
+- `application/lib/ts/placeorder.js` теперь передаёт в `getAction()` instrument с нормализованным `type`, полученным из canonical parse или `asset_category`
+- option close / buyback actions корректно определяются для caller-ов, которые присылают только `asset_category`
+- `makeTSSymbol()` / `makeSymbol()` contract не изменён, `data.Symbol` остаётся TradeStation upstream format
+- regression coverage в `application/test/run.js` подтверждает `SELLTOCLOSE` для OPT close path с `asset_category`
+
+### Заключение: Блок 23 — Barcharts invalid instrument guard
+
+Статус: passed with notes
+Проблемы: live TradeStation runtime smoke для `marketdata/barcharts` в этом workspace не запускался.
+Задачи:
+
+- `application/api/marketdata/barcharts.js` теперь проверяет `instrument` до чтения `asset_category`, поэтому null/empty input стабильно возвращает `DomainError('EINSTRUMENT')`
+- symbol contract сохранён: `makeSymbol()` остаётся canonical back/metaterminal parser, `makeTSSymbol()` остаётся TradeStation upstream formatter
+- regression coverage в `application/test/run.js` подтверждает `DomainError('EINSTRUMENT')` для `instrument: null` и пустого `symbol`
+
 Новые заключения добавляются сюда только для текущего активного цикла.

@@ -104,7 +104,8 @@ async () => ({
         try {
           if (!message.StreamStatus) {
             // console.info('streamPositions', message.AccountID, message.Symbol, ':', message.Quantity, message.AveragePrice);
-            domain.ts.positions.setPosition({ account: message.AccountID, symbol: message.Symbol, data: message });
+            const symbol = lib.utils.makeSymbol(message.Symbol)?.symbol ?? message.Symbol;
+            domain.ts.positions.setPosition({ account: message.AccountID, symbol, data: message });
           }
         } catch (error) {
           console.error('Error processing position message:', error);

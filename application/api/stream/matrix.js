@@ -4,11 +4,10 @@
   returns: 'json',
   errors: {
     EACTION: 'Invalid action: expected "subscribe", "unsubscribe", or "touch"',
-    ESYMBOL: 'Symbol is required for matrix subscribe requests',
+    EINSTRUMENTS: 'At least one valid instrument is required for matrix subscribe requests',
   },
   method: async ({
-    symbol = null,
-    type = 'STK',
+    instruments = [],
     action = 'subscribe',
     stop = false,
     idleMs = null,
@@ -23,14 +22,15 @@
     const actionLabel = actionValue ?? 'subscribe';
 
     const data = { heartbeat: true, limit: 50, increment: 0.01, enableVolume: true };
-    const rawSymbol = typeof symbol === 'string' ? symbol.trim() : '';
-    const rawSymbolData = rawSymbol ? lib.utils.convertSymbol({ symbol: rawSymbol, type }) : null;
-    let normalizedSymbol = null;
-    if (typeof rawSymbolData === 'string') {
-      normalizedSymbol = rawSymbolData.toUpperCase();
-    } else {
-      normalizedSymbol = rawSymbolData?.symbol?.toUpperCase() ?? null;
+    let rawSymbol = '';
+    for (const instrument of instruments) {
+      if (!instrument || typeof instrument !== 'object') continue;
+      if (typeof instrument.symbol !== 'string' || instrument.symbol.trim() === '') continue;
+      rawSymbol = instrument.symbol.trim();
+      break;
     }
+    const rawSymbolData = rawSymbol ? lib.utils.makeSymbol(rawSymbol) : null;
+    const normalizedSymbol = rawSymbolData?.symbol?.toUpperCase() ?? null;
     const providedKey = typeof streamKey === 'string' ? streamKey.trim() || null : null;
     let key = providedKey;
     let status = 'ok';
@@ -42,7 +42,7 @@
       action: actionLabel,
       streamKey: key,
       symbol: normalizedSymbol,
-      extra: { idleMs, type },
+      extra: { idleMs, instrumentCount: instruments.length },
     });
 
     try {
@@ -53,8 +53,8 @@
 
       const symbolRequired = actionValue === null || actionValue === 'subscribe';
       if (!normalizedSymbol && (symbolRequired || !key)) {
-        status = 'error:ESYMBOL';
-        return new DomainError('ESYMBOL');
+        status = 'error:EINSTRUMENTS';
+        return new DomainError('EINSTRUMENTS');
       }
 
       const tsClient = await domain.ts.clients.getClient({});
@@ -131,7 +131,7 @@
         streamKey: key,
         symbol: normalizedSymbol,
         durationMs: Date.now() - startedAt,
-        extra: { idleMs, type, status },
+        extra: { idleMs, status, instrumentCount: instruments.length },
       });
     }
   },

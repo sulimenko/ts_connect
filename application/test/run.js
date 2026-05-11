@@ -70,6 +70,28 @@ function loadExpressionModule(relativePath, globals = {}) {
   return new vm.Script(source, { filename: filePath }).runInContext(context);
 }
 
+function loadUtils() {
+  return loadExpressionModule('application/lib/utils.js', {
+    DomainError: class DomainError extends Error {
+      constructor(code) {
+        super(code);
+        this.code = code;
+        this.name = 'DomainError';
+      }
+    },
+    config: {
+      ts: {
+        url: {
+          protocol: 'https',
+          live: 'live',
+          sim: 'sim',
+          domen: '.example',
+        },
+      },
+    },
+  });
+}
+
 const tests = [];
 
 function test(name, fn) {
@@ -259,6 +281,327 @@ test('serializeError preserves upstream error metadata', async () => {
   assert.equal(errorResult.details, 'more detail');
   assert.equal(errorResult.upstreamMessage, 'upstream detail');
   assert.equal(errorResult.symbol, 'TSLA');
+});
+
+test('symbol helpers normalize display and internal option formats idempotently', async () => {
+  const utils = loadUtils();
+
+  const display = utils.makeSymbol('CRWV 280121C80');
+  const internal = utils.makeSymbol('CRWV280121C00080000');
+  const stock = utils.makeSymbol('MSFT');
+
+  assert.equal(display.symbol, 'CRWV280121C00080000');
+  assert.equal(internal.symbol, 'CRWV280121C00080000');
+  assert.equal(stock.symbol, 'MSFT');
+  assert.equal(utils.normalizePositionSymbol(display.symbol), 'CRWV280121C00080000');
+  assert.equal(utils.normalizePositionSymbol(internal.symbol), 'CRWV280121C00080000');
+  assert.equal(utils.makeSymbol(display.symbol).symbol, 'CRWV280121C00080000');
+  assert.equal(utils.makeTSSymbol(display.symbol, display.type), 'CRWV 280121C80');
+  assert.equal(utils.makeTSSymbol(internal.symbol, internal.type), 'CRWV 280121C80');
+  assert.equal(utils.makeTSSymbol(stock.symbol, stock.type), 'MSFT');
+});
+
+test('readOptionChain and positions share the same canonical option symbol contract', async () => {
+  const utils = loadUtils();
+  const readOptionChain = loadExpressionModule('application/lib/ts/readOptionChain.js', {
+    lib: { utils },
+  });
+  const positions = loadExpressionModule('application/domain/ts/positions.js', {
+    lib: { utils },
+  });
+
+  const option = readOptionChain({
+    message: {
+      Legs: [
+        {
+          Symbol: 'CRWV 280121C80',
+          Expiration: '2028-01-21T00:00:00Z',
+          OptionType: 'Call',
+          StrikePrice: 80,
+        },
+      ],
+      Ask: '1.25',
+      Bid: '1.15',
+      PreviousClose: '1.20',
+      Delta: '0.5',
+      Gamma: '0.02',
+      Theta: '-0.01',
+      Vega: '0.05',
+      ImpliedVolatility: '0.25',
+      DailyOpenInterest: 10,
+      Last: '1.22',
+      Volume: 100,
+    },
+  });
+
+  assert.ok(option);
+  assert.equal(option.symbol_raw, 'CRWV280121C00080000');
+  assert.equal(option.strike, '00080000');
+
+  positions.setPosition({
+    account: 'A1',
+    symbol: 'CRWV 280121C80',
+    data: {
+      AccountID: 'A1',
+      Symbol: 'CRWV 280121C80',
+      Quantity: '2',
+      AssetType: 'OPT',
+      PositionID: 'P1',
+      AveragePrice: '1.10',
+    },
+  });
+
+  const byDisplay = positions.getPosition({ account: 'A1', symbol: 'CRWV 280121C80' });
+  const byInternal = positions.getPosition({ account: 'A1', symbol: 'CRWV280121C00080000' });
+  assert.equal(byDisplay.get('Quantity'), '2');
+  assert.equal(byInternal.get('Quantity'), '2');
+  assert.equal(positions.clearPosition({ account: 'A1', symbol: 'CRWV280121C00080000' }), true);
+  assert.equal(positions.getPosition({ account: 'A1', symbol: 'CRWV 280121C80' }), null);
+});
+
+test('marketdata quotes and order execution use the shared symbol formatter', async () => {
+  const utils = loadUtils();
+  const readQuote = loadExpressionModule('application/lib/ts/readQuote.js', {
+    lib: { utils },
+  });
+  const quotesApiCalls = [];
+  const quotesApi = loadExpressionModule('application/api/marketdata/quotes.js', {
+    DomainError: class DomainError extends Error {
+      constructor(code) {
+        super(code);
+        this.code = code;
+        this.name = 'DomainError';
+      }
+    },
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({ tokens: { access: 'token' } }),
+        },
+      },
+    },
+    lib: {
+      utils,
+      ts: {
+        send: async (payload) => {
+          quotesApiCalls.push(payload);
+          return {
+            Errors: [],
+            result: {
+              Quotes: [
+                {
+                  Symbol: 'CRWV 280121C80',
+                  Ask: '1.30',
+                  AskSize: 1,
+                  Bid: '1.20',
+                  BidSize: 2,
+                  Last: '1.25',
+                  LastSize: 3,
+                  TradeTime: '2028-01-21T10:00:00Z',
+                  PreviousClose: '1.15',
+                  Volume: 4,
+                },
+                {
+                  Symbol: 'MSFT',
+                  Ask: '10.30',
+                  AskSize: 5,
+                  Bid: '10.20',
+                  BidSize: 6,
+                  Last: '10.25',
+                  LastSize: 7,
+                  TradeTime: '2028-01-21T10:00:00Z',
+                  PreviousClose: '10.15',
+                  Volume: 8,
+                },
+              ],
+            },
+          };
+        },
+        readQuote,
+      },
+    },
+  });
+
+  const optionInstrument = { symbol: 'CRWV 280121C80' };
+  optionInstrument['asset_category'] = 'OPT';
+  const stockInstrument = { symbol: 'MSFT' };
+  stockInstrument['asset_category'] = 'STK';
+
+  const rows = await quotesApi.method({
+    instruments: [optionInstrument, stockInstrument],
+  });
+
+  assert.equal(quotesApiCalls.length, 1);
+  assert.equal(quotesApiCalls[0].endpoint[2], 'CRWV 280121C80,MSFT');
+  assert.equal(rows[0].symbol, 'CRWV280121C00080000');
+  assert.equal(rows[0].data.symbol, 'CRWV280121C00080000');
+  assert.equal(rows[1].symbol, 'MSFT');
+
+  const orderCalls = [];
+  const orderApi = loadExpressionModule('application/api/orderexecution/order.js', {
+    lib: {
+      utils,
+      ts: {
+        placeorder: async (payload) => {
+          orderCalls.push(payload);
+          return { Orders: [{ Status: 'OK' }] };
+        },
+      },
+    },
+    api: {
+      account: {
+        positions: async () => [],
+      },
+    },
+  });
+
+  await orderApi.method({
+    contract: { account: 'A1', live: true },
+    instrument: { symbol: 'CRWV280121C00080000', type: 'OPT' },
+    qty: 1,
+    type: 'Limit',
+    tif: 'GTC',
+  });
+
+  assert.equal(orderCalls.length, 1);
+  assert.equal(orderCalls[0].data.Symbol, 'CRWV 280121C80');
+});
+
+test('placeorder normalizes instrument type before getAction for option closes', async () => {
+  const utils = loadUtils();
+  const sendCalls = [];
+  const placeorder = loadExpressionModule('application/lib/ts/placeorder.js', {
+    domain: {
+      ts: {
+        positions: {
+          getPosition: () => {
+            const position = new Map();
+            position.set('Quantity', '2');
+            return position;
+          },
+          clearPosition: () => {},
+        },
+        clients: {
+          getClient: async () => ({
+            tokens: { access: 'token' },
+          }),
+        },
+      },
+    },
+    lib: {
+      utils,
+      ts: {
+        send: async (payload) => {
+          sendCalls.push(payload);
+          return { Orders: [{ Status: 'OK' }] };
+        },
+      },
+    },
+  });
+
+  const optionInstrument = { symbol: 'CRWV280121C00080000' };
+  optionInstrument['asset_category'] = 'OPT';
+
+  await placeorder({
+    data: {
+      AccountID: 'A1',
+      Symbol: 'CRWV 280121C80',
+      OrderType: 'Limit',
+      TimeInForce: { Duration: 'GTC' },
+      Route: 'Intelligent',
+    },
+    qty: -1,
+    instrument: optionInstrument,
+    live: true,
+  });
+
+  assert.equal(sendCalls.length, 1);
+  assert.equal(sendCalls[0].data.TradeAction, 'SELLTOCLOSE');
+});
+
+test('stream matrix accepts instruments and derives symbol from the first valid instrument', async () => {
+  const utils = loadUtils();
+  let buildStreamKeyArgs = null;
+  let subscribeArgs = null;
+
+  const matrixApi = loadExpressionModule('application/api/stream/matrix.js', {
+    DomainError: class DomainError extends Error {
+      constructor(code) {
+        super(code);
+        this.code = code;
+        this.name = 'DomainError';
+      }
+    },
+    context: { client: {} },
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            buildStreamKey: (args) => {
+              buildStreamKeyArgs = args;
+              return 'matrix-key';
+            },
+          }),
+        },
+        streams: {
+          subscribe: async (args) => {
+            subscribeArgs = args;
+            return { ok: true };
+          },
+        },
+      },
+    },
+    lib: { utils },
+  });
+
+  await matrixApi.method({
+    instruments: [{ symbol: 'CRWV 280121C80' }, { symbol: 'MSFT' }],
+  });
+
+  assert.ok(buildStreamKeyArgs);
+  assert.equal(buildStreamKeyArgs.symbol, 'CRWV280121C00080000');
+  assert.ok(subscribeArgs);
+  assert.equal(subscribeArgs.key, 'matrix-key');
+  assert.equal(subscribeArgs.metadata.symbol, 'CRWV280121C00080000');
+});
+
+test('marketdata barcharts returns EINSTRUMENT for null or empty instrument input', async () => {
+  const DomainError = class DomainError extends Error {
+    constructor(code) {
+      super(code);
+      this.code = code;
+      this.name = 'DomainError';
+    }
+  };
+
+  const barcharts = loadExpressionModule('application/api/marketdata/barcharts.js', {
+    DomainError,
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            tokens: { access: 'token' },
+          }),
+        },
+        barcharts: {
+          fetch: async () => {
+            throw new Error('fetch should not be called');
+          },
+        },
+      },
+    },
+    lib: {
+      utils: loadUtils(),
+    },
+  });
+
+  const nullResult = await barcharts.method({ instrument: null });
+  assert.ok(nullResult instanceof DomainError);
+  assert.equal(nullResult.code, 'EINSTRUMENT');
+
+  const emptyResult = await barcharts.method({ instrument: { symbol: '' } });
+  assert.ok(emptyResult instanceof DomainError);
+  assert.equal(emptyResult.code, 'EINSTRUMENT');
 });
 
 test('optionChain rejects object errors with a readable message', async () => {

@@ -39,7 +39,9 @@
         return new DomainError('ELIMIT');
       }
 
-      normalizedSymbol = lib.utils.makeTSSymbol(instrument.symbol.trim(), instrument.asset_category);
+      const parsedInstrument = requestedSymbol ? lib.utils.makeSymbol(requestedSymbol) : null;
+      const instrumentType = parsedInstrument?.type ?? instrument?.asset_category;
+      normalizedSymbol = lib.utils.makeTSSymbol(parsedInstrument?.symbol ?? instrument.symbol.trim(), instrumentType);
       normalizedPeriod = lib.utils.normalizeBarPeriod(period);
       if (normalizedPeriod instanceof DomainError) {
         status = `error:${normalizedPeriod.code}`;

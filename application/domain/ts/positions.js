@@ -1,25 +1,42 @@
 ({
   values: new Map(),
+  getSymbolKey({ symbol }) {
+    return lib.utils.normalizePositionSymbol(symbol);
+  },
   clearAccount({ account }) {
     return this.values.set(account, new Map()).get(account);
   },
   clearPosition({ account, symbol }) {
-    return this.getAccount({ account }).set(symbol, new Map()).get(symbol);
+    const key = this.getSymbolKey({ symbol });
+    if (!key) return null;
+    const positions = this.getAccount({ account, create: false });
+    if (!positions) return false;
+    return positions.delete(key);
   },
-  getAccount({ account }) {
+  getAccount({ account, create = true }) {
     let positions = this.values.get(account);
-    if (positions === undefined) positions = this.clearAccount({ account });
+    if (positions === undefined && create) positions = this.clearAccount({ account });
     return positions;
   },
   getPosition({ account, symbol }) {
-    let position = this.getAccount({ account }).get(symbol);
-    if (position === undefined) position = this.clearPosition({ account, symbol });
-    return position;
+    const key = this.getSymbolKey({ symbol });
+    if (!key) return null;
+    const positions = this.getAccount({ account, create: false });
+    if (!positions) return null;
+    return positions.get(key) ?? null;
   },
   setPosition({ account, symbol, data }) {
-    const position = this.getPosition({ account, symbol });
-    for (const key of Object.keys(data)) {
-      if (['AccountID', 'Symbol', 'Quantity', 'AssetType', 'PositionID', 'AveragePrice'].includes(key)) position.set(key, data[key]);
+    const key = this.getSymbolKey({ symbol: data?.Symbol ?? symbol });
+    if (!key) return null;
+    const accountPositions = this.getAccount({ account });
+    let position = accountPositions.get(key);
+    if (position === undefined) {
+      position = new Map();
+      accountPositions.set(key, position);
+    }
+    const fields = data && typeof data === 'object' ? Object.keys(data) : [];
+    for (const field of fields) {
+      if (['AccountID', 'Symbol', 'Quantity', 'AssetType', 'PositionID', 'AveragePrice'].includes(field)) position.set(field, data[field]);
     }
     // position.forEach((value, key) => (value = data[key]));
     return position;

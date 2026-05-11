@@ -15,10 +15,12 @@
   }) => {
     const live = contract.live === 1 || contract.live === '1' || contract.live === true || contract.live === 'true';
     qty = parseInt(qty);
+    const parsedInstrument = lib.utils.makeSymbol(instrument.symbol);
+    const instrumentType = parsedInstrument?.type ?? instrument.type ?? instrument.asset_category;
 
     const data = {
       AccountID: contract.account,
-      Symbol: instrument.symbol.toUpperCase(),
+      Symbol: lib.utils.makeTSSymbol(parsedInstrument?.symbol ?? instrument.symbol, instrumentType),
       // Quantity: parseInt(qty),
       OrderType: type,
       TimeInForce: { Duration: tif },

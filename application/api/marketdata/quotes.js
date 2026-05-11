@@ -20,29 +20,6 @@
       extra: { symbolCount: instruments.length },
     });
 
-    const normalizeRequestSymbol = (symbol) => {
-      if (typeof symbol !== 'string') return '';
-      const trimmed = symbol.trim();
-      if (!trimmed) return '';
-      if (trimmed.includes(' ')) {
-        const parsed = lib.utils.makeSymbol(trimmed);
-        return parsed?.symbol?.toUpperCase() ?? trimmed.toUpperCase();
-      }
-      return trimmed.toUpperCase();
-    };
-
-    const buildTsSymbol = (instrument) => {
-      if (!instrument || typeof instrument.symbol !== 'string') return null;
-      const symbol = instrument.symbol.trim();
-      if (!symbol) return null;
-      if (symbol.includes(' ')) {
-        const parsed = lib.utils.makeSymbol(symbol);
-        if (!parsed) return null;
-        return lib.utils.makeTSSymbol(parsed.symbol, parsed.type);
-      }
-      return lib.utils.makeTSSymbol(symbol, instrument.asset_category);
-    };
-
     const extractQuotes = (response) => {
       if (!response || typeof response !== 'object') return [];
       const payload = response.result ?? response;
@@ -108,8 +85,9 @@
     const normalizedInputs = [];
     for (const instrument of instruments) {
       if (!instrument || typeof instrument !== 'object') continue;
-      const symbol = normalizeRequestSymbol(instrument.symbol);
-      const tsSymbol = buildTsSymbol(instrument);
+      const parsed = lib.utils.makeSymbol(instrument.symbol);
+      const symbol = parsed?.symbol?.toUpperCase() ?? null;
+      const tsSymbol = parsed ? lib.utils.makeTSSymbol(parsed.symbol, parsed.type) : null;
       if (!symbol || !tsSymbol) continue;
       normalizedInputs.push({
         instrument: { ...instrument, symbol },

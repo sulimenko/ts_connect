@@ -44,12 +44,10 @@
       const normalizedSymbols = [];
       for (const instrument of instruments) {
         if (!instrument || typeof instrument !== 'object') continue;
-        const symbol = typeof instrument.symbol === 'string' ? instrument.symbol.trim() : '';
-        if (!symbol) continue;
-
-        const type = typeof instrument.asset_category === 'string' ? instrument.asset_category : 'STK';
+        const parsed = lib.utils.makeSymbol(instrument.symbol);
         try {
-          normalizedSymbols.push(lib.utils.makeTSSymbol(symbol, type));
+          if (!parsed) continue;
+          normalizedSymbols.push(lib.utils.makeTSSymbol(parsed.symbol, parsed.type));
           validInstrumentCount += 1;
         } catch (error) {
           console.error('Invalid quote instrument:', instrument, error);
