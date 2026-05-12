@@ -263,3 +263,19 @@ Review обязателен после любого task. После review ну
 - `application/api/stream/addBarchart.js` теперь маршрутизирует upstream по `tsSymbol`, но downstream `stream/barchart` event отдаёт canonical back/metaterminal symbol
 - public `symbol` contract сохранён: canonical back input и TS-style input оба нормализуются в один и тот же downstream canonical payload
 - regression coverage в `application/test/run.js` подтверждает canonical `stream/barchart` payload для TS-style input и TS upstream routing для canonical input
+
+### Заключение: Блок 27 — Stream outbound instrument payload contract
+
+Статус: passed with notes
+Проблемы:
+
+- Live TradeStation runtime smoke для managed stream emit-пакетов в этом workspace не запускался.
+- [P3] Regression coverage для `stream/levelII` проверяет наличие `instrument`, но не проверяет отсутствие top-level `symbol`, хотя это было отдельным acceptance criterion T-037. Кодовый payload уже не содержит `symbol`; нужен test-only follow-up.
+
+Задачи:
+
+- `application/api/stream/matrix.js` теперь эмитит `stream/levelII` с top-level `instrument`, а routing остаётся на TS symbol
+- `application/api/stream/quotes.js`, `application/lib/ts/readQuote.js` и `application/api/marketdata/quotes.js` используют новый quote outbound shape без top-level instrument fields в stream packet-е
+- `application/api/stream/addBarchart.js` и `application/lib/stream/optionChain.js` эмитят `stream/barchart` / `stream/chain` с `instrument` вместо top-level `symbol`
+- `application/test/run.js` покрывает canonical `instrument` payload для `stream/levelII`, `stream/quote`, `stream/barchart` и `stream/chain`
+- Создать test-only T-038 на явную проверку отсутствия top-level `symbol` в `stream/levelII`.

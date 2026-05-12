@@ -1,3 +1,4 @@
+/* eslint camelcase: "off" */
 ({
   access: 'public',
   parameters: 'json',
@@ -21,20 +22,31 @@
     const actionValue = lib.utils.normalizeAction({ action, stop });
     const actionLabel = actionValue ?? 'subscribe';
     const instrumentList = Array.isArray(instruments) ? instruments : [];
+    const buildInstrument = (symbol) => {
+      const parsed = lib.utils.makeSymbol(symbol);
+      if (!parsed) return null;
+      return {
+        symbol: parsed.symbol,
+        asset_category: parsed.type,
+        source: 'TS',
+        listing_exchange: 'TS',
+        currency: 'USD',
+      };
+    };
 
     const data = { heartbeat: true, limit: 50, increment: 0.01, enableVolume: true };
     const providedKey = typeof streamKey === 'string' ? streamKey.trim() || null : null;
     let key = providedKey;
     let status = 'ok';
-    let symbol = null;
     let tsSymbol = null;
+    let outboundInstrument = null;
 
-    for (const instrument of instrumentList) {
-      if (!instrument || typeof instrument !== 'object') continue;
-      const parsed = lib.utils.makeSymbol(instrument.symbol);
+    for (const item of instrumentList) {
+      if (!item || typeof item !== 'object') continue;
+      const parsed = lib.utils.makeSymbol(item.symbol);
       if (!parsed) continue;
-      symbol = parsed.symbol ?? null;
       tsSymbol = parsed.tsSymbol ?? null;
+      outboundInstrument = buildInstrument(parsed.symbol);
       break;
     }
 
@@ -84,7 +96,7 @@
           const onData = (message) => {
             if (message.AskSize === undefined && message.BidSize === undefined) return;
 
-            const packet = { symbol, price: message.Price };
+            const packet = { instrument: outboundInstrument, price: message.Price };
             if (message.BidSize > 0) {
               packet.type = 'bid';
               packet.size = message.BidSize;
@@ -99,7 +111,7 @@
             if (packet.type === 'delete' && packet.size !== 0) {
               console.error('stream matrix delete with size', message);
             }
-            console.warn(packet);
+            console.warn('stream/levelII', packet);
             emit('stream/levelII', packet);
           };
 

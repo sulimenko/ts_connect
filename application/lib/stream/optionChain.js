@@ -1,3 +1,4 @@
+/* eslint camelcase: "off" */
 async ({
   client = null,
   responce = null,
@@ -18,6 +19,17 @@ async ({
   const scope = trace?.scope ?? 'stream/options/chains';
   const actionLabel = action ?? 'subscribe';
   const startedAt = Date.now();
+  const buildInstrument = (value) => {
+    const parsed = lib.utils.makeSymbol(value);
+    if (!parsed) return null;
+    return {
+      symbol: parsed.symbol,
+      asset_category: parsed.type,
+      source: 'TS',
+      listing_exchange: 'TS',
+      currency: 'USD',
+    };
+  };
 
   lib.utils.traceLog({
     scope,
@@ -63,9 +75,10 @@ async ({
             return;
           }
 
+          const instrument = buildInstrument(option.symbol);
           emit('stream/chain', {
             streamKey: key,
-            symbol: option.symbol,
+            instrument,
             expiration: option.expiration,
             chain: { [option.strike]: { [option.type]: option } },
           });

@@ -70,14 +70,16 @@
     };
 
     const buildRowFromQuote = ({ instrument, symbol, quote }) => {
-      let rowInstrument = { symbol };
-      if (instrument) rowInstrument = { ...instrument, symbol };
-      if (quote.instrument) rowInstrument = { ...rowInstrument, ...quote.instrument, symbol };
+      const rowSymbol = quote.instrument?.symbol ?? quote.symbol ?? symbol;
+      let rowInstrument = { symbol: rowSymbol };
+      if (instrument) rowInstrument = { ...instrument, symbol: rowSymbol };
+      if (quote.instrument) rowInstrument = { ...rowInstrument, ...quote.instrument, symbol: rowSymbol };
+      const rowData = quote.data ? { ...quote.data, symbol: rowSymbol } : { symbol: rowSymbol };
 
       return {
-        symbol,
+        symbol: rowSymbol,
         instrument: rowInstrument,
-        data: quote.data,
+        data: rowData,
         quote: quote.quote,
       };
     };
@@ -131,8 +133,8 @@
       const quoteMap = new Map();
       for (const message of quotes) {
         const parsed = lib.ts.readQuote({ message });
-        if (!parsed?.symbol) continue;
-        quoteMap.set(parsed.symbol, parsed);
+        if (!parsed?.instrument?.symbol) continue;
+        quoteMap.set(parsed.instrument.symbol, parsed);
       }
 
       const rows = normalizedInputs.map(({ instrument, symbol }) => {

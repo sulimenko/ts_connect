@@ -289,3 +289,56 @@
 - [x] Upstream barchart routing использует TS symbol.
 - [x] Downstream `stream/barchart` event использует canonical back symbol.
 - [x] `npm run lint`, `npm run types`, `npm test` проходят.
+
+## Блок 27: Stream outbound instrument payload contract
+
+### T-037: Заменить top-level `symbol` на `instrument` в outbound stream events
+
+- [x] Изменить downstream payload contract для всех бизнес-событий, которые отправляются наружу через managed stream `emit`: `stream/levelII`, `stream/quote`, `stream/barchart`, `stream/chain`.
+- [x] Новый обязательный contract вместо top-level `symbol`:
+      `instrument: { symbol, asset_category, source, listing_exchange, currency }`.
+- [x] `instrument.symbol` всегда должен быть canonical back/metaterminal symbol из `lib.utils.makeSymbol()`, не TradeStation display symbol.
+- [x] `instrument.asset_category` должен быть нормализованным типом инструмента из общего symbol parser-а: минимум `STK` / `OPT`.
+- [x] `instrument.source` для TradeStation данных: `TS`.
+- [x] `instrument.listing_exchange` и `instrument.currency` должны заполняться из доступного payload/context. Если TradeStation stream не даёт точного значения, использовать текущий устойчивый default проекта: `listing_exchange: 'TS'`, `currency: 'USD'`. Не добавлять API-запросы для enrichment в рамках этого блока.
+- [x] Не оставлять `symbol` на верхнем уровне outbound packet-ов, если задача не указывает явное исключение. Это breaking contract change для metaterminal и должен быть отражён в тестах.
+
+Файлы:
+
+- `application/api/stream/matrix.js`: заменить payload `stream/levelII` с `{ symbol, price, type, size }` на `{ instrument, price, type, size }`. Upstream endpoint и `streamKey` продолжают использовать TS symbol.
+- `application/api/stream/quotes.js`: `stream/quote` должен отдавать только `instrument` и связанные с ним данные внутри `instrument`; убрать `symbol`, `source`, `listed_exchange` / `listing_exchange`, `currency` и другие instrument-level поля из верхнего уровня response. Quote market fields (`bid`, `ask`, `lp`, sizes, volume, ch/chp, dates и т.п.) остаются на верхнем уровне.
+- `application/lib/ts/readQuote.js`: при необходимости обновить formatter quote packet-а, чтобы он сразу возвращал новый outbound shape. Не дублировать instrument fields в `data`, если этот объект является частью outbound packet-а.
+- `application/api/stream/addBarchart.js`: заменить `stream/barchart` payload `{ streamKey, symbol, bar }` на `{ streamKey, instrument, bar }`. `instrument.symbol` canonical, upstream chart routing остаётся на TS symbol.
+- `application/lib/stream/optionChain.js`: заменить `stream/chain` payload `{ streamKey, symbol, expiration, chain }` на `{ streamKey, instrument, expiration, chain }`. Для option chain `instrument` описывает underlying/root instrument, если текущий event агрегирует цепочку по underlying; option-level symbols внутри `chain` не менять без отдельной задачи.
+- `application/test/run.js`: обновить regression coverage для всех четырёх outbound events.
+
+Ограничения:
+
+- Не менять public input contract subscribe/touch/unsubscribe в рамках этой задачи.
+- Не менять lifecycle: API слой не хранит state, managed streams остаются через `domain.ts.streams.subscribe()`.
+- Не добавлять legacy compatibility aliases (`symbol` + `instrument`) в outbound payload, если нет отдельного решения architect-а.
+- Не делать enrichment через дополнительные snapshot/API calls; использовать уже известные поля и defaults.
+- Сохранять compact style: не вводить отдельные большие builders, если достаточно локальной компактной сборки или существующего `makeSymbol()`.
+
+Критерии приёмки:
+
+- `stream/levelII` больше не содержит top-level `symbol`; содержит `instrument.symbol`, `instrument.asset_category`, `instrument.source`, `instrument.listing_exchange`, `instrument.currency`.
+- `stream/quote` больше не содержит top-level instrument metadata; содержит quote fields + `instrument`.
+- `stream/barchart` больше не содержит top-level `symbol`; содержит `instrument`.
+- `stream/chain` больше не содержит top-level `symbol`; содержит `instrument`.
+- Все outbound stream tests в `application/test/run.js` проверяют отсутствие top-level `symbol` там, где он удалён.
+- `npm run lint`, `npm run types`, `npm test` проходят.
+
+## Блок 28: Stream outbound contract test gap
+
+### T-038: Добавить явную проверку отсутствия top-level `symbol` в `stream/levelII`
+
+- [ ] Доработать только regression coverage в `application/test/run.js`.
+- [ ] В тесте `stream matrix emits canonical levelII packets while routing by tsSymbol` добавить явную проверку, что emitted payload `stream/levelII` не содержит top-level `symbol`.
+- [ ] Не менять runtime-код, если текущий payload уже соответствует контракту T-037.
+- [ ] Сохранить существующие проверки `instrument.symbol`, `instrument.asset_category`, `instrument.source`, `instrument.listing_exchange`, `instrument.currency`, `type`, `size`, upstream endpoint и TS symbol routing.
+
+Критерии приёмки:
+
+- Тест падает, если `stream/levelII` снова начнёт отдавать top-level `symbol`.
+- `npm run lint`, `npm run types`, `npm test` проходят.
