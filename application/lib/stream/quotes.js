@@ -1,5 +1,10 @@
 async ({ client, symbols }) => {
-  const endpoint = ['marketdata', 'stream', 'quotes', symbols.map((symbol) => symbol.toUpperCase()).join(',')];
+  const endpoint = [
+    'marketdata',
+    'stream',
+    'quotes',
+    symbols.map((symbol) => lib.utils.makeSymbol(symbol)?.tsSymbol ?? String(symbol).toUpperCase()).join(','),
+  ];
 
   const onData = (data) => console.debug('quotes:', data);
   const onError = (err) => console.error('quotes:', err);

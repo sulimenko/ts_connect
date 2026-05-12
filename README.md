@@ -10,6 +10,7 @@ Internal project based on an open-source solution metarhia.
 This project is a modified version of an original work created by **Timur Shemsedinov**.
 
 Original project:
+
 - Author: Timur Shemsedinov <timur.shemsedinov@gmail.com>
 - License: MIT
 - Source: https://github.com/metarhia/Example

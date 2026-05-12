@@ -2,6 +2,7 @@
 ({
   access: 'public',
   method: async ({ contracts }) => {
+    void contracts;
     //     const client = await domain.ts.clients.getClient({});
     //     const result = [];
     //     for (const contract of contracts) {

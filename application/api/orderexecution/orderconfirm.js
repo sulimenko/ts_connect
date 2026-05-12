@@ -8,11 +8,21 @@
     // side, // Buy, Sell, BUYTOCOVER, SELLSHORT, BUYTOOPEN, BUYTOCLOSE, SELLTOOPEN, SELLTOCLOSE
     tif = 'GTC', // GTC, Day, IOC
     route = 'Intelligent',
-    limit_price = null,
-    stop_price = null,
+    limit_price: limitPrice = null,
+    stop_price: stopPrice = null,
     related = null,
     orderId = null,
   }) => {
+    void contract;
+    void instrument;
+    void qty;
+    void type;
+    void tif;
+    void route;
+    void limitPrice;
+    void stopPrice;
+    void related;
+    void orderId;
     // let endpoint = ['orderexecution', 'orderconfirm'];
     // // let endpoint = ['orderexecution', 'marginimpact'];
     // let method = 'POST';

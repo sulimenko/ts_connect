@@ -5,7 +5,7 @@
     const result = [];
     for (const contract of contracts) {
       contract.live = contract.live === 1 || contract.live === '1' || contract.live === true || contract.live === 'true';
-      let endpoint = ['brokerage', 'accounts', contract.account, 'historicalorders'];
+      const endpoint = ['brokerage', 'accounts', contract.account, 'historicalorders'];
       if (orders.length > 0) endpoint.push(orders.join(','));
       const since = start || new Date(new Date().setMonth(new Date().getMonth() - 1)).toISOString().split('T')[0];
       const data = { since };

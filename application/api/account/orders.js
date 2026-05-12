@@ -5,7 +5,7 @@
     const result = [];
     for (const contract of contracts) {
       contract.live = contract.live === 1 || contract.live === '1' || contract.live === true || contract.live === 'true';
-      let endpoint = ['brokerage', 'accounts', contract.account, 'orders'];
+      const endpoint = ['brokerage', 'accounts', contract.account, 'orders'];
       if (orders.length > 0) endpoint.push(orders.join(','));
       const data = {};
       if (limit !== null) data.pageSize = limit;

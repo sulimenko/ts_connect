@@ -29,7 +29,7 @@
   "main": "server.js",
   "types": "types/global.d.ts",
   "scripts": {
-    "test": "npm run lint && npm run types && MODE=test node server.js",
+    "test": "npm run lint && npm run types && node application/test/run.js",
     "dotest": "npm run lint && npm run types && node server.js",
     "types": "tsc -p tsconfig.json",
     "lint": "eslint . && prettier -c \"**/*.js\" \"**/*.json\" \"**/*.md\"",
