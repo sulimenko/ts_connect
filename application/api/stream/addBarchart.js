@@ -28,7 +28,9 @@
       return Number.isFinite(number) ? number : null;
     };
     const actionValue = lib.utils.normalizeAction({ action, stop });
-    const chartSymbol = typeof symbol === 'string' ? symbol.trim().toUpperCase() : '';
+    const parsedSymbol = typeof symbol === 'string' ? lib.utils.makeSymbol(symbol) : null;
+    const chartSymbol = parsedSymbol?.tsSymbol ?? '';
+    const displaySymbol = parsedSymbol?.symbol ?? '';
     const chartKey = typeof streamKey === 'string' ? streamKey.trim() || null : null;
     const periodValue = Number(period);
     const limitValue = toNumber(limit);
@@ -82,7 +84,7 @@
         metadata: { symbol: chartSymbol, period: periodValue, limit: Math.floor(limitValue) },
         start: async ({ notifyError, emit }) => {
           const onData = (message) => {
-            emit('stream/barchart', { streamKey: key, symbol: chartSymbol, bar: message });
+            emit('stream/barchart', { streamKey: key, symbol: displaySymbol, bar: message });
           };
           const onError = (error) => {
             console.error('stream chart error:', error);

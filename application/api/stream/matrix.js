@@ -20,20 +20,23 @@
     const actionSet = new Set(['subscribe', 'unsubscribe', 'touch']);
     const actionValue = lib.utils.normalizeAction({ action, stop });
     const actionLabel = actionValue ?? 'subscribe';
+    const instrumentList = Array.isArray(instruments) ? instruments : [];
 
     const data = { heartbeat: true, limit: 50, increment: 0.01, enableVolume: true };
-    let rawSymbol = '';
-    for (const instrument of instruments) {
-      if (!instrument || typeof instrument !== 'object') continue;
-      if (typeof instrument.symbol !== 'string' || instrument.symbol.trim() === '') continue;
-      rawSymbol = instrument.symbol.trim();
-      break;
-    }
-    const rawSymbolData = rawSymbol ? lib.utils.makeSymbol(rawSymbol) : null;
-    const normalizedSymbol = rawSymbolData?.symbol?.toUpperCase() ?? null;
     const providedKey = typeof streamKey === 'string' ? streamKey.trim() || null : null;
     let key = providedKey;
     let status = 'ok';
+    let symbol = null;
+    let tsSymbol = null;
+
+    for (const instrument of instrumentList) {
+      if (!instrument || typeof instrument !== 'object') continue;
+      const parsed = lib.utils.makeSymbol(instrument.symbol);
+      if (!parsed) continue;
+      symbol = parsed.symbol ?? null;
+      tsSymbol = parsed.tsSymbol ?? null;
+      break;
+    }
 
     lib.utils.traceLog({
       scope: 'stream/matrix',
@@ -41,8 +44,8 @@
       traceId: trace,
       action: actionLabel,
       streamKey: key,
-      symbol: normalizedSymbol,
-      extra: { idleMs, instrumentCount: instruments.length },
+      symbol: tsSymbol,
+      extra: { idleMs, instrumentCount: instrumentList.length },
     });
 
     try {
@@ -52,14 +55,14 @@
       }
 
       const symbolRequired = actionValue === null || actionValue === 'subscribe';
-      if (!normalizedSymbol && (symbolRequired || !key)) {
+      if (!tsSymbol && (symbolRequired || !key)) {
         status = 'error:EINSTRUMENTS';
         return new DomainError('EINSTRUMENTS');
       }
 
       const tsClient = await domain.ts.clients.getClient({});
       if (!key) {
-        key = tsClient.buildStreamKey({ group: 'matrix', symbol: normalizedSymbol, data });
+        key = tsClient.buildStreamKey({ group: 'matrix', symbol: tsSymbol, data });
       }
 
       if (actionValue === 'unsubscribe') {
@@ -69,19 +72,19 @@
         return await domain.ts.streams.touch({ kind: 'matrix', key, client: context.client, idleMs });
       }
 
-      const endpoint = ['stream', 'matrix', 'changes', normalizedSymbol];
+      const endpoint = ['stream', 'matrix', 'changes', tsSymbol];
 
       return await domain.ts.streams.subscribe({
         kind: 'matrix',
         key,
         client: context.client,
         idleMs,
-        metadata: { symbol: normalizedSymbol, owner: 'metaterminal', streamKey: key },
+        metadata: { symbol: tsSymbol, owner: 'metaterminal', streamKey: key },
         start: async ({ notifyError, emit }) => {
           const onData = (message) => {
             if (message.AskSize === undefined && message.BidSize === undefined) return;
 
-            const packet = { symbol: normalizedSymbol, price: message.Price };
+            const packet = { symbol, price: message.Price };
             if (message.BidSize > 0) {
               packet.type = 'bid';
               packet.size = message.BidSize;
@@ -96,7 +99,7 @@
             if (packet.type === 'delete' && packet.size !== 0) {
               console.error('stream matrix delete with size', message);
             }
-
+            console.warn(packet);
             emit('stream/levelII', packet);
           };
 
@@ -107,7 +110,7 @@
 
           const registeredKey = await tsClient.streamMatrix({
             endpoint,
-            symbol: normalizedSymbol,
+            symbol: tsSymbol,
             data,
             onData,
             onError,
@@ -129,9 +132,9 @@
         traceId: trace,
         action: actionLabel,
         streamKey: key,
-        symbol: normalizedSymbol,
+        symbol: tsSymbol,
         durationMs: Date.now() - startedAt,
-        extra: { idleMs, status, instrumentCount: instruments.length },
+        extra: { idleMs, status, instrumentCount: instrumentList.length },
       });
     }
   },

@@ -225,3 +225,41 @@ Review обязателен после любого task. После review ну
 - regression coverage в `application/test/run.js` подтверждает `DomainError('EINSTRUMENT')` для `instrument: null` и пустого `symbol`
 
 Новые заключения добавляются сюда только для текущего активного цикла.
+
+### Заключение: Блок 24 — Matrix compact symbol parsing guard
+
+Статус: passed with notes
+Проблемы: live TradeStation runtime smoke для `stream/matrix` в этом workspace не запускался.
+Задачи:
+
+- `application/api/stream/matrix.js` больше не читает `instruments[0].symbol` до contract guard-а и сохраняет компактный lifecycle без лишних промежуточных сущностей
+- пустой, malformed или частично invalid `instruments` теперь возвращает `DomainError('EINSTRUMENTS')`; первый валидный инструмент wins
+- upstream matrix routing и `streamKey` используют `tsSymbol`, а downstream `stream/levelII` packet остаётся на canonical `symbol`
+- regression coverage в `application/test/run.js` подтверждает empty, malformed и first-invalid/second-valid cases, а также canonical payload formatting
+
+### Заключение: Блок 25 — Stream API compact contract alignment
+
+Статус: failed
+Проблемы:
+
+- [P2] `application/api/stream/addBarchart.js` маршрутизирует upstream по TradeStation `tsSymbol`, но downstream `stream/barchart` event тоже отдаёт `symbol: chartSymbol`. Для OPT это будет `CRWV 280121C80`, а audit-критерий T-035 требует canonical back symbol в downstream metaterminal events. Regression coverage сейчас проверяет только upstream endpoint/key и не ловит event payload.
+- Live TradeStation runtime smoke для `stream/quotes`, `stream/addBarchart` и `stream/clear` в этом workspace не запускался.
+
+Задачи:
+
+- `application/api/stream/quotes.js` стал compact contract-first batch API: `instruments = null` и пустые/invalid subscribe inputs возвращают `DomainError('EINSTRUMENTS')`, а `unsubscribe` / `touch` продолжают работать по `streamKey`
+- `application/api/stream/quotes.js` продолжает batch-capable flow с общим symbol contract и стабильным TS key из нескольких instruments
+- `application/api/stream/addBarchart.js` сохраняет public `symbol` contract как явный API shape и нормализует его в TradeStation `tsSymbol` через общий parser before routing
+- `application/api/stream/clear.js` получил явные `parameters` / `returns` metadata без усложнения lifecycle и по-прежнему очищает подписки через `unsubscribeAll({ reason: 'clear' })`
+- `application/test/run.js` покрывает empty subscribe, invalid action, key-based unsubscribe/touch, stable batch key, normalized barchart symbol, and clear return shape
+- Создать T-036 на canonical `stream/barchart` event payload и соответствующий regression test.
+
+### Заключение: Блок 26 — Barchart stream canonical event symbol
+
+Статус: passed with notes
+Проблемы: live TradeStation runtime smoke для `stream/addBarchart` в этом workspace не запускался.
+Задачи:
+
+- `application/api/stream/addBarchart.js` теперь маршрутизирует upstream по `tsSymbol`, но downstream `stream/barchart` event отдаёт canonical back/metaterminal symbol
+- public `symbol` contract сохранён: canonical back input и TS-style input оба нормализуются в один и тот же downstream canonical payload
+- regression coverage в `application/test/run.js` подтверждает canonical `stream/barchart` payload для TS-style input и TS upstream routing для canonical input

@@ -24,6 +24,13 @@
 - Worker не может сам добавлять задачи или менять блок — только выполняет описанное
 - После выполнения блока worker сигнализирует завершение — architect проводит review
 
+### Общие правила реализации
+
+- Избегать overengineering: проверки и преобразования добавлять только там, где они защищают реальный публичный контракт, external input или known failure mode.
+- Предпочитать компактный читаемый код во всём методе, если он не скрывает domain error, lifecycle state или внешний формат данных.
+- Конкретные примеры в задаче не являются обязательным implementation recipe: worker может заменить их более простой формой, если сохраняет поведение и критерии приёмки.
+- Console statements и закомментированные console statements не входят в scope задачи и review, если конкретная задача явно не про logging/observability.
+
 ### Архивирование
 
 **Когда архивировать**: при выполнении любого из условий:
@@ -51,7 +58,7 @@
 ## Активные задачи
 
 Архив текущего цикла перенесён в `doc/changelog.md`.
-Сейчас открытых блоков нет.
+Сейчас открыт один блок для worker.
 
 ## Блок 19: Position current normalization for placeorder
 
@@ -187,3 +194,98 @@
 - Invalid/empty instrument input в `marketdata/barcharts` стабильно возвращает `DomainError('EINSTRUMENT')`.
 - Happy path barcharts по valid STK/OPT instrument продолжает строить TradeStation symbol через `makeTSSymbol()`.
 - `npm run lint`, `npm run types`, `npm test` проходят.
+
+## Блок 24: Matrix compact symbol parsing guard
+
+### T-031: Сохранить компактность `stream/matrix` без потери contract guards
+
+- [x] Исправить `application/api/stream/matrix.js`: текущую строку `makeSymbol(instruments[0].symbol)` можно менять. Важно не сохранить конкретную форму, а оставить метод коротким и читаемым без лишних промежуточных сущностей.
+- [x] Проверки и преобразования делать только при необходимости: минимально защитить случаи, где public input может быть пустым/некорректным и должен дать `DomainError('EINSTRUMENTS')`, а не `TypeError`.
+- [x] Сейчас `const { symbol, tsSymbol } = lib.utils.makeSymbol(instruments[0].symbol);` выполняется до contract validation. Для `{ instruments: [] }`, `{ instruments: [{}] }` или invalid symbol это может дать `TypeError` вместо `DomainError('EINSTRUMENTS')`.
+- [x] Компактность нужна на уровне всего метода, а не только одной строки. Если более короткая запись сохраняет понятный lifecycle `subscribe/touch/unsubscribe`, `streamKey` и symbol formats, её нужно предпочесть развернутому over-defensive коду.
+- [x] Явно проверить формат symbol для upstream matrix endpoint и downstream event payload: TradeStation matrix routing и `streamKey` используют `tsSymbol`, а downstream `metaterminal` packet остаётся на canonical back symbol `symbol`.
+- [x] Добавить regression coverage: empty instruments, malformed first instrument и first invalid / second valid instrument не должны падать `TypeError`; ожидаемый результат должен соответствовать contract `EINSTRUMENTS` или выбранной стратегии first valid instrument.
+
+Критерии приёмки:
+
+- [x] `stream/matrix` не падает до `try/finally` при пустом или некорректном `instruments`.
+- [x] Invalid input возвращает `DomainError('EINSTRUMENTS')`.
+- [x] `npm run lint`, `npm run types`, `npm test` проходят.
+
+## Блок 25: Stream API compact contract alignment
+
+### T-032: Привести `application/api/stream/quotes.js` к compact contract style
+
+- [x] Проверить и упростить `application/api/stream/quotes.js` по правилам `task.md`: без overengineering, минимальные проверки только для public input, компактный читаемый метод целиком.
+- [x] Сохранить текущий public input shape: `{ instruments, action, stop, idleMs, streamKey, traceId, requestId }`.
+- [x] Сохранить поддержку нескольких instruments: quotes stream может подписываться на batch symbols, поэтому нельзя превращать его в single-instrument flow как `matrix`.
+- [x] Нормализацию symbol делать через общий contract `makeSymbol()` / `makeTSSymbol()`. Не возвращать к локальным regex или ручной сборке option symbol.
+- [x] Проверить invalid input behavior: empty/invalid instruments для `subscribe` должны возвращать `DomainError('EINSTRUMENTS')`, а `unsubscribe` / `touch` должны работать по `streamKey`, если он передан.
+- [x] Добавить или уточнить regression coverage только там, где это реально защищает public contract: empty subscribe, invalid action, touch/unsubscribe by key, multiple instruments into stable TS symbol key.
+
+Критерии приёмки:
+
+- [x] `stream/quotes` остаётся batch-capable и использует общий symbol formatter.
+- [x] Public input errors остаются domain errors, без `TypeError` на пустом/битом input.
+- [x] Метод короче/чище без потери lifecycle semantics.
+- [x] `npm run lint`, `npm run types`, `npm test` проходят.
+
+### T-033: Привести `application/api/stream/addBarchart.js` к stream API contract style
+
+- [x] Проверить `application/api/stream/addBarchart.js` и привести его к тем же правилам компактного contract-first кода.
+- [x] Определить и явно закрепить public input shape для chart stream. Если текущий `symbol` остаётся осознанным contract для chart stream, описать это в review notes. Если нужно выровнять с `instrument`, сделать это без поддержки лишних legacy вариантов.
+- [x] Сохранить `action` / `stop` / `idleMs` / `streamKey` / `traceId` / `requestId` lifecycle и stop reason propagation.
+- [x] Проверки `period`, `limit`, `symbol/instrument` должны быть минимальными, но достаточными, чтобы invalid public input возвращал `DomainError`, а не падал internal error.
+- [x] Символы для upstream TradeStation должны формироваться через `makeSymbol()` / `makeTSSymbol()` там, где endpoint принимает metaterminal/back symbol.
+- [x] Добавить regression coverage для invalid input и для выбранного public contract shape.
+
+Критерии приёмки:
+
+- [x] `stream/addBarchart` имеет явно понятный public input contract и не смешивает несколько неописанных форматов.
+- [x] `period`/`limit`/symbol validation возвращают documented domain errors.
+- [x] Lifecycle `subscribe/touch/unsubscribe` сохранён.
+- [x] `npm run lint`, `npm run types`, `npm test` проходят.
+
+### T-034: Проверить `application/api/stream/clear.js` на contract metadata и compact lifecycle
+
+- [x] Проверить `application/api/stream/clear.js`: endpoint сейчас простой, но должен соответствовать общему style публичных stream API.
+- [x] Если требуется, добавить `parameters`, `returns`, `errors` metadata без усложнения метода.
+- [x] Сохранить текущую семантику: очистка всех подписок текущего `context.client` через `domain.ts.streams.unsubscribeAll({ reason: 'clear' })`.
+- [x] Проверить, что trace logging остаётся компактным и показывает `removedCount`.
+- [x] Добавить regression coverage только если существующие тесты не фиксируют return shape `{ removed, total }`.
+
+Критерии приёмки:
+
+- [x] `stream/clear` остаётся коротким и не получает лишнюю абстракцию.
+- [x] Return shape и trace fields понятны из кода и docs.
+- [x] `npm run lint`, `npm run types`, `npm test` проходят.
+
+### T-035: Финальный audit всех `application/api/stream/*` после преобразования
+
+- [x] После T-032..T-034 сделать общий audit папки `application/api/stream`.
+- [x] Проверить единообразие action handling: `subscribe`, `touch`, `unsubscribe`, legacy `stop` только через `lib.utils.normalizeAction()`.
+- [x] Проверить единообразие managed stream lifecycle: API слой не хранит state, upstream stream создаётся через `domain.ts.streams.subscribe`, stop прокидывает reason до `domain.ts.clients.stopStoredStream()`.
+- [x] Проверить symbol formats: downstream metaterminal events используют canonical back symbol, upstream TradeStation endpoints используют TS symbol там, где это требуется.
+- [x] Не трогать console statements и закомментированные console statements в рамках этой задачи, если они не ломают тесты и задача не про logging.
+- [x] Обновить `doc/review.md` заключением по блоку.
+
+Критерии приёмки:
+
+- [x] Все файлы `application/api/stream/*` соответствуют общим правилам `task.md`.
+- [x] Нет новых legacy input aliases без явного решения в задаче.
+- [x] `npm run lint`, `npm run types`, `npm test` проходят.
+
+## Блок 26: Barchart stream canonical event symbol
+
+### T-036: Отдавать canonical symbol в downstream `stream/barchart` event
+
+- [x] Исправить `application/api/stream/addBarchart.js`: upstream endpoint, `streamKey` и `tsClient.streamCharts()` могут использовать TradeStation `tsSymbol`, но downstream event `stream/barchart` должен отдавать canonical back/metaterminal symbol.
+- [x] Сейчас `emit('stream/barchart', { streamKey: key, symbol: chartSymbol, bar: message })` использует `chartSymbol`, который после T-033 является `tsSymbol`. Для OPT это формат `CRWV 280121C80`, а общий stream audit требует canonical back symbol `CRWV280121C00080000`.
+- [x] Сохранить public input contract `symbol` для `stream/addBarchart`, если он остаётся осознанным API shape. Не добавлять новые aliases.
+- [x] Добавить regression coverage: при subscribe с `symbol: 'CRWV280121C00080000'` или `symbol: 'CRWV 280121C80'` upstream endpoint остаётся `marketdata/stream/barcharts/CRWV 280121C80`, а emitted `stream/barchart` payload содержит `symbol: 'CRWV280121C00080000'`.
+
+Критерии приёмки:
+
+- [x] Upstream barchart routing использует TS symbol.
+- [x] Downstream `stream/barchart` event использует canonical back symbol.
+- [x] `npm run lint`, `npm run types`, `npm test` проходят.

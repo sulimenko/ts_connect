@@ -1,5 +1,7 @@
 ({
   access: 'public',
+  parameters: 'json',
+  returns: 'json',
   method: async ({ traceId = null, requestId = null } = {}) => {
     const trace = lib.utils.resolveTraceId({ traceId, requestId, prefix: 'stream' });
     const startedAt = Date.now();

@@ -20,6 +20,7 @@
     const actionSet = new Set(['subscribe', 'unsubscribe', 'touch']);
     const actionValue = lib.utils.normalizeAction({ action, stop });
     const actionLabel = actionValue ?? 'subscribe';
+    const instrumentList = Array.isArray(instruments) ? instruments : [];
     const providedKey = typeof streamKey === 'string' ? streamKey.trim() || null : null;
     let key = providedKey;
     let status = 'ok';
@@ -32,7 +33,7 @@
       traceId: trace,
       streamKey: key,
       action: actionLabel,
-      extra: { instrumentCount: instruments.length },
+      extra: { instrumentCount: instrumentList.length },
     });
 
     try {
@@ -42,19 +43,15 @@
       }
 
       const normalizedSymbols = [];
-      for (const instrument of instruments) {
+      for (const instrument of instrumentList) {
         if (!instrument || typeof instrument !== 'object') continue;
         const parsed = lib.utils.makeSymbol(instrument.symbol);
-        try {
-          if (!parsed) continue;
-          normalizedSymbols.push(lib.utils.makeTSSymbol(parsed.symbol, parsed.type));
-          validInstrumentCount += 1;
-        } catch (error) {
-          console.error('Invalid quote instrument:', instrument, error);
-        }
+        if (!parsed) continue;
+        normalizedSymbols.push(lib.utils.makeTSSymbol(parsed.symbol, parsed.type));
+        validInstrumentCount += 1;
       }
 
-      const symbols = Array.from(new Set(normalizedSymbols)).sort();
+      const symbols = [...new Set(normalizedSymbols)].sort();
       tsSymbolCount = symbols.length;
 
       if (actionValue === 'subscribe' && symbols.length === 0) {
@@ -130,7 +127,7 @@
         action: actionLabel,
         durationMs: Date.now() - startedAt,
         extra: {
-          instrumentCount: instruments.length,
+          instrumentCount: instrumentList.length,
           validInstrumentCount,
           tsSymbolCount,
           status,

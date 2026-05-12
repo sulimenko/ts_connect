@@ -519,19 +519,20 @@ test('placeorder normalizes instrument type before getAction for option closes',
   assert.equal(sendCalls[0].data.TradeAction, 'SELLTOCLOSE');
 });
 
-test('stream matrix accepts instruments and derives symbol from the first valid instrument', async () => {
+test('stream matrix rejects empty or malformed instruments and uses the first valid instrument', async () => {
   const utils = loadUtils();
+  const DomainError = class DomainError extends Error {
+    constructor(code) {
+      super(code);
+      this.code = code;
+      this.name = 'DomainError';
+    }
+  };
   let buildStreamKeyArgs = null;
   let subscribeArgs = null;
 
   const matrixApi = loadExpressionModule('application/api/stream/matrix.js', {
-    DomainError: class DomainError extends Error {
-      constructor(code) {
-        super(code);
-        this.code = code;
-        this.name = 'DomainError';
-      }
-    },
+    DomainError,
     context: { client: {} },
     domain: {
       ts: {
@@ -554,15 +555,324 @@ test('stream matrix accepts instruments and derives symbol from the first valid 
     lib: { utils },
   });
 
-  await matrixApi.method({
-    instruments: [{ symbol: 'CRWV 280121C80' }, { symbol: 'MSFT' }],
+  const emptyResult = await matrixApi.method({ instruments: [] });
+  assert.ok(emptyResult instanceof DomainError);
+  assert.equal(emptyResult.code, 'EINSTRUMENTS');
+
+  const malformedResult = await matrixApi.method({ instruments: [{}] });
+  assert.ok(malformedResult instanceof DomainError);
+  assert.equal(malformedResult.code, 'EINSTRUMENTS');
+
+  const invalidFirst = await matrixApi.method({
+    instruments: [{ symbol: '' }, { symbol: 'CRWV 280121C80' }],
   });
 
+  assert.equal(invalidFirst.ok, true);
   assert.ok(buildStreamKeyArgs);
-  assert.equal(buildStreamKeyArgs.symbol, 'CRWV280121C00080000');
+  assert.equal(buildStreamKeyArgs.symbol, 'CRWV 280121C80');
   assert.ok(subscribeArgs);
   assert.equal(subscribeArgs.key, 'matrix-key');
-  assert.equal(subscribeArgs.metadata.symbol, 'CRWV280121C00080000');
+  assert.equal(subscribeArgs.metadata.symbol, 'CRWV 280121C80');
+  assert.equal(typeof subscribeArgs.start, 'function');
+  assert.equal(subscribeArgs.metadata.owner, 'metaterminal');
+});
+
+test('stream matrix emits canonical levelII packets while routing by tsSymbol', async () => {
+  const utils = loadUtils();
+  let streamMatrixArgs = null;
+  let emitted = null;
+
+  const matrixApi = loadExpressionModule('application/api/stream/matrix.js', {
+    DomainError: class DomainError extends Error {
+      constructor(code) {
+        super(code);
+        this.code = code;
+        this.name = 'DomainError';
+      }
+    },
+    context: { client: {} },
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            buildStreamKey: () => 'matrix-key',
+            streamMatrix: async (args) => {
+              streamMatrixArgs = args;
+              await args.onData({ AskSize: 2, BidSize: 0, Price: 12.34 });
+              return 'registered-key';
+            },
+            stopStoredStream: async () => {},
+          }),
+        },
+        streams: {
+          subscribe: async ({ start }) => {
+            await start({
+              notifyError: () => {},
+              emit: (eventName, payload) => {
+                emitted = { eventName, payload };
+              },
+            });
+            return { ok: true };
+          },
+        },
+      },
+    },
+    lib: { utils },
+  });
+
+  await matrixApi.method({
+    instruments: [{ symbol: 'CRWV 280121C80' }],
+  });
+
+  assert.ok(streamMatrixArgs);
+  assert.equal(streamMatrixArgs.endpoint.join('/'), 'stream/matrix/changes/CRWV 280121C80');
+  assert.equal(streamMatrixArgs.symbol, 'CRWV 280121C80');
+  assert.ok(emitted);
+  assert.equal(emitted.eventName, 'stream/levelII');
+  assert.equal(emitted.payload.symbol, 'CRWV280121C00080000');
+  assert.equal(emitted.payload.type, 'ask');
+  assert.equal(emitted.payload.size, 2);
+});
+
+test('stream quotes keeps batch keys stable and guards public input', async () => {
+  const utils = loadUtils();
+  const DomainError = class DomainError extends Error {
+    constructor(code) {
+      super(code);
+      this.code = code;
+      this.name = 'DomainError';
+    }
+  };
+  let subscribeArgs = null;
+  let streamQuotesArgs = null;
+  let unsubscribeArgs = null;
+  let touchArgs = null;
+
+  const quotesApi = loadExpressionModule('application/api/stream/quotes.js', {
+    DomainError,
+    context: { client: {} },
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            streamQuotes: async (args) => {
+              streamQuotesArgs = args;
+              return 'quotes-registered-key';
+            },
+            stopStoredStream: async () => {},
+          }),
+        },
+        streams: {
+          subscribe: async (args) => {
+            subscribeArgs = args;
+            await args.start({
+              notifyError: () => {},
+              emit: () => {},
+            });
+            return { ok: true };
+          },
+          unsubscribe: async (args) => {
+            unsubscribeArgs = args;
+            return { ok: true, kind: args.kind, streamKey: args.key, removed: true };
+          },
+          touch: async (args) => {
+            touchArgs = args;
+            return { ok: true, kind: args.kind, streamKey: args.key, active: true };
+          },
+        },
+      },
+    },
+    lib: { utils },
+  });
+
+  const emptyResult = await quotesApi.method({ instruments: null });
+  assert.ok(emptyResult instanceof DomainError);
+  assert.equal(emptyResult.code, 'EINSTRUMENTS');
+
+  const invalidAction = await quotesApi.method({ action: 'restart', instruments: [] });
+  assert.ok(invalidAction instanceof DomainError);
+  assert.equal(invalidAction.code, 'EACTION');
+
+  const subscribeResult = await quotesApi.method({
+    instruments: [{ symbol: 'MSFT' }, { symbol: 'CRWV 280121C80' }, { symbol: 'MSFT' }],
+  });
+
+  assert.deepEqual(subscribeResult, { ok: true });
+  assert.ok(subscribeArgs);
+  assert.equal(subscribeArgs.key, 'CRWV 280121C80,MSFT');
+  assert.ok(streamQuotesArgs);
+  assert.equal(streamQuotesArgs.endpoint.join('/'), 'marketdata/stream/quotes/CRWV 280121C80,MSFT');
+  assert.equal(streamQuotesArgs.trace.scope, 'stream/quotes');
+
+  const unsubscribeResult = await quotesApi.method({
+    instruments: null,
+    action: 'unsubscribe',
+    streamKey: 'quotes-key',
+  });
+
+  assert.deepEqual(unsubscribeResult, { ok: true, kind: 'quotes', streamKey: 'quotes-key', removed: true });
+  assert.ok(unsubscribeArgs);
+  assert.equal(unsubscribeArgs.key, 'quotes-key');
+
+  const touchResult = await quotesApi.method({
+    instruments: [],
+    action: 'touch',
+    streamKey: 'quotes-key',
+  });
+
+  assert.deepEqual(touchResult, { ok: true, kind: 'quotes', streamKey: 'quotes-key', active: true });
+  assert.ok(touchArgs);
+  assert.equal(touchArgs.key, 'quotes-key');
+});
+
+test('stream addBarchart normalizes symbol contract and rejects empty symbol', async () => {
+  const utils = loadUtils();
+  const DomainError = class DomainError extends Error {
+    constructor(code) {
+      super(code);
+      this.code = code;
+      this.name = 'DomainError';
+    }
+  };
+  let buildStreamKeyArgs = null;
+  let streamChartsArgs = null;
+
+  const barchartApi = loadExpressionModule('application/api/stream/addBarchart.js', {
+    DomainError,
+    context: { client: {} },
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            buildStreamKey: (args) => {
+              buildStreamKeyArgs = args;
+              return 'charts-key';
+            },
+            streamCharts: async (args) => {
+              streamChartsArgs = args;
+              return 'charts-registered-key';
+            },
+            stopStoredStream: async () => {},
+          }),
+        },
+        streams: {
+          subscribe: async (args) => {
+            await args.start({
+              notifyError: () => {},
+              emit: () => {},
+            });
+            return { ok: true };
+          },
+          unsubscribe: async () => ({ ok: true }),
+          touch: async () => ({ ok: true }),
+        },
+      },
+    },
+    lib: { utils },
+  });
+
+  const invalidResult = await barchartApi.method({ symbol: '   ' });
+  assert.ok(invalidResult instanceof DomainError);
+  assert.equal(invalidResult.code, 'ESYMBOL');
+
+  const subscribeResult = await barchartApi.method({
+    symbol: 'CRWV280121C00080000',
+    period: 3600,
+    limit: 100,
+  });
+
+  assert.deepEqual(subscribeResult, { ok: true });
+  assert.ok(buildStreamKeyArgs);
+  assert.equal(buildStreamKeyArgs.symbol, 'CRWV 280121C80');
+  assert.ok(streamChartsArgs);
+  assert.equal(streamChartsArgs.endpoint.join('/'), 'marketdata/stream/barcharts/CRWV 280121C80');
+  assert.equal(streamChartsArgs.symbol, 'CRWV 280121C80');
+});
+
+test('stream addBarchart emits canonical symbol for TS-style input', async () => {
+  const utils = loadUtils();
+  let emitted = null;
+
+  const barchartApi = loadExpressionModule('application/api/stream/addBarchart.js', {
+    DomainError: class DomainError extends Error {
+      constructor(code) {
+        super(code);
+        this.code = code;
+        this.name = 'DomainError';
+      }
+    },
+    context: { client: {} },
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            buildStreamKey: () => 'charts-key',
+            streamCharts: async (args) => {
+              await args.onData({ Open: 1 });
+              return 'charts-registered-key';
+            },
+            stopStoredStream: async () => {},
+          }),
+        },
+        streams: {
+          subscribe: async ({ start }) => {
+            await start({
+              notifyError: () => {},
+              emit: (eventName, payload) => {
+                emitted = { eventName, payload };
+              },
+            });
+            return { ok: true };
+          },
+          unsubscribe: async () => ({ ok: true }),
+          touch: async () => ({ ok: true }),
+        },
+      },
+    },
+    lib: { utils },
+  });
+
+  const result = await barchartApi.method({
+    symbol: 'CRWV 280121C80',
+    period: 3600,
+    limit: 100,
+  });
+
+  assert.deepEqual(result, { ok: true });
+  assert.ok(emitted);
+  assert.equal(emitted.eventName, 'stream/barchart');
+  assert.equal(emitted.payload.symbol, 'CRWV280121C00080000');
+});
+
+test('stream clear returns removed entries and total count', async () => {
+  const utils = loadUtils();
+  let unsubscribeAllArgs = null;
+
+  const clearApi = loadExpressionModule('application/api/stream/clear.js', {
+    context: { client: {} },
+    domain: {
+      ts: {
+        streams: {
+          unsubscribeAll: async (args) => {
+            unsubscribeAllArgs = args;
+            return [{ kind: 'quotes', key: 'quotes-key', removed: true }];
+          },
+        },
+      },
+    },
+    lib: { utils },
+  });
+
+  const result = await clearApi.method({ traceId: 'trace-1' });
+
+  assert.ok(result);
+  assert.equal(result.total, 1);
+  assert.equal(result.removed.length, 1);
+  assert.equal(result.removed[0].kind, 'quotes');
+  assert.equal(result.removed[0].key, 'quotes-key');
+  assert.equal(result.removed[0].removed, true);
+  assert.ok(unsubscribeAllArgs);
+  assert.equal(unsubscribeAllArgs.reason, 'clear');
 });
 
 test('marketdata barcharts returns EINSTRUMENT for null or empty instrument input', async () => {
