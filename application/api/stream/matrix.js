@@ -111,7 +111,6 @@
             if (packet.type === 'delete' && packet.size !== 0) {
               console.error('stream matrix delete with size', message);
             }
-            console.warn('stream/levelII', packet);
             emit('stream/levelII', packet);
           };
 

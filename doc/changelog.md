@@ -32,6 +32,13 @@
 | T-022 | Довести contract для `stream/matrix` и `stream/quotes` до metaterminal-managed lifecycle | [x]    | 2026-05-10 | `stream/quotes` и `stream/matrix` получили contract metadata, action validation и независимые stream keys.                              |
 | T-023 | Привести `marketdata/tickbars` к contract/logging parity с `marketdata/quotes`           | [x]    | 2026-05-10 | `marketdata/tickbars` теперь валидирует вход, читает v2 JSON-lines stream и логирует `api.start` / `ts.request.done` / `api.done`.      |
 | T-024 | Привести option snapshot endpoints к стилю `application/api/options/chain.js`            | [x]    | 2026-05-10 | `strikes`, `expirations`, `riskreward` и `spreadtypes` выровнены по contract-first style с predictable domain validation.               |
+| T-039 | Исправить порядок регистрации subscriber-а перед запуском upstream stream                | [x]    | 2026-05-12 | Subscriber регистрируется до `start()`, поэтому synchronous emit больше не теряется из-за пустого subscriber set.                       |
+| T-040 | Добавить startup state / startPromise для concurrent subscribe                           | [x]    | 2026-05-12 | Один `startPromise` обслуживает concurrent subscribe на один `kind:key`, без второго upstream stream.                                   |
+| T-041 | Обработать client.close во время startup                                                 | [x]    | 2026-05-12 | `client.close` снимает subscription during startup, а startup.no-subscribers cleanup не оставляет dangling stream.                      |
+| T-042 | Добавить диагностику dropped stream events                                               | [x]    | 2026-05-12 | `emit()` теперь логирует dropped event with state, upstreamReady, lastMessageAt и subscriberCount без payload noise.                    |
+| T-043 | Расширить info/client для stream startup diagnostics                                     | [x]    | 2026-05-12 | `info/client` показывает `state`, `upstreamReady`, `starting`, `lastError` и metadata для managed subscriptions.                        |
+| T-044 | Добавить regression tests для managed stream subscribe race                              | [x]    | 2026-05-12 | Regression suite покрывает synchronous emit, startup failure cleanup и concurrent subscribe race.                                       |
+| T-045 | Обновить stream lifecycle документацию                                                   | [!]    | 2026-05-12 | `blueprint.md` и `review.md` фиксируют startup-race invariant, но финальное закрытие блока отложено из-за review findings.              |
 
 ---
 
@@ -59,3 +66,4 @@
 | 2026-05-10 | Блок 16 — Managed Level II streams for metaterminal                     | passed with notes   | `stream/quotes` и `stream/matrix` теперь имеют explicit contract metadata, action validation и независимые stop/reuse keys.                            |
 | 2026-05-10 | Блок 17 — Tickbars contract and diagnostics parity                      | passed with notes   | `marketdata/tickbars` стал contract-aware stream reader с trace-логами и predictable domain validation.                                                |
 | 2026-05-10 | Блок 18 — Options API style alignment                                   | passed with notes   | `application/api/options/*` получил uniform contract metadata и predictable invalid-input handling там, где это применимо.                             |
+| 2026-05-12 | Блок 29 — Managed stream startup race hardening                         | failed              | Runtime-идея принята, но `npm test` не завершает процесс после passed output, а T-038 был удалён без выполнения/архивации. Создан follow-up T-046.     |

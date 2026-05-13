@@ -6,7 +6,7 @@
 
 При review нужно исходить из того, что `ts_connect` опирается на Metarhia/Impress как на реальный механизм исполнения RPC-контрактов. Поэтому review проверяет не только "работает ли метод", но и "остался ли он внутри архитектурной модели проекта": контракт процедуры, границы слоев, stream lifecycle и явные ограничения интеграции с TradeStation.
 
-Review обязателен после любого task. После review нужно синхронно обновить все файлы `doc/*`, чтобы новое правило, найденный риск или новый reference example не оставались только в коде.
+Review обязателен после любого task. После review architect синхронно обновляет все файлы `doc/*`, чтобы новое правило, найденный риск или новый reference example не оставались только в коде. Worker документацию не меняет.
 
 ## Что считаем архитектурной опорой проекта
 
@@ -67,6 +67,7 @@ Review обязателен после любого task. После review ну
 - после unsubscribe subscription исчезает, но upstream stream остается висеть без подписчиков;
 - managed stream stop logs должны отличать `idle`, `unsubscribe`, `clear`, `client.close` и `permanent-error`, чтобы эксплуатация не теряла причину остановки;
 - если операция может быть корректно отклонена на уровне контракта, она должна возвращать `DomainError` с явным `errors` block, а не generic `Error`.
+- startup race должна проверяться отдельно: downstream subscriber регистрируется до `start()`, concurrent subscribe на один `kind:key` разделяет один `startPromise`, а startup failure обязан делать полный cleanup без dangling entry.
 
 ## 4. Проверка совместимости публичного API
 
@@ -103,8 +104,9 @@ Review обязателен после любого task. После review ну
 - изменение оставляет способ увидеть текущее server-side состояние;
 - при необходимости обновлены info/introspection методы;
 - есть ручной сценарий smoke-проверки до деплоя;
-- ограничения сервиса отражены в документации, а не только в коде;
+- ограничения сервиса отражены в документации, а не только в коде; эти изменения делает architect после review;
 - worker не добавляет новый test coverage внутри обычного функционального блока; если review принимает блок, architect при необходимости создаёт отдельный test-block.
+- worker не меняет `doc/*`, не меняет статусы задач, не архивирует блоки и не пишет review-заключения; если нужна правка документации, worker сообщает это в итоговом отчёте.
 
 Минимум для stream-изменения:
 
@@ -279,3 +281,20 @@ Review обязателен после любого task. После review ну
 - `application/api/stream/addBarchart.js` и `application/lib/stream/optionChain.js` эмитят `stream/barchart` / `stream/chain` с `instrument` вместо top-level `symbol`
 - `application/test/run.js` покрывает canonical `instrument` payload для `stream/levelII`, `stream/quote`, `stream/barchart` и `stream/chain`
 - Создать test-only T-038 на явную проверку отсутствия top-level `symbol` в `stream/levelII`.
+
+### Заключение: Блок 29 — Managed stream startup race hardening
+
+Статус: failed
+Проблемы:
+
+- [P1] `npm test` печатает `20 test(s) passed`, но процесс не завершается и продолжает висеть после тестов. Это похоже на оставленные active timers/subscriptions в новых managed stream regression tests или lifecycle cleanup path.
+- [P2] Test-only задача T-038 исчезла из `doc/task.md`, но не появилась в `doc/changelog.md`, и проверка отсутствия top-level `symbol` в `stream/levelII` всё ещё не добавлена в `application/test/run.js`.
+- Live TradeStation runtime smoke для managed stream lifecycle в этом workspace не запускался.
+
+Задачи:
+
+- `application/domain/ts/streams.js` теперь регистрирует subscriber до `start()`, разделяет один `startPromise` на concurrent subscribe, очищает `client.close` during startup и логирует dropped events без payload
+- `application/api/info/client.js` и `domain.ts.streams.list()` показывают `state`, `upstreamReady`, `starting` и `lastError` для managed subscriptions
+- `application/test/run.js` покрывает synchronous emit during startup, startup failure cleanup и concurrent subscribe race
+- `doc/blueprint.md` и review checklist фиксируют startup-race invariant для будущих stream endpoint-ов
+- Создать follow-up блок на cleanup зависающих tests и восстановление T-038 acceptance.

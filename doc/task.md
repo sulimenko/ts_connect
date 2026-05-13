@@ -22,6 +22,8 @@
 - Worker получает весь блок сразу и выполняет задачи последовательно
 - Задачи внутри блока описаны подробно: файлы, поведение до, поведение после, ограничения
 - Worker не может сам добавлять задачи или менять блок — только выполняет описанное
+- Worker не меняет `doc/*`, не меняет статусы задач, не архивирует блоки и не пишет review-заключения; этим занимается только architect
+- Если worker видит, что документация требует обновления, он сообщает об этом в итоговом отчёте, но не правит документацию
 - После выполнения блока worker сигнализирует завершение — architect проводит review
 
 ### Общие правила реализации
@@ -329,16 +331,21 @@
 - Все outbound stream tests в `application/test/run.js` проверяют отсутствие top-level `symbol` там, где он удалён.
 - `npm run lint`, `npm run types`, `npm test` проходят.
 
-## Блок 28: Stream outbound contract test gap
+## Блок 30: Managed stream review fixes
 
-### T-038: Добавить явную проверку отсутствия top-level `symbol` в `stream/levelII`
+### T-046: Исправить зависание `npm test` после managed stream startup tests
 
-- [ ] Доработать только regression coverage в `application/test/run.js`.
-- [ ] В тесте `stream matrix emits canonical levelII packets while routing by tsSymbol` добавить явную проверку, что emitted payload `stream/levelII` не содержит top-level `symbol`.
-- [ ] Не менять runtime-код, если текущий payload уже соответствует контракту T-037.
-- [ ] Сохранить существующие проверки `instrument.symbol`, `instrument.asset_category`, `instrument.source`, `instrument.listing_exchange`, `instrument.currency`, `type`, `size`, upstream endpoint и TS symbol routing.
+- [ ] Проверить новые тесты managed stream lifecycle в `application/test/run.js`.
+- [ ] Найти оставленные active timers/subscriptions/listeners, из-за которых `npm test` печатает `20 test(s) passed`, но процесс не завершается.
+- [ ] Исправить тестовый cleanup или runtime cleanup path минимально, без изменения публичного stream contract.
+- [ ] Если причина в тестах, явно останавливать созданные managed stream entries после assertions через public/domain API, а не оставлять idle timers до `defaultIdleMs`.
+- [ ] Если причина в runtime lifecycle, исправить `application/domain/ts/streams.js` так, чтобы successful subscribe tests могли корректно остановить streams и не оставлять dangling timers.
+- [ ] Восстановить acceptance T-038: в тесте `stream matrix emits canonical levelII packets while routing by tsSymbol` добавить явную проверку, что emitted payload `stream/levelII` не содержит top-level `symbol`.
+- [ ] Сообщить architect-у в итоговом отчёте, если после выполнения остаётся документационная консистентность по T-038/T-046. Не менять `doc/*` из worker-а.
 
 Критерии приёмки:
 
-- Тест падает, если `stream/levelII` снова начнёт отдавать top-level `symbol`.
+- `npm test` не только печатает passed, но и завершает процесс с exit code `0` без ожидания idle таймеров.
+- `stream/levelII` regression test падает при возврате top-level `symbol`.
+- Worker не менял `doc/*`; architect после review синхронизирует `doc/task.md`, `doc/review.md`, `doc/changelog.md` по T-038 и текущему блоку.
 - `npm run lint`, `npm run types`, `npm test` проходят.

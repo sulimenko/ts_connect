@@ -2,6 +2,7 @@
 /* global require */
 
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -281,6 +282,144 @@ test('serializeError preserves upstream error metadata', async () => {
   assert.equal(errorResult.details, 'more detail');
   assert.equal(errorResult.upstreamMessage, 'upstream detail');
   assert.equal(errorResult.symbol, 'TSLA');
+});
+
+test('managed stream subscribe registers the client before synchronous startup emit', async () => {
+  const streams = loadExpressionModule('application/domain/ts/streams.js', {
+    lib: makeLib(),
+  });
+  const client = new EventEmitter();
+  let received = null;
+  let startCalls = 0;
+
+  client.on('stream/levelII', (packet) => {
+    received = packet;
+  });
+
+  const result = await streams.subscribe({
+    kind: 'matrix',
+    key: 'matrix-key',
+    client,
+    metadata: { symbol: 'TSLA' },
+    start: async ({ emit }) => {
+      startCalls += 1;
+      emit('stream/levelII', { instrument: 'TSLA', price: 12.34 });
+      return {
+        stop: async () => {},
+      };
+    },
+  });
+
+  assert.equal(startCalls, 1);
+  assert.equal(result.active, true);
+  assert.equal(result.subscribers, 1);
+  assert.equal(result.created, true);
+  assert.equal(result.subscribed, true);
+  assert.equal(result.metadata.symbol, 'TSLA');
+  assert.deepEqual(received, { instrument: 'TSLA', price: 12.34 });
+
+  await streams.unsubscribe({
+    kind: 'matrix',
+    key: 'matrix-key',
+    client,
+    reason: 'test.cleanup',
+  });
+});
+
+test('managed stream startup failure cleans up listeners and registry entries', async () => {
+  const clears = [];
+  const streams = loadExpressionModule('application/domain/ts/streams.js', {
+    lib: makeLib(),
+    clearTimeout: (timer) => {
+      clears.push(timer);
+    },
+  });
+  const client = new EventEmitter();
+  let startCalls = 0;
+
+  await assert.rejects(
+    streams.subscribe({
+      kind: 'quotes',
+      key: 'quotes-key',
+      client,
+      idleMs: 1000,
+      start: async () => {
+        startCalls += 1;
+        throw new Error('startup boom');
+      },
+    }),
+    /startup boom/,
+  );
+
+  assert.equal(startCalls, 1);
+  assert.equal(streams.getEntry({ kind: 'quotes', key: 'quotes-key' }), null);
+  assert.equal(client.listenerCount('close'), 0);
+  assert.equal(clears.length, 1);
+});
+
+test('managed stream concurrent subscribe shares one startup promise', async () => {
+  const streams = loadExpressionModule('application/domain/ts/streams.js', {
+    lib: makeLib(),
+  });
+  const clientA = new EventEmitter();
+  const clientB = new EventEmitter();
+  let startCalls = 0;
+  let resolveUpstream = null;
+
+  const upstreamReady = new Promise((resolve) => {
+    resolveUpstream = resolve;
+  });
+
+  const first = streams.subscribe({
+    kind: 'matrix',
+    key: 'matrix-key',
+    client: clientA,
+    start: async () => {
+      startCalls += 1;
+      return upstreamReady;
+    },
+  });
+
+  const second = streams.subscribe({
+    kind: 'matrix',
+    key: 'matrix-key',
+    client: clientB,
+    start: async () => {
+      startCalls += 1;
+      return upstreamReady;
+    },
+  });
+
+  const entry = streams.getEntry({ kind: 'matrix', key: 'matrix-key' });
+  assert.ok(entry);
+  assert.equal(entry.state, 'starting');
+  assert.equal(entry.subscribers.size, 2);
+  assert.equal(startCalls, 1);
+
+  resolveUpstream({
+    stop: async () => {},
+  });
+
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+
+  assert.equal(firstResult.active, true);
+  assert.equal(secondResult.active, true);
+  assert.equal(firstResult.subscribers, 2);
+  assert.equal(secondResult.subscribers, 2);
+  assert.equal(streams.getEntry({ kind: 'matrix', key: 'matrix-key' }).state, 'active');
+
+  await streams.unsubscribe({
+    kind: 'matrix',
+    key: 'matrix-key',
+    client: clientA,
+    reason: 'test.cleanup',
+  });
+  await streams.unsubscribe({
+    kind: 'matrix',
+    key: 'matrix-key',
+    client: clientB,
+    reason: 'test.cleanup',
+  });
 });
 
 test('symbol helpers normalize display and internal option formats idempotently', async () => {
@@ -636,6 +775,7 @@ test('stream matrix emits canonical levelII packets while routing by tsSymbol', 
   assert.equal(emitted.payload.instrument.source, 'TS');
   assert.equal(emitted.payload.instrument.listing_exchange, 'TS');
   assert.equal(emitted.payload.instrument.currency, 'USD');
+  assert.equal(emitted.payload.symbol, undefined);
   assert.equal(emitted.payload.type, 'ask');
   assert.equal(emitted.payload.size, 2);
 });
