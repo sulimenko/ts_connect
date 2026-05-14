@@ -1,3 +1,4 @@
+/* eslint camelcase: "off" */
 ({
   access: 'public',
   parameters: 'json',
@@ -30,7 +31,15 @@
     const actionValue = lib.utils.normalizeAction({ action, stop });
     const parsedSymbol = typeof symbol === 'string' ? lib.utils.makeSymbol(symbol) : null;
     const chartSymbol = parsedSymbol?.tsSymbol ?? '';
-    const displaySymbol = parsedSymbol?.symbol ?? '';
+    const outboundInstrument = parsedSymbol
+      ? {
+          symbol: parsedSymbol.symbol,
+          asset_category: parsedSymbol.type,
+          source: 'TS',
+          listing_exchange: 'TS',
+          currency: 'USD',
+        }
+      : null;
     const chartKey = typeof streamKey === 'string' ? streamKey.trim() || null : null;
     const periodValue = Number(period);
     const limitValue = toNumber(limit);
@@ -84,7 +93,7 @@
         metadata: { symbol: chartSymbol, period: periodValue, limit: Math.floor(limitValue) },
         start: async ({ notifyError, emit }) => {
           const onData = (message) => {
-            emit('stream/barchart', { streamKey: key, symbol: displaySymbol, bar: message });
+            emit('stream/barchart', { streamKey: key, instrument: outboundInstrument, bar: message });
           };
           const onError = (error) => {
             console.error('stream chart error:', error);

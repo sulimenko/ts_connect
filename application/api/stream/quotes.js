@@ -88,7 +88,7 @@
         start: async ({ notifyError, emit }) => {
           const onData = (message) => {
             const packet = lib.ts.readQuote({ message });
-            if (!packet.symbol) return;
+            if (!packet.instrument) return;
             emit('stream/quote', packet);
           };
 

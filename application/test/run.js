@@ -2,6 +2,7 @@
 /* global require */
 
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -283,6 +284,144 @@ test('serializeError preserves upstream error metadata', async () => {
   assert.equal(errorResult.symbol, 'TSLA');
 });
 
+test('managed stream subscribe registers the client before synchronous startup emit', async () => {
+  const streams = loadExpressionModule('application/domain/ts/streams.js', {
+    lib: makeLib(),
+  });
+  const client = new EventEmitter();
+  let received = null;
+  let startCalls = 0;
+
+  client.on('stream/levelII', (packet) => {
+    received = packet;
+  });
+
+  const result = await streams.subscribe({
+    kind: 'matrix',
+    key: 'matrix-key',
+    client,
+    metadata: { symbol: 'TSLA' },
+    start: async ({ emit }) => {
+      startCalls += 1;
+      emit('stream/levelII', { instrument: 'TSLA', price: 12.34 });
+      return {
+        stop: async () => {},
+      };
+    },
+  });
+
+  assert.equal(startCalls, 1);
+  assert.equal(result.active, true);
+  assert.equal(result.subscribers, 1);
+  assert.equal(result.created, true);
+  assert.equal(result.subscribed, true);
+  assert.equal(result.metadata.symbol, 'TSLA');
+  assert.deepEqual(received, { instrument: 'TSLA', price: 12.34 });
+
+  await streams.unsubscribe({
+    kind: 'matrix',
+    key: 'matrix-key',
+    client,
+    reason: 'test.cleanup',
+  });
+});
+
+test('managed stream startup failure cleans up listeners and registry entries', async () => {
+  const clears = [];
+  const streams = loadExpressionModule('application/domain/ts/streams.js', {
+    lib: makeLib(),
+    clearTimeout: (timer) => {
+      clears.push(timer);
+    },
+  });
+  const client = new EventEmitter();
+  let startCalls = 0;
+
+  await assert.rejects(
+    streams.subscribe({
+      kind: 'quotes',
+      key: 'quotes-key',
+      client,
+      idleMs: 1000,
+      start: async () => {
+        startCalls += 1;
+        throw new Error('startup boom');
+      },
+    }),
+    /startup boom/,
+  );
+
+  assert.equal(startCalls, 1);
+  assert.equal(streams.getEntry({ kind: 'quotes', key: 'quotes-key' }), null);
+  assert.equal(client.listenerCount('close'), 0);
+  assert.equal(clears.length, 1);
+});
+
+test('managed stream concurrent subscribe shares one startup promise', async () => {
+  const streams = loadExpressionModule('application/domain/ts/streams.js', {
+    lib: makeLib(),
+  });
+  const clientA = new EventEmitter();
+  const clientB = new EventEmitter();
+  let startCalls = 0;
+  let resolveUpstream = null;
+
+  const upstreamReady = new Promise((resolve) => {
+    resolveUpstream = resolve;
+  });
+
+  const first = streams.subscribe({
+    kind: 'matrix',
+    key: 'matrix-key',
+    client: clientA,
+    start: async () => {
+      startCalls += 1;
+      return upstreamReady;
+    },
+  });
+
+  const second = streams.subscribe({
+    kind: 'matrix',
+    key: 'matrix-key',
+    client: clientB,
+    start: async () => {
+      startCalls += 1;
+      return upstreamReady;
+    },
+  });
+
+  const entry = streams.getEntry({ kind: 'matrix', key: 'matrix-key' });
+  assert.ok(entry);
+  assert.equal(entry.state, 'starting');
+  assert.equal(entry.subscribers.size, 2);
+  assert.equal(startCalls, 1);
+
+  resolveUpstream({
+    stop: async () => {},
+  });
+
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+
+  assert.equal(firstResult.active, true);
+  assert.equal(secondResult.active, true);
+  assert.equal(firstResult.subscribers, 2);
+  assert.equal(secondResult.subscribers, 2);
+  assert.equal(streams.getEntry({ kind: 'matrix', key: 'matrix-key' }).state, 'active');
+
+  await streams.unsubscribe({
+    kind: 'matrix',
+    key: 'matrix-key',
+    client: clientA,
+    reason: 'test.cleanup',
+  });
+  await streams.unsubscribe({
+    kind: 'matrix',
+    key: 'matrix-key',
+    client: clientB,
+    reason: 'test.cleanup',
+  });
+});
+
 test('symbol helpers normalize display and internal option formats idempotently', async () => {
   const utils = loadUtils();
 
@@ -304,7 +443,9 @@ test('symbol helpers normalize display and internal option formats idempotently'
 test('readOptionChain and positions share the same canonical option symbol contract', async () => {
   const utils = loadUtils();
   const readOptionChain = loadExpressionModule('application/lib/ts/readOptionChain.js', {
-    lib: { utils },
+    lib: {
+      utils,
+    },
   });
   const positions = loadExpressionModule('application/domain/ts/positions.js', {
     lib: { utils },
@@ -629,13 +770,21 @@ test('stream matrix emits canonical levelII packets while routing by tsSymbol', 
   assert.equal(streamMatrixArgs.symbol, 'CRWV 280121C80');
   assert.ok(emitted);
   assert.equal(emitted.eventName, 'stream/levelII');
-  assert.equal(emitted.payload.symbol, 'CRWV280121C00080000');
+  assert.equal(emitted.payload.instrument.symbol, 'CRWV280121C00080000');
+  assert.equal(emitted.payload.instrument.asset_category, 'OPT');
+  assert.equal(emitted.payload.instrument.source, 'TS');
+  assert.equal(emitted.payload.instrument.listing_exchange, 'TS');
+  assert.equal(emitted.payload.instrument.currency, 'USD');
+  assert.equal(emitted.payload.symbol, undefined);
   assert.equal(emitted.payload.type, 'ask');
   assert.equal(emitted.payload.size, 2);
 });
 
 test('stream quotes keeps batch keys stable and guards public input', async () => {
   const utils = loadUtils();
+  const readQuote = loadExpressionModule('application/lib/ts/readQuote.js', {
+    lib: { utils },
+  });
   const DomainError = class DomainError extends Error {
     constructor(code) {
       super(code);
@@ -647,6 +796,7 @@ test('stream quotes keeps batch keys stable and guards public input', async () =
   let streamQuotesArgs = null;
   let unsubscribeArgs = null;
   let touchArgs = null;
+  let emitted = null;
 
   const quotesApi = loadExpressionModule('application/api/stream/quotes.js', {
     DomainError,
@@ -657,6 +807,18 @@ test('stream quotes keeps batch keys stable and guards public input', async () =
           getClient: async () => ({
             streamQuotes: async (args) => {
               streamQuotesArgs = args;
+              await args.onData({
+                Symbol: 'CRWV 280121C80',
+                Ask: '1.30',
+                AskSize: 1,
+                Bid: '1.20',
+                BidSize: 2,
+                Last: '1.25',
+                LastSize: 3,
+                TradeTime: '2028-01-21T10:00:00Z',
+                PreviousClose: '1.15',
+                Volume: 4,
+              });
               return 'quotes-registered-key';
             },
             stopStoredStream: async () => {},
@@ -667,7 +829,9 @@ test('stream quotes keeps batch keys stable and guards public input', async () =
             subscribeArgs = args;
             await args.start({
               notifyError: () => {},
-              emit: () => {},
+              emit: (eventName, payload) => {
+                emitted = { eventName, payload };
+              },
             });
             return { ok: true };
           },
@@ -682,7 +846,12 @@ test('stream quotes keeps batch keys stable and guards public input', async () =
         },
       },
     },
-    lib: { utils },
+    lib: {
+      utils,
+      ts: {
+        readQuote,
+      },
+    },
   });
 
   const emptyResult = await quotesApi.method({ instruments: null });
@@ -703,6 +872,15 @@ test('stream quotes keeps batch keys stable and guards public input', async () =
   assert.ok(streamQuotesArgs);
   assert.equal(streamQuotesArgs.endpoint.join('/'), 'marketdata/stream/quotes/CRWV 280121C80,MSFT');
   assert.equal(streamQuotesArgs.trace.scope, 'stream/quotes');
+  assert.ok(emitted);
+  assert.equal(emitted.eventName, 'stream/quote');
+  assert.equal(emitted.payload.instrument.symbol, 'CRWV280121C00080000');
+  assert.equal(emitted.payload.instrument.asset_category, 'OPT');
+  assert.equal(emitted.payload.instrument.source, 'TS');
+  assert.equal(emitted.payload.instrument.listing_exchange, 'TS');
+  assert.equal(emitted.payload.instrument.currency, 'USD');
+  assert.equal(emitted.payload.data.symbol, undefined);
+  assert.equal(emitted.payload.symbol, undefined);
 
   const unsubscribeResult = await quotesApi.method({
     instruments: null,
@@ -841,7 +1019,102 @@ test('stream addBarchart emits canonical symbol for TS-style input', async () =>
   assert.deepEqual(result, { ok: true });
   assert.ok(emitted);
   assert.equal(emitted.eventName, 'stream/barchart');
-  assert.equal(emitted.payload.symbol, 'CRWV280121C00080000');
+  assert.equal(emitted.payload.instrument.symbol, 'CRWV280121C00080000');
+  assert.equal(emitted.payload.instrument.asset_category, 'OPT');
+  assert.equal(emitted.payload.instrument.source, 'TS');
+  assert.equal(emitted.payload.instrument.listing_exchange, 'TS');
+  assert.equal(emitted.payload.instrument.currency, 'USD');
+  assert.equal(emitted.payload.symbol, undefined);
+});
+
+test('stream optionChain emits root instrument payload while preserving chain symbols', async () => {
+  const utils = loadUtils();
+  let emitted = null;
+  let streamChainsArgs = null;
+
+  const optionChain = loadExpressionModule('application/lib/stream/optionChain.js', {
+    lib: {
+      utils,
+      ts: {
+        readOptionChain: loadExpressionModule('application/lib/ts/readOptionChain.js', {
+          lib: { utils },
+        }),
+      },
+    },
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            buildStreamKey: () => 'chains-key',
+            streamChains: async (args) => {
+              streamChainsArgs = args;
+              await args.onData({
+                Legs: [
+                  {
+                    Symbol: 'CRWV280121C00080000',
+                    Expiration: '2028-01-19T00:00:00Z',
+                    OptionType: 'Call',
+                  },
+                ],
+                Ask: '1.30',
+                AskSize: 1,
+                Bid: '1.20',
+                BidSize: 2,
+                Delta: '0.1',
+                Gamma: '0.2',
+                PreviousClose: '1.15',
+                DailyOpenInterest: 10,
+                TheoreticalValue: '1.25',
+                Theta: '0.3',
+                Last: '1.10',
+                Vega: '0.4',
+                ImpliedVolatility: '0.5',
+                Volume: 11,
+              });
+              return 'chains-registered-key';
+            },
+            stopStoredStream: async () => {},
+          }),
+        },
+        streams: {
+          subscribe: async ({ start }) => {
+            await start({
+              emit: (eventName, payload) => {
+                emitted = { eventName, payload };
+              },
+              notifyError: () => {},
+            });
+            return { ok: true };
+          },
+          unsubscribe: async () => ({ ok: true }),
+          touch: async () => ({ ok: true }),
+        },
+      },
+    },
+  });
+
+  const result = await optionChain({
+    client: {},
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'CRWV'],
+    symbol: 'CRWV',
+    data: {
+      strikeProximity: 2,
+      optionType: 'All',
+    },
+  });
+
+  assert.deepEqual(result, { ok: true });
+  assert.ok(streamChainsArgs);
+  assert.equal(streamChainsArgs.endpoint.join('/'), 'marketdata/stream/options/chains/CRWV');
+  assert.ok(emitted);
+  assert.equal(emitted.eventName, 'stream/chain');
+  assert.equal(emitted.payload.instrument.symbol, 'CRWV');
+  assert.equal(emitted.payload.instrument.asset_category, 'STK');
+  assert.equal(emitted.payload.instrument.source, 'TS');
+  assert.equal(emitted.payload.instrument.listing_exchange, 'TS');
+  assert.equal(emitted.payload.instrument.currency, 'USD');
+  assert.equal(emitted.payload.symbol, undefined);
+  assert.equal(emitted.payload.chain['00080000'].C.symbol_raw, 'CRWV280121C00080000');
 });
 
 test('stream clear returns removed entries and total count', async () => {

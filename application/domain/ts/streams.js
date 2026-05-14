@@ -32,6 +32,18 @@
     console.info(`Subscriber removed: ${kind}:${key} reason=${reason} remaining=${remaining}`);
   },
 
+  logDroppedEvent({ entry, eventName }) {
+    console.info('Stream event dropped: no subscribers', {
+      kind: entry.kind,
+      streamKey: entry.key,
+      eventName,
+      state: entry.state,
+      upstreamReady: entry.upstreamReady,
+      lastMessageAt: entry.lastMessageAt,
+      subscriberCount: entry.subscribers.size,
+    });
+  },
+
   serializeError(error) {
     if (error instanceof Error) {
       const serialized = {
@@ -79,6 +91,11 @@
 
   emit(entry, eventName, payload) {
     entry.lastMessageAt = Date.now();
+    if (entry.subscribers.size === 0) {
+      this.logDroppedEvent({ entry, eventName });
+      return;
+    }
+
     for (const subscription of entry.subscribers.values()) {
       try {
         subscription.client.emit(eventName, payload);
@@ -152,24 +169,38 @@
     const entry = bucket.get(key);
     if (!entry) return false;
 
-    bucket.delete(key);
-    this.logStop({ kind, key, reason, clientCount: entry.subscribers.size });
+    if (entry.stopPromise) return entry.stopPromise;
 
-    for (const subscription of entry.subscribers.values()) {
-      clearTimeout(subscription.idleTimer);
-      subscription.client.removeListener('close', subscription.onClose);
-    }
-    entry.subscribers.clear();
+    entry.state = 'stopping';
+    entry.stopPromise = (async () => {
+      bucket.delete(key);
+      this.logStop({ kind, key, reason, clientCount: entry.subscribers.size });
 
-    if (entry.upstream?.stop) {
-      try {
-        await entry.upstream.stop({ reason });
-      } catch (error) {
-        console.error(`Failed to stop managed stream ${kind}:${key}:`, error);
+      for (const subscription of entry.subscribers.values()) {
+        clearTimeout(subscription.idleTimer);
+        subscription.client.removeListener('close', subscription.onClose);
       }
-    }
+      entry.subscribers.clear();
+      entry.startPromise = null;
+      entry.upstreamReady = false;
 
-    return true;
+      if (entry.upstream?.stop) {
+        try {
+          await entry.upstream.stop({ reason });
+        } catch (error) {
+          console.error(`Failed to stop managed stream ${kind}:${key}:`, error);
+        }
+      }
+
+      entry.upstream = null;
+      return true;
+    })();
+
+    try {
+      return await entry.stopPromise;
+    } finally {
+      entry.stopPromise = null;
+    }
   },
 
   async unsubscribe({ kind, key, client, reason = 'unsubscribe' }) {
@@ -187,7 +218,10 @@
 
     const subscribers = entry.subscribers.size;
     if (subscribers === 0) {
-      await this.stopEntry({ kind, key, reason });
+      this.logUnsubscribe({ kind, key, reason, remaining: subscribers });
+      if (entry.state !== 'starting') {
+        await this.stopEntry({ kind, key, reason });
+      }
       return { active: false, kind, streamKey: key, subscribers, removed: true };
     }
 
@@ -212,6 +246,7 @@
 
   async subscribe({ kind, key, client, idleMs = null, metadata = {}, start }) {
     if (!client) throw new Error('Metacom client is required');
+    if (typeof start !== 'function') throw new Error('Managed stream start() is required');
 
     const bucket = this.getBucket({ kind });
     // One managed entry per client + kind + streamKey.
@@ -228,25 +263,13 @@
         lastMessageAt: null,
         subscribers: new Map(),
         upstream: null,
+        upstreamReady: false,
+        state: 'starting',
+        startPromise: null,
+        stopPromise: null,
+        lastError: null,
       };
       bucket.set(key, entry);
-
-      try {
-        const upstream = await start({
-          entry,
-          emit: (eventName, payload) => this.emit(entry, eventName, payload),
-          notifyError: (error) => this.notifyError(entry, error),
-        });
-
-        if (!upstream || typeof upstream.stop !== 'function') {
-          throw new Error(`Managed stream "${kind}" must provide stop()`);
-        }
-
-        entry.upstream = upstream;
-      } catch (error) {
-        bucket.delete(key);
-        throw error;
-      }
     } else if (Object.keys(metadata).length > 0) {
       entry.metadata = { ...entry.metadata, ...metadata };
     }
@@ -273,11 +296,57 @@
       entry.subscribers.set(client, subscription);
     }
 
+    if (created) {
+      entry.startPromise = (async () => {
+        try {
+          const upstream = await start({
+            entry,
+            emit: (eventName, payload) => this.emit(entry, eventName, payload),
+            notifyError: (error) => this.notifyError(entry, error),
+          });
+
+          if (!upstream || typeof upstream.stop !== 'function') {
+            throw new Error(`Managed stream "${kind}" must provide stop()`);
+          }
+
+          entry.upstream = upstream;
+          entry.upstreamReady = true;
+          entry.state = 'active';
+
+          if (entry.subscribers.size === 0) {
+            await this.stopEntry({ kind, key, reason: 'startup.no-subscribers' });
+            return false;
+          }
+
+          return true;
+        } catch (error) {
+          entry.lastError = this.serializeError(error);
+          await this.stopEntry({ kind, key, reason: 'startup.failed' });
+          throw error;
+        }
+      })();
+    }
+
+    await entry.startPromise;
+
+    const liveEntry = this.getEntry({ kind, key });
+    if (!liveEntry) {
+      return {
+        active: false,
+        kind,
+        streamKey: key,
+        subscribers: 0,
+        created,
+        subscribed,
+        metadata: entry.metadata,
+      };
+    }
+
     const state = this.touch({ kind, key, client, idleMs });
     console.info(
       `Stream subscribe: ${kind}:${key} created=${created} subscribed=${subscribed} total=${state.subscribers} idleMs=${state.idleMs}`,
     );
-    return { ...state, created, subscribed, metadata: entry.metadata };
+    return { ...state, created, subscribed, metadata: liveEntry.metadata };
   },
 
   list() {
@@ -290,6 +359,10 @@
         lastMessageAt: entry.lastMessageAt,
         metadata: entry.metadata,
         subscribers: entry.subscribers.size,
+        state: entry.state ?? 'active',
+        upstreamReady: Boolean(entry.upstreamReady),
+        starting: entry.state === 'starting',
+        lastError: entry.lastError ?? null,
       }));
     }
 

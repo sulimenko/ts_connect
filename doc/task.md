@@ -22,6 +22,8 @@
 - Worker получает весь блок сразу и выполняет задачи последовательно
 - Задачи внутри блока описаны подробно: файлы, поведение до, поведение после, ограничения
 - Worker не может сам добавлять задачи или менять блок — только выполняет описанное
+- Worker не меняет `doc/*`, не меняет статусы задач, не архивирует блоки и не пишет review-заключения; этим занимается только architect
+- Если worker видит, что документация требует обновления, он сообщает об этом в итоговом отчёте, но не правит документацию
 - После выполнения блока worker сигнализирует завершение — architect проводит review
 
 ### Общие правила реализации
@@ -289,3 +291,61 @@
 - [x] Upstream barchart routing использует TS symbol.
 - [x] Downstream `stream/barchart` event использует canonical back symbol.
 - [x] `npm run lint`, `npm run types`, `npm test` проходят.
+
+## Блок 27: Stream outbound instrument payload contract
+
+### T-037: Заменить top-level `symbol` на `instrument` в outbound stream events
+
+- [x] Изменить downstream payload contract для всех бизнес-событий, которые отправляются наружу через managed stream `emit`: `stream/levelII`, `stream/quote`, `stream/barchart`, `stream/chain`.
+- [x] Новый обязательный contract вместо top-level `symbol`:
+      `instrument: { symbol, asset_category, source, listing_exchange, currency }`.
+- [x] `instrument.symbol` всегда должен быть canonical back/metaterminal symbol из `lib.utils.makeSymbol()`, не TradeStation display symbol.
+- [x] `instrument.asset_category` должен быть нормализованным типом инструмента из общего symbol parser-а: минимум `STK` / `OPT`.
+- [x] `instrument.source` для TradeStation данных: `TS`.
+- [x] `instrument.listing_exchange` и `instrument.currency` должны заполняться из доступного payload/context. Если TradeStation stream не даёт точного значения, использовать текущий устойчивый default проекта: `listing_exchange: 'TS'`, `currency: 'USD'`. Не добавлять API-запросы для enrichment в рамках этого блока.
+- [x] Не оставлять `symbol` на верхнем уровне outbound packet-ов, если задача не указывает явное исключение. Это breaking contract change для metaterminal и должен быть отражён в тестах.
+
+Файлы:
+
+- `application/api/stream/matrix.js`: заменить payload `stream/levelII` с `{ symbol, price, type, size }` на `{ instrument, price, type, size }`. Upstream endpoint и `streamKey` продолжают использовать TS symbol.
+- `application/api/stream/quotes.js`: `stream/quote` должен отдавать только `instrument` и связанные с ним данные внутри `instrument`; убрать `symbol`, `source`, `listed_exchange` / `listing_exchange`, `currency` и другие instrument-level поля из верхнего уровня response. Quote market fields (`bid`, `ask`, `lp`, sizes, volume, ch/chp, dates и т.п.) остаются на верхнем уровне.
+- `application/lib/ts/readQuote.js`: при необходимости обновить formatter quote packet-а, чтобы он сразу возвращал новый outbound shape. Не дублировать instrument fields в `data`, если этот объект является частью outbound packet-а.
+- `application/api/stream/addBarchart.js`: заменить `stream/barchart` payload `{ streamKey, symbol, bar }` на `{ streamKey, instrument, bar }`. `instrument.symbol` canonical, upstream chart routing остаётся на TS symbol.
+- `application/lib/stream/optionChain.js`: заменить `stream/chain` payload `{ streamKey, symbol, expiration, chain }` на `{ streamKey, instrument, expiration, chain }`. Для option chain `instrument` описывает underlying/root instrument, если текущий event агрегирует цепочку по underlying; option-level symbols внутри `chain` не менять без отдельной задачи.
+- `application/test/run.js`: обновить regression coverage для всех четырёх outbound events.
+
+Ограничения:
+
+- Не менять public input contract subscribe/touch/unsubscribe в рамках этой задачи.
+- Не менять lifecycle: API слой не хранит state, managed streams остаются через `domain.ts.streams.subscribe()`.
+- Не добавлять legacy compatibility aliases (`symbol` + `instrument`) в outbound payload, если нет отдельного решения architect-а.
+- Не делать enrichment через дополнительные snapshot/API calls; использовать уже известные поля и defaults.
+- Сохранять compact style: не вводить отдельные большие builders, если достаточно локальной компактной сборки или существующего `makeSymbol()`.
+
+Критерии приёмки:
+
+- `stream/levelII` больше не содержит top-level `symbol`; содержит `instrument.symbol`, `instrument.asset_category`, `instrument.source`, `instrument.listing_exchange`, `instrument.currency`.
+- `stream/quote` больше не содержит top-level instrument metadata; содержит quote fields + `instrument`.
+- `stream/barchart` больше не содержит top-level `symbol`; содержит `instrument`.
+- `stream/chain` больше не содержит top-level `symbol`; содержит `instrument`.
+- Все outbound stream tests в `application/test/run.js` проверяют отсутствие top-level `symbol` там, где он удалён.
+- `npm run lint`, `npm run types`, `npm test` проходят.
+
+## Блок 30: Managed stream review fixes
+
+### T-046: Исправить зависание `npm test` после managed stream startup tests
+
+- [ ] Проверить новые тесты managed stream lifecycle в `application/test/run.js`.
+- [ ] Найти оставленные active timers/subscriptions/listeners, из-за которых `npm test` печатает `20 test(s) passed`, но процесс не завершается.
+- [ ] Исправить тестовый cleanup или runtime cleanup path минимально, без изменения публичного stream contract.
+- [ ] Если причина в тестах, явно останавливать созданные managed stream entries после assertions через public/domain API, а не оставлять idle timers до `defaultIdleMs`.
+- [ ] Если причина в runtime lifecycle, исправить `application/domain/ts/streams.js` так, чтобы successful subscribe tests могли корректно остановить streams и не оставлять dangling timers.
+- [ ] Восстановить acceptance T-038: в тесте `stream matrix emits canonical levelII packets while routing by tsSymbol` добавить явную проверку, что emitted payload `stream/levelII` не содержит top-level `symbol`.
+- [ ] Сообщить architect-у в итоговом отчёте, если после выполнения остаётся документационная консистентность по T-038/T-046. Не менять `doc/*` из worker-а.
+
+Критерии приёмки:
+
+- `npm test` не только печатает passed, но и завершает процесс с exit code `0` без ожидания idle таймеров.
+- `stream/levelII` regression test падает при возврате top-level `symbol`.
+- Worker не менял `doc/*`; architect после review синхронизирует `doc/task.md`, `doc/review.md`, `doc/changelog.md` по T-038 и текущему блоку.
+- `npm run lint`, `npm run types`, `npm test` проходят.

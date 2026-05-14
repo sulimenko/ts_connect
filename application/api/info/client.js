@@ -2,6 +2,7 @@
   access: 'public',
   method: async () => {
     const client = await domain.ts.clients.getClient({});
+    const subscriptions = domain.ts.streams.list();
 
     const upstream = {};
     for (const group of Object.keys(client.streams)) {
@@ -14,7 +15,7 @@
 
     return {
       upstream,
-      subscriptions: domain.ts.streams.list(),
+      subscriptions,
     };
   },
 });

@@ -11,37 +11,36 @@
     return Number.isNaN(time) ? null : time;
   };
 
+  const buildInstrument = (symbol) => {
+    const parsed = lib.utils.makeSymbol(symbol);
+    if (!parsed) return null;
+    return {
+      symbol: parsed.symbol,
+      asset_category: parsed.type,
+      source: 'TS',
+      listing_exchange: 'TS',
+      currency: 'USD',
+    };
+  };
+
   if (!message) return {};
 
-  const instrument = lib.utils.makeSymbol(message.Symbol);
+  const instrument = buildInstrument(message.Symbol);
   if (!instrument) {
     console.error('Unknown instrument for quote message:', message);
     return {};
   }
-  const quote = {
-    bid: toFixedString(message.Bid, 2),
-    bid_size: message.BidSize,
-    ask: toFixedString(message.Ask, 2),
-    ask_size: message.AskSize,
-  };
   const data = {
-    symbol: instrument.symbol,
     lp: message.Last ?? null,
     lp_time: toTimestamp(message.TradeTime ?? message.LastTradingDate),
     prev_close_price: toFixedString(message.PreviousClose, 2),
     date: Date.now(),
-    listed_exchange: 'TS',
-    currency: 'USD',
-    currency_id: 'USD',
-    currency_code: 'USD',
-    underlying: instrument.underlying,
-    source: 'TS',
   };
   return {
-    ask: quote.ask,
-    ask_size: quote.ask_size,
-    bid: quote.bid,
-    bid_size: quote.bid_size,
+    ask: toFixedString(message.Ask, 2),
+    ask_size: message.AskSize,
+    bid: toFixedString(message.Bid, 2),
+    bid_size: message.BidSize,
     lp: data.lp,
     lp_size: message.LastSize,
     lp_time: data.lp_time,
@@ -55,15 +54,13 @@
     ch: message.NetChange,
     chp: message.NetChangePct,
     date: data.date,
-    listed_exchange: data.listed_exchange,
-    currency: data.currency,
-    currency_id: data.currency_id,
-    currency_code: data.currency_code,
-    symbol: instrument.symbol,
-    underlying: instrument.underlying,
-    source: 'TS',
     instrument,
     data,
-    quote,
+    quote: {
+      bid: toFixedString(message.Bid, 2),
+      bid_size: message.BidSize,
+      ask: toFixedString(message.Ask, 2),
+      ask_size: message.AskSize,
+    },
   };
 };
