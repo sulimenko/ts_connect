@@ -12,3 +12,12 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    networks:
+      ptfin-backend:
+        aliases:
+          - ts_connect.ptfin.local
+
+networks:
+  ptfin-backend:
+    external: true
+    name: ptfin-backend
