@@ -8,15 +8,20 @@
     this.connecting[name] = null;
   },
 
-  deleteClient({ name }) {
+  async deleteClient({ name }) {
     console.log('deleteClient:', name);
     const client = this.values[name];
     if (client) {
-      for (const key of Object.keys(client.timers)) clearTimeout(client.timers[key]);
-      if (client.streams) {
-        for (const account in client.streams) {
-          for (const key in client.streams[account]) {
-            client.streams[account][key].stopStream();
+      if (typeof client.close === 'function') {
+        await client.close({ reason: 'client.delete' });
+      } else {
+        for (const key of Object.keys(client.timers ?? {})) clearTimeout(client.timers[key]);
+        if (client.streams) {
+          for (const group of Object.keys(client.streams)) {
+            for (const key of Object.keys(client.streams[group])) {
+              const stream = client.streams[group][key];
+              if (stream?.stopStream) stream.stopStream('client.delete');
+            }
           }
         }
       }
@@ -42,6 +47,7 @@
       client.key.secret = config.ts[name].secret;
 
       await lib.ts.refresh({ client });
+      await client.syncBrokerageStreams({ name });
       client.lifetime();
       return client;
     })();
@@ -51,7 +57,7 @@
     try {
       const client = await setup;
       if (this.revisions[name] !== token) {
-        if (client && typeof client.close === 'function') client.close();
+        if (client && typeof client.close === 'function') await client.close({ reason: 'client.revision' });
         return null;
       }
       if (client) this.values[name] = client;
@@ -62,9 +68,12 @@
   },
 
   async getClient({ name = 'ptfin', update = false }) {
-    if (update) this.deleteClient({ name });
+    if (update) await this.deleteClient({ name });
     let client = this.values[name];
-    if (client) return client;
+    if (client) {
+      await client.syncBrokerageStreams({ name });
+      return client;
+    }
     client = await this.setClient({ name });
     return client;
   },

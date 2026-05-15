@@ -2,6 +2,8 @@ async () => ({
   key: { pkey: null, secret: null },
   tokens: { id: null, access: null, expires: null, refresh: null },
   timers: { rtoken: null },
+  brokerage: { setup: null, ready: false },
+  closed: false,
   streams: {
     charts: {},
     chains: {},
@@ -34,6 +36,11 @@ async () => ({
     return suffix ? `${prefix}?${suffix}` : prefix;
   },
 
+  getBrokerageAccount({ contract }) {
+    const account = `${contract?.account ?? ''}`.trim();
+    return account || null;
+  },
+
   async stopStoredStream({ group, key, reason = 'unknown' }) {
     const bucket = this.getStreamBucket(group);
     const stream = bucket[key];
@@ -55,6 +62,78 @@ async () => ({
     return key;
   },
 
+  async stopAllStreams({ reason = 'client.close' } = {}) {
+    for (const group of Object.keys(this.streams)) {
+      const bucket = this.getStreamBucket(group);
+      for (const key of Object.keys(bucket)) {
+        await this.stopStoredStream({ group, key, reason });
+      }
+    }
+  },
+
+  async close({ reason = 'client.close' } = {}) {
+    if (this.closed) return true;
+    this.closed = true;
+    this.brokerage.ready = false;
+    this.brokerage.setup = null;
+
+    await this.stopAllStreams({ reason });
+
+    for (const key of Object.keys(this.timers)) {
+      clearTimeout(this.timers[key]);
+      this.timers[key] = null;
+    }
+
+    return true;
+  },
+
+  async syncBrokerageStreams({ name = 'ptfin' } = {}) {
+    if (name !== 'ptfin' || this.closed) return false;
+    if (!this.tokens.access) {
+      console.warn('Brokerage stream sync skipped: missing access token', name);
+      return false;
+    }
+    if (this.brokerage.ready) return true;
+    if (this.brokerage.setup) return this.brokerage.setup;
+
+    this.brokerage.setup = (async () => {
+      try {
+        const contracts = await lib.ptfin.getContract({ accounts: ['all'] });
+        if (this.closed) return false;
+        if (!Array.isArray(contracts) || contracts.length === 0) {
+          console.warn('Brokerage stream sync skipped: no contracts', name);
+          return false;
+        }
+
+        const seenAccounts = new Set();
+        let started = false;
+        let complete = true;
+
+        for (const contract of contracts) {
+          if (this.closed) return false;
+          const account = this.getBrokerageAccount({ contract });
+          if (!account || seenAccounts.has(account)) continue;
+          seenAccounts.add(account);
+
+          const orderStarted = await this.streamOrders({ contract: { ...contract, account } });
+          const positionStarted = await this.streamPositions({ contract: { ...contract, account } });
+          if (!orderStarted || !positionStarted) complete = false;
+          if (orderStarted || positionStarted) started = true;
+        }
+
+        if (started && complete) this.brokerage.ready = true;
+        return started && complete;
+      } catch (error) {
+        console.warn('Brokerage stream sync failed:', name, error);
+        return false;
+      } finally {
+        this.brokerage.setup = null;
+      }
+    })();
+
+    return this.brokerage.setup;
+  },
+
   lifetime() {
     clearTimeout(this.timers.rtoken);
     this.timers.rtoken = setTimeout(() => {
@@ -71,53 +150,79 @@ async () => ({
 
   async streamOrders({ contract, ordersIds = [] }) {
     try {
-      if (this.streams[contract.account] === undefined) this.streams[contract.account] = {};
+      if (this.closed) return false;
+      const account = this.getBrokerageAccount({ contract });
+      if (!account) return false;
 
-      const endpoint = ['brokerage', 'stream', 'accounts', contract.account, 'orders'];
+      const data = ordersIds.length > 0 ? { ordersIds: ordersIds.join(',') } : {};
+      const key = this.buildStreamKey({ group: 'orders', symbol: account, data });
+      const bucket = this.getStreamBucket('orders');
+      if (bucket[key]) return key;
+
+      const endpoint = ['brokerage', 'stream', 'accounts', account, 'orders'];
       if (ordersIds.length > 0) endpoint.push(ordersIds.join(','));
 
       const onData = (message) => {
-        if (message.StreamStatus && message.StreamStatus === 'EndSnapshot') return;
-        if (message.StreamStatus) console.debug('streamOrders onData:', message);
-        // console.debug('orders:', message.OrderID ?? message);
-        console.debug('orders:', message);
+        if (message?.StreamStatus === 'EndSnapshot') return;
+        if (message?.StreamStatus && !message.OrderID) return;
         domain.queue.addTask({ endpoint: ['response'], data: { type: 'order', data: message } });
-        // lib.ptfin.send({ method: 'POST', endpoint: ['response'], data: { type: 'order', data: message } });
       };
 
-      const onError = (err) => console.error('Stream orders error:', err);
+      const onError = (err) => console.error('Stream orders error:', account, endpoint.join('/'), err);
 
       const stream = lib.ts.stream({ live: contract.live, endpoint, tokens: this.tokens, onData, onError });
       await stream.initiateStream();
-      this.streams[contract.account].orders = stream;
+      if (this.closed) {
+        stream.stopStream('client.close');
+        return false;
+      }
+      await this.setStoredStream({ group: 'orders', key, stream });
+      return key;
     } catch (error) {
-      console.error('Error in streamOrders:', error);
+      console.error('Error in streamOrders:', contract?.account, error);
+      return false;
     }
   },
 
   async streamPositions({ contract }) {
     try {
-      if (this.streams[contract.account] === undefined) this.streams[contract.account] = {};
-      const endpoint = ['brokerage', 'stream', 'accounts', contract.account, 'positions'];
+      if (this.closed) return false;
+      const account = this.getBrokerageAccount({ contract });
+      if (!account) return false;
+
+      const key = this.buildStreamKey({ group: 'positions', symbol: account });
+      const bucket = this.getStreamBucket('positions');
+      if (bucket[key]) return key;
+
+      const endpoint = ['brokerage', 'stream', 'accounts', account, 'positions'];
 
       const onData = (message) => {
         try {
-          if (!message.StreamStatus) {
-            // console.info('streamPositions', message.AccountID, message.Symbol, ':', message.Quantity, message.AveragePrice);
-            const symbol = lib.utils.makeSymbol(message.Symbol)?.symbol ?? message.Symbol;
-            domain.ts.positions.setPosition({ account: message.AccountID, symbol, data: message });
+          if (message?.StreamStatus) return;
+          const symbol = lib.utils.makeSymbol(message.Symbol)?.symbol ?? null;
+          if (!symbol) return;
+          const accountId = message.AccountID ?? account;
+          const position = domain.ts.positions.setPosition({ account: accountId, symbol, data: message });
+          if (lib.utils.readPositionQuantity(position) === 0) {
+            domain.ts.positions.clearPosition({ account: accountId, symbol });
           }
         } catch (error) {
           console.error('Error processing position message:', error);
         }
       };
-      const onError = (err) => console.error('Stream positions error:', err);
+      const onError = (err) => console.error('Stream positions error:', account, endpoint.join('/'), err);
 
       const stream = lib.ts.stream({ live: contract.live, endpoint, tokens: this.tokens, onData, onError });
       await stream.initiateStream();
-      this.streams[contract.account].positions = stream;
+      if (this.closed) {
+        stream.stopStream('client.close');
+        return false;
+      }
+      await this.setStoredStream({ group: 'positions', key, stream });
+      return key;
     } catch (error) {
-      console.error('Error in streamPositions:', error);
+      console.error('Error in streamPositions:', contract?.account, error);
+      return false;
     }
   },
 

@@ -5,19 +5,22 @@
     const result = [];
     for (const contract of contracts) {
       contract.live = contract.live === 1 || contract.live === '1' || contract.live === true || contract.live === 'true';
+      const account = domain.ts.positions.normalizeAccountKey(contract.account);
       const endpoint = ['brokerage', 'accounts', contract.account, 'positions'];
       const data = {};
       // if (symbols.length > 0) data.symbol = symbols.map((each) => each.toUpperCase()).join(',');
 
       const responce = await lib.ts.send({ method: 'GET', live: contract.live, endpoint, token: client.tokens.access, data });
       if (responce.Errors.length === 0) {
-        const exist = domain.ts.positions.getAccount({ account: contract.account });
+        const exist = domain.ts.positions.getAccount({ account }) ?? new Map();
         for (const symbol of exist.keys()) {
           const internal = exist.get(symbol);
           const internalSymbol = lib.utils.makeSymbol(internal.get('Symbol') ?? symbol)?.symbol ?? null;
           const external =
             responce.Positions?.find(
-              (each) => each.AccountID === internal.get('AccountID') && lib.utils.makeSymbol(each.Symbol)?.symbol === internalSymbol,
+              (each) =>
+                domain.ts.positions.normalizeAccountKey(each.AccountID) === account &&
+                lib.utils.makeSymbol(each.Symbol)?.symbol === internalSymbol,
             ) || {};
           try {
             // console.info('positions', symbol, 'internal', internal.get('Quantity'), '=', external.Quantity ?? 'empty', 'external');
@@ -29,10 +32,10 @@
           }
         }
 
-        domain.ts.positions.clearAccount({ account: contract.account });
+        domain.ts.positions.clearAccount(account);
         if (responce.Positions.length > 0) {
           for (const position of responce.Positions) {
-            domain.ts.positions.setPosition({ account: position.AccountID, symbol: position.Symbol, data: position });
+            domain.ts.positions.setPosition({ account, symbol: position.Symbol, data: position });
             result.push(position);
           }
           // result.push(...responce.Positions);

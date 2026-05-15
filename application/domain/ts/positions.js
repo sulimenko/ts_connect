@@ -3,8 +3,16 @@
   getSymbolKey({ symbol }) {
     return lib.utils.normalizePositionSymbol(symbol);
   },
-  clearAccount({ account }) {
-    return this.values.set(account, new Map()).get(account);
+  normalizeAccountKey(account) {
+    const key = String(account ?? '').trim();
+    return key || null;
+  },
+  clearAccount(account) {
+    const key = this.normalizeAccountKey(account);
+    if (!key) return null;
+    const positions = new Map();
+    this.values.set(key, positions);
+    return positions;
   },
   clearPosition({ account, symbol }) {
     const key = this.getSymbolKey({ symbol });
@@ -14,8 +22,10 @@
     return positions.delete(key);
   },
   getAccount({ account, create = true }) {
-    let positions = this.values.get(account);
-    if (positions === undefined && create) positions = this.clearAccount({ account });
+    const key = this.normalizeAccountKey(account);
+    if (!key) return null;
+    let positions = this.values.get(key);
+    if (positions === undefined && create) positions = this.clearAccount(key);
     return positions;
   },
   getPosition({ account, symbol }) {
@@ -29,6 +39,7 @@
     const key = this.getSymbolKey({ symbol: data?.Symbol ?? symbol });
     if (!key) return null;
     const accountPositions = this.getAccount({ account });
+    if (!accountPositions) return null;
     let position = accountPositions.get(key);
     if (position === undefined) {
       position = new Map();

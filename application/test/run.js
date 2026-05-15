@@ -1235,6 +1235,131 @@ test('optionChain rejects object errors with a readable message', async () => {
   );
 });
 
+test('brokerage streams start once and update orders and positions', async () => {
+  const utils = loadUtils();
+  const positions = loadExpressionModule('application/domain/ts/positions.js', {
+    lib: { utils },
+  });
+  const queued = [];
+  const streams = [];
+  const stopped = [];
+  const contracts = [
+    { account: 11827414, live: true },
+    { account: '11827414', live: true },
+  ];
+
+  const factory = loadExpressionModule('application/domain/ts/client.js', {
+    domain: {
+      queue: {
+        addTask: (task) => queued.push(task),
+      },
+      ts: {
+        positions,
+      },
+    },
+    lib: {
+      utils,
+      ptfin: {
+        getContract: async () => contracts,
+      },
+      ts: {
+        stream: ({ endpoint, onData }) => {
+          const stream = {
+            endpoint,
+            onData,
+            initiateStream: async () => {},
+            stopStream: async (reason) => stopped.push({ endpoint, reason }),
+          };
+          streams.push(stream);
+          return stream;
+        },
+      },
+    },
+  });
+
+  const client = await factory();
+  client.tokens.access = 'token';
+
+  assert.equal(await client.syncBrokerageStreams({ name: 'ptfin' }), true);
+  assert.equal(streams.length, 2);
+  assert.deepEqual(streams.map((stream) => stream.endpoint.join('/')).sort(), [
+    'brokerage/stream/accounts/11827414/orders',
+    'brokerage/stream/accounts/11827414/positions',
+  ]);
+
+  assert.equal(await client.syncBrokerageStreams({ name: 'ptfin' }), true);
+  assert.equal(streams.length, 2);
+
+  const orders = streams.find((stream) => stream.endpoint.at(-1) === 'orders');
+  orders.onData({ StreamStatus: 'EndSnapshot' });
+  orders.onData({ OrderID: 'O1', AccountID: '11827414', Status: 'Filled' });
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0].endpoint[0], 'response');
+  assert.equal(queued[0].data.type, 'order');
+  assert.equal(queued[0].data.data.OrderID, 'O1');
+  assert.equal(queued[0].data.data.AccountID, '11827414');
+  assert.equal(queued[0].data.data.Status, 'Filled');
+
+  const positionStream = streams.find((stream) => stream.endpoint.at(-1) === 'positions');
+  positionStream.onData({ StreamStatus: 'EndSnapshot' });
+  positionStream.onData({
+    AccountID: '11827414',
+    Symbol: 'CRWV 280121C80',
+    Quantity: '3',
+    AssetType: 'OPT',
+  });
+
+  const position = positions.getPosition({
+    account: 11827414,
+    symbol: 'CRWV280121C00080000',
+  });
+  assert.equal(position.get('Quantity'), '3');
+
+  positionStream.onData({
+    AccountID: '11827414',
+    Symbol: 'CRWV 280121C80',
+    Quantity: '0',
+    AssetType: 'OPT',
+  });
+  assert.equal(
+    positions.getPosition({
+      account: 11827414,
+      symbol: 'CRWV280121C00080000',
+    }),
+    null,
+  );
+
+  await client.close({ reason: 'test.close' });
+  assert.equal(stopped.length, 2);
+  assert.ok(stopped.every((entry) => entry.reason === 'test.close'));
+});
+
+test('deleteClient closes brokerage streams through client close', async () => {
+  const clients = loadExpressionModule('application/domain/ts/clients.js', {
+    domain: {
+      ts: {
+        client: async () => ({}),
+      },
+    },
+    lib: {
+      ts: {
+        refresh: async () => {},
+      },
+    },
+    config: { ts: {} },
+  });
+  const closeCalls = [];
+
+  clients.values.ptfin = {
+    close: async (args) => closeCalls.push(args),
+  };
+
+  assert.equal(await clients.deleteClient({ name: 'ptfin' }), true);
+  assert.equal(closeCalls.length, 1);
+  assert.equal(closeCalls[0].reason, 'client.delete');
+  assert.equal(clients.values.ptfin, undefined);
+});
+
 (async () => {
   let failed = 0;
 

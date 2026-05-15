@@ -24,6 +24,7 @@
 - Worker не может сам добавлять задачи или менять блок — только выполняет описанное
 - Worker не меняет `doc/*`, не меняет статусы задач, не архивирует блоки и не пишет review-заключения; этим занимается только architect
 - Если worker видит, что документация требует обновления, он сообщает об этом в итоговом отчёте, но не правит документацию
+- Worker не добавляет, не переписывает и не запускает automated/unit/regression tests; tests пишет и запускает architect отдельной задачей после acceptance worker-блока
 - После выполнения блока worker сигнализирует завершение — architect проводит review
 
 ### Общие правила реализации
@@ -335,17 +336,164 @@
 
 ### T-046: Исправить зависание `npm test` после managed stream startup tests
 
-- [ ] Проверить новые тесты managed stream lifecycle в `application/test/run.js`.
-- [ ] Найти оставленные active timers/subscriptions/listeners, из-за которых `npm test` печатает `20 test(s) passed`, но процесс не завершается.
-- [ ] Исправить тестовый cleanup или runtime cleanup path минимально, без изменения публичного stream contract.
-- [ ] Если причина в тестах, явно останавливать созданные managed stream entries после assertions через public/domain API, а не оставлять idle timers до `defaultIdleMs`.
-- [ ] Если причина в runtime lifecycle, исправить `application/domain/ts/streams.js` так, чтобы successful subscribe tests могли корректно остановить streams и не оставлять dangling timers.
-- [ ] Восстановить acceptance T-038: в тесте `stream matrix emits canonical levelII packets while routing by tsSymbol` добавить явную проверку, что emitted payload `stream/levelII` не содержит top-level `symbol`.
-- [ ] Сообщить architect-у в итоговом отчёте, если после выполнения остаётся документационная консистентность по T-038/T-046. Не менять `doc/*` из worker-а.
+- [x] Проверить новые тесты managed stream lifecycle в `application/test/run.js`.
+- [x] Найти оставленные active timers/subscriptions/listeners, из-за которых `npm test` печатает `20 test(s) passed`, но процесс не завершается.
+- [x] Исправить тестовый cleanup или runtime cleanup path минимально, без изменения публичного stream contract.
+- [x] Если причина в тестах, явно останавливать созданные managed stream entries после assertions через public/domain API, а не оставлять idle timers до `defaultIdleMs`.
+- [x] Если причина в runtime lifecycle, исправить `application/domain/ts/streams.js` так, чтобы successful subscribe tests могли корректно остановить streams и не оставлять dangling timers.
+- [x] Восстановить acceptance T-038: в тесте `stream matrix emits canonical levelII packets while routing by tsSymbol` добавить явную проверку, что emitted payload `stream/levelII` не содержит top-level `symbol`.
+- [x] Сообщить architect-у в итоговом отчёте, если после выполнения остаётся документационная консистентность по T-038/T-046. Не менять `doc/*` из worker-а.
 
 Критерии приёмки:
 
 - `npm test` не только печатает passed, но и завершает процесс с exit code `0` без ожидания idle таймеров.
 - `stream/levelII` regression test падает при возврате top-level `symbol`.
 - Worker не менял `doc/*`; architect после review синхронизирует `doc/task.md`, `doc/review.md`, `doc/changelog.md` по T-038 и текущему блоку.
+- `npm run lint`, `npm run types`, `npm test` проходят.
+
+## Блок 31: Brokerage orders and positions streams after TS connect
+
+Выполнять после закрытия Блока 30. Worker не меняет `doc/*`; если при выполнении обнаружится необходимость документационных правок, указать это в итоговом отчёте.
+
+### T-047: Запускать brokerage streams после успешного подключения к TradeStation и получения token
+
+- [ ] Включить автоматический запуск brokerage streams после успешного `domain.ts.clients.getClient()` / `lib.ts.refresh()` для основного клиента `ptfin`.
+- [ ] Старт должен происходить только после того, как у client есть валидный `tokens.access`.
+- [ ] Источник accounts/contracts брать из существующего механизма проекта, сейчас это `lib.ptfin.getContract({ accounts: ['all'] })` в старом закомментированном startup-примере. Не хардкодить account IDs.
+- [ ] Запуск должен быть idempotent: повторный `getClient()`, token refresh или prewarm не должны создавать дублирующие upstream streams для тех же accounts.
+- [ ] Если contracts получить не удалось, не ломать `getClient()` и не блокировать сервис; логировать понятный warning и оставить возможность lazy retry при следующем setup/prewarm.
+- [ ] Старые закомментированные вызовы `client.streamOrders()` / `client.streamPositions()` в `application/lib/ts/start.js` и `application/lib/ts/start1.js` не считать рабочим механизмом. Рабочий механизм должен быть в domain/client lifecycle, а не в ручном commented startup.
+
+Файлы:
+
+- `application/domain/ts/clients.js`
+- `application/domain/ts/client.js`
+- `application/lib/ts/start.js` только если нужно убрать misleading commented block без изменения логики
+- `application/test/run.js`
+
+Критерии приёмки:
+
+- После успешного setup client-а запускается orders stream и positions stream для доступных contracts/accounts.
+- Повторный setup/getClient не создаёт дубликаты streams.
+- Ошибка получения contracts не валит TS client setup.
+- `npm run lint`, `npm run types`, `npm test` проходят.
+
+### T-048: Включить orders stream и отправку обновлений на back
+
+- [ ] Реализовать рабочий stream для TradeStation endpoint `GET /v3/brokerage/stream/accounts/{accounts}/orders`.
+- [ ] Текущий `domain.ts.client.streamOrders({ contract, ordersIds })` можно переиспользовать или заменить, но итоговый stream должен быть idempotent и храниться в `client.streams` через общий stable key, чтобы `info/client` и cleanup могли его видеть.
+- [ ] Stream должен получать order update packets, игнорировать служебные `StreamStatus` snapshot markers там, где они не являются business update, и отправлять реальные updates на back.
+- [ ] Сохранить текущий downstream intent: `domain.queue.addTask({ endpoint: ['response'], data: { type: 'order', data: message } })`, если нет уже существующего более нового back-контракта.
+- [ ] Ошибки stream должны логироваться с account/accounts и endpoint, но не запускать неконтролируемые дублирующие streams.
+- [ ] Stop/cleanup должен проходить через существующий `stopStoredStream()` / client cleanup path.
+
+Файлы:
+
+- `application/domain/ts/client.js`
+- `application/domain/ts/clients.js`
+- `application/domain/queue.js` только если нужен test double / compatibility check, без изменения публичного contract
+- `application/test/run.js`
+
+Критерии приёмки:
+
+- Orders stream endpoint собирается как `brokerage/stream/accounts/{accounts}/orders`.
+- Business order packet добавляется в `domain.queue` на endpoint `['response']` с `type: 'order'`.
+- `StreamStatus: 'EndSnapshot'` не отправляется как order update.
+- Stream не дублируется при повторном запуске для тех же accounts.
+- `npm run lint`, `npm run types`, `npm test` проходят.
+
+### T-049: Включить positions stream и актуализировать `domain.ts.positions`
+
+- [ ] Реализовать рабочий stream для TradeStation endpoint `GET /v3/brokerage/stream/accounts/{accounts}/positions`.
+- [ ] Stream должен обновлять `application/domain/ts/positions.js`, чтобы `domain.ts.positions.getPosition({ account, symbol })` возвращал актуальную позицию для `application/lib/ts/placeorder.js`.
+- [ ] Symbol из TS packet нормализовать через общий `lib.utils.makeSymbol()` contract перед записью в `domain.ts.positions`.
+- [ ] `Quantity` сохранять без потери знака; `lib.utils.readPositionQuantity(position)` должен продолжать читать актуальное signed значение.
+- [ ] Если stream packet означает нулевую/закрытую позицию, очищать соответствующую canonical entry через `domain.ts.positions.clearPosition({ account, symbol })`, а не оставлять stale quantity.
+- [ ] Служебные `StreamStatus` packets не должны портить registry positions.
+- [ ] При первом старте stream не заменяет snapshot `api.account.positions()` полностью: если нужна первичная синхронизация до прихода stream update, worker должен либо вызвать существующий snapshot по contracts, либо явно сохранить текущую lazy behavior и описать это в итоговом отчёте.
+
+Файлы:
+
+- `application/domain/ts/client.js`
+- `application/domain/ts/positions.js`
+- `application/api/account/positions.js` только если нужен безопасный initial snapshot reuse
+- `application/lib/utils.js` только если нужен уже существующий helper, без новой ручной symbol-сборки
+- `application/test/run.js`
+
+Критерии приёмки:
+
+- Position update из stream с TS/display OPT symbol находится потом через canonical internal symbol в `getPosition()`.
+- `placeorder` получает актуальный `current` через `domain.ts.positions.getPosition()` и `lib.utils.readPositionQuantity()`.
+- Zero/closed position packet очищает registry entry.
+- `StreamStatus` не создаёт fake position.
+- `npm run lint`, `npm run types`, `npm test` проходят.
+
+### T-050: Диагностика и cleanup brokerage streams
+
+- [ ] Убедиться, что `application/api/info/client.js` показывает активные brokerage orders/positions upstream streams вместе с market data streams.
+- [ ] Убедиться, что `domain.ts.clients.deleteClient({ name })` корректно останавливает orders/positions streams и не оставляет dangling reconnect timers.
+- [ ] Не смешивать account-nested storage и group storage так, чтобы cleanup случайно пропускал orders/positions. Если текущая структура `client.streams[contract.account].orders` мешает общему cleanup, привести хранение к стабильным groups `orders` / `positions` с key по accounts.
+- [ ] Логи запуска/остановки должны позволять увидеть: accounts, endpoint, group, reason.
+- [ ] Не подключать brokerage streams к public `domain.ts.streams` subscriber lifecycle, если нет downstream metacom subscribers. Это server-owned streams для синхронизации back/order/position state.
+
+Файлы:
+
+- `application/domain/ts/client.js`
+- `application/domain/ts/clients.js`
+- `application/api/info/client.js`
+- `application/test/run.js`
+
+Критерии приёмки:
+
+- `info/client` показывает orders/positions streams в `upstream`.
+- `deleteClient()` останавливает orders/positions streams.
+- В тестах нет зависания от idle timers после проверки brokerage stream lifecycle.
+- `npm run lint`, `npm run types`, `npm test` проходят.
+
+## Блок 32: Brokerage stream review fixes
+
+Worker выполняет только production-fix T-051. Test coverage по brokerage streams оформлен отдельной architect-only задачей T-052 после acceptance Блока 32.
+
+### T-051: Нормализовать account key для positions stream и order lookup
+
+- [x] Исправить account-key contract для `domain.ts.positions`: запись из brokerage positions stream и lookup из `placeorder` должны использовать один и тот же account key.
+- [x] Сейчас `streamPositions()` запускается по normalized string account, но записывает позицию под `message.AccountID ?? account`, а `placeorder` ищет по `data.AccountID`, которое приходит из `contract.account` и может быть number. Это может дать miss и `current = 0`.
+- [x] Выбрать один invariant для account key, желательно строковый `String(account).trim()`, и использовать его во всех позиционных paths: `setPosition`, `getPosition`, `clearPosition`, snapshot `api.account.positions`, stream positions, `placeorder`.
+- [x] Не менять публичный order contract; нормализация должна быть внутренним registry invariant.
+- [x] Сохранить нормализацию symbol только через `lib.utils.makeSymbol()` / `normalizePositionSymbol()`, без ручной сборки.
+
+Файлы:
+
+- `application/domain/ts/positions.js`
+- `application/domain/ts/client.js`
+- `application/api/account/positions.js`
+- `application/lib/ts/placeorder.js`
+
+Критерии приёмки:
+
+- Position update из stream с `AccountID: '11827414'` находится в `placeorder`, когда `contract.account` / `data.AccountID` равен `11827414` number.
+- Zero/closed stream packet очищает ту же registry entry, которую читает `placeorder`.
+- Snapshot positions и stream positions используют один account-key invariant.
+
+## Блок 33: Architect tests for brokerage streams
+
+Выполняет architect после passed review Блока 32. Worker не выполняет этот блок и не меняет tests.
+
+### T-052: Добавить regression coverage для brokerage orders/positions streams
+
+- [x] Добавить regression tests для T-047..T-050 в `application/test/run.js`.
+- [x] Если T-051 изменит account-key invariant, добавить regression coverage для account key string/number parity из T-051.
+- [x] Покрыть auto-start brokerage streams после успешного client setup/token: mock `lib.ptfin.getContract({ accounts: ['all'] })`, `lib.ts.refresh()` и `lib.ts.stream()`.
+- [x] Проверить idempotency: повторный `getClient()` / `syncBrokerageStreams()` не создаёт второй orders/positions stream для того же account.
+- [x] Проверить orders stream: endpoint `brokerage/stream/accounts/{account}/orders`, business packet уходит в `domain.queue.addTask({ endpoint: ['response'], data: { type: 'order', data } })`, `StreamStatus: 'EndSnapshot'` не уходит.
+- [x] Проверить positions stream: display OPT symbol нормализуется в canonical symbol, signed `Quantity` читается через `lib.utils.readPositionQuantity()`, zero quantity очищает position.
+- [x] Проверить cleanup: `domain.ts.clients.deleteClient({ name })` вызывает stop for orders/positions streams and clears timers without leaving active handles.
+- [x] Не изменять production behavior вне нужного testability surface.
+
+Критерии приёмки:
+
+- Тесты падают, если brokerage streams не стартуют после token setup.
+- Тесты падают, если orders packet не отправляется на back.
+- Тесты падают, если positions stream не обновляет `domain.ts.positions` для `placeorder`.
+- Тесты падают, если `deleteClient()` не останавливает orders/positions streams.
 - `npm run lint`, `npm run types`, `npm test` проходят.

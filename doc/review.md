@@ -298,3 +298,54 @@ Review обязателен после любого task. После review arch
 - `application/test/run.js` покрывает synchronous emit during startup, startup failure cleanup и concurrent subscribe race
 - `doc/blueprint.md` и review checklist фиксируют startup-race invariant для будущих stream endpoint-ов
 - Создать follow-up блок на cleanup зависающих tests и восстановление T-038 acceptance.
+
+### Заключение: Блок 30 — Managed stream review fixes
+
+Статус: passed with notes
+Проблемы: live TradeStation runtime smoke для managed stream lifecycle в этом workspace не запускался.
+Задачи:
+
+- `application/test/run.js` теперь явно очищает successful managed stream subscriptions после startup-race тестов, поэтому `npm test` завершается сразу после `20 test(s) passed`
+- `stream matrix emits canonical levelII packets while routing by tsSymbol` проверяет отсутствие top-level `symbol` в `stream/levelII` payload
+- `npm run lint`, `npm run types` и `npm test` проходят
+
+### Заключение: Блок 31 — Brokerage orders and positions streams after TS connect
+
+Статус: failed
+Проблемы:
+
+- [P1] `application/domain/ts/client.js` пишет positions stream update под `message.AccountID ?? account`, а `application/lib/ts/placeorder.js` ищет position по `data.AccountID`. Публичный order пример использует `contract.account` как number, а stream account нормализуется в string; при несовпадении типов Map key lookup промахнётся и `current` снова станет `0`.
+- [P2] В staged patch нет regression coverage для T-047..T-050: `application/test/run.js` не покрывает auto-start brokerage streams after token, idempotency, orders queue forwarding, positions registry update, zero position cleanup и `deleteClient()` cleanup. По глобальному правилу это не worker-scope; coverage оформлен отдельной architect-only задачей после acceptance production-fix.
+- [P3] В staged patch изменён `AGENTS.md`; это документационный файл, а по текущим правилам worker не должен менять `AGENTS.md`/`doc/*`. Изменение не оценивалось как production fix.
+- Live TradeStation runtime smoke для brokerage orders/positions streams в этом workspace не запускался.
+
+Задачи:
+
+- `application/domain/ts/client.js` добавляет server-owned brokerage startup state, `syncBrokerageStreams()`, grouped `orders` / `positions` streams и `close()` / `stopAllStreams()`
+- `application/domain/ts/clients.js` вызывает `syncBrokerageStreams()` после refresh/setup и на повторном `getClient()`, а `deleteClient()` теперь await-ит client cleanup
+- Создать follow-up T-051 на account-key normalization и architect-only T-052 на regression coverage после acceptance T-051.
+
+### Заключение: Блок 32 — Brokerage stream review fixes
+
+Статус: passed
+Проблемы: не найдено.
+Проверено:
+
+- `application/domain/ts/positions.js` держит единый account-key invariant через `normalizeAccountKey(account)` и корректно принимает number/string account.
+- `application/domain/ts/client.js` передаёт raw `message.AccountID ?? account` в positions registry, а registry нормализует ключ внутри.
+- `application/api/account/positions.js` использует тот же account-key invariant при snapshot reconciliation и refresh.
+- `application/lib/ts/placeorder.js` оставляет публичный order contract без изменений и читает position через registry normalization.
+
+Задачи:
+
+- T-051 закрыта.
+- После acceptance T-051 выполнена architect-only T-052 на regression coverage.
+
+### Заключение: Блок 33 — Architect tests for brokerage streams
+
+Статус: passed
+Проблемы: live TradeStation runtime smoke для brokerage streams в этом workspace не запускался.
+Задачи:
+
+- `application/test/run.js` добавляет coverage для auto-start brokerage streams после token setup, idempotency, orders queue forwarding, positions update, string/number account parity, zero position cleanup и `deleteClient()` cleanup.
+- `npm test` проходит: `22 test(s) passed`.
