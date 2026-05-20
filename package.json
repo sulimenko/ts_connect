@@ -34,7 +34,6 @@
     "types": "tsc -p tsconfig.json",
     "lint": "eslint . && prettier -c \"**/*.js\" \"**/*.json\" \"**/*.md\"",
     "fix": "eslint . --fix && prettier --write \"**/*.js\" \"**/*.json\" \"**/*.md\"",
-    "release": "node scripts/release.js",
     "db": "metasql c",
     "start": "node server.js"
   },
