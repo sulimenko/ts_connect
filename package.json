@@ -1,6 +1,6 @@
 {
   "name": "ts_connect",
-  "version": "1.0.0",
+  "version": "26.5.0",
   "author": "Alexey Sulimenko sulimenkoas@gmail.com>",
   "description": "Connector for TradeStation API",
   "contributors": [
