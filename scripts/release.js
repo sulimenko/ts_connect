@@ -3,9 +3,10 @@
 const { spawnSync } = require('node:child_process');
 
 const rawVersion = process.argv[2];
+const isWindows = process.platform === 'win32';
 
 if (!rawVersion) {
-  console.error('Usage: npm run release:tag -- <version>');
+  console.error('Usage: npm run release -- <version>');
   process.exit(1);
 }
 
@@ -17,19 +18,23 @@ if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
   process.exit(1);
 }
 
+const resolveCommand = (command) => {
+  if (!isWindows) return command;
+  if (command === 'npm') return 'npm.cmd';
+  return command;
+};
+
 const run = (command, args, options = {}) => {
-  const result = spawnSync(command, args, {
+  const result = spawnSync(resolveCommand(command), args, {
     stdio: 'inherit',
-    shell: process.platform === 'win32',
     ...options,
   });
   if (result.status !== 0) process.exit(result.status ?? 1);
 };
 
 const capture = (command, args) => {
-  const result = spawnSync(command, args, {
+  const result = spawnSync(resolveCommand(command), args, {
     encoding: 'utf8',
-    shell: process.platform === 'win32',
   });
   if (result.status !== 0) {
     process.stderr.write(result.stderr ?? '');
