@@ -1,0 +1,49 @@
+name: Deploy System
+
+on:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  deploy-prod:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Add SSH key (base64)
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PROD_DEPLOY_SSH_KEY_B64 }}" | base64 -d > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          eval "$(ssh-agent -s)"
+          ssh-add ~/.ssh/id_rsa
+
+      - name: Trust host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${{ vars.PROD_DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Ensure remote deploy directory exists
+        run: |
+          ssh "${{ vars.PROD_DEPLOY_USER }}@${{ vars.PROD_DEPLOY_HOST }}" "mkdir -p '${{ vars.PROD_DEPLOY_PATH }}'"
+
+      - name: Show remote deploy directory
+        run: |
+          ssh "${{ vars.PROD_DEPLOY_USER }}@${{ vars.PROD_DEPLOY_HOST }}" "ls -la '${{ vars.PROD_DEPLOY_PATH }}'"
+
+      - name: Sync source to server
+        run: |
+          rsync -az --delete \
+            `# --exclude "/.git"` \
+            --exclude "/.github" \
+            --exclude "/.vscode" \
+            --exclude "/node_modules" \
+            --exclude "/log" \
+            --exclude "/.env" \
+            ./ "${{ vars.PROD_DEPLOY_USER }}@${{ vars.PROD_DEPLOY_HOST }}:${{ vars.PROD_DEPLOY_PATH }}/"
+
+      - name: Build and run on server
+        run: |
+          ssh "${{ vars.PROD_DEPLOY_USER }}@${{ vars.PROD_DEPLOY_HOST }}" "cd '${{ vars.PROD_DEPLOY_PATH }}' && docker compose build && docker compose up -d --remove-orphans"
