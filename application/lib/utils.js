@@ -162,7 +162,7 @@
     try {
       const domainPart = live ? config.ts.url.live : config.ts.url.sim;
       // console.log(live, config.ts.url.protocol, '://', domainPart, config.ts.url.domen);
-      return new URL(config.ts.url.protocol + '://' + domainPart + config.ts.url.domen).toString();
+      return new URL(`${config.ts.url.protocol}://${domainPart}${config.ts.url.domen}`).toString();
     } catch (error) {
       console.error('Error in constructDomain:', error);
       throw new Error('Invalid domain configuration');
@@ -172,7 +172,7 @@
   constructURL(method, domain, endpoint, data) {
     try {
       let url = new URL(endpoint.join('/'), domain).toString();
-      if (method === 'GET' && Object.keys(data).length > 0) url += '?' + new URLSearchParams(data).toString();
+      if (method === 'GET' && Object.keys(data).length > 0) url += `?${new URLSearchParams(data).toString()}`;
       return url;
     } catch (error) {
       console.error('Error in constructURL:', error);

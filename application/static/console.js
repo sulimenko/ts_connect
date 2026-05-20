@@ -226,7 +226,7 @@ const upload = () => {
   fileSelect.click();
   fileSelect.onchange = () => {
     const files = Array.from(fileSelect.files);
-    application.print('Uploading ' + files.length + ' file(s)');
+    application.print(`Uploading ${files.length} file(s)`);
     files.sort((a, b) => a.size - b.size);
     let i = 0;
     const uploadNext = async () => {
@@ -268,7 +268,7 @@ class Keyboard {
 
   show() {
     this.controlKeyboard.style.display = 'block';
-    const down = this.controlKeyboard.offsetHeight + 'px';
+    const down = `${this.controlKeyboard.offsetHeight}px`;
     application.controlBrowse.style.bottom = down;
   }
 
@@ -308,8 +308,8 @@ class Scroller {
     this.thumbHeight = this.scrollHeight * this.viewableRatio;
     const top = application.controlBrowse.scrollTop;
     this.thumbPosition = (top * this.thumbHeight) / this.viewportHeight;
-    this.controlScroll.style.top = this.thumbPosition + 'px';
-    this.controlScroll.style.height = this.thumbHeight + 'px';
+    this.controlScroll.style.top = `${this.thumbPosition}px`;
+    this.controlScroll.style.height = `${this.thumbHeight}px`;
   }
 
   scrollBottom() {
@@ -354,7 +354,7 @@ class Application {
       value = pad('*', value.length);
     }
     value = value.replace(/ /g, '&nbsp;');
-    const html = this.controlInput.inputPrompt + value + '<span>&block;</span>';
+    const html = `${this.controlInput.inputPrompt + value}<span>&block;</span>`;
     this.controlInput.innerHTML = html;
   }
 
