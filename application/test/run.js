@@ -1,5 +1,4 @@
 'use strict';
-/* global require */
 
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
