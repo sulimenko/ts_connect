@@ -90,7 +90,7 @@
       const response = await fetch(url, {
         method: 'GET',
         headers: {
-          Authorization: 'Bearer ' + client.tokens.access,
+          Authorization: `Bearer ${client.tokens.access}`,
           'Content-Type': 'application/json',
         },
       });

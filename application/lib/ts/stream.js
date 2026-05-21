@@ -67,7 +67,7 @@
     try {
       const response = await fetch(url, {
         method: 'GET',
-        headers: { Authorization: 'Bearer ' + tokens.access, 'Content-Type': 'application/json' },
+        headers: { Authorization: `Bearer ${tokens.access}`, 'Content-Type': 'application/json' },
         signal,
       });
 

@@ -7,7 +7,7 @@ async ({ method, endpoint, data = {}, type = 'application/json' }) => {
     const options = {
       method,
       headers: {
-        Authorization: 'Bearer ' + config.ptfin.main.token,
+        Authorization: `Bearer ${config.ptfin.main.token}`,
       },
     };
 

@@ -6,7 +6,7 @@ async ({ method, domain = null, live = false, ver = 'v3', endpoint, token, data 
 
     const options = { method, headers: {} };
 
-    if (token !== null) options.headers.Authorization = 'Bearer ' + token;
+    if (token !== null) options.headers.Authorization = `Bearer ${token}`;
     const urlEncodedData = new URLSearchParams(data).toString();
 
     if (method === 'POST') {
