@@ -1444,6 +1444,113 @@ test('optionChain rejects object errors with a readable message', async () => {
   );
 });
 
+test('optionChain snapshot times out with no option packets', async () => {
+  let timer = null;
+  let keys = null;
+  let resolveKey = null;
+  const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
+    setTimeout: (fn) => {
+      timer = () => fn();
+      return 1;
+    },
+    clearTimeout: () => {},
+    lib: makeLib({
+      ts: {
+        readOptionChain: () => null,
+      },
+    }),
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            stopStoredStream: async ({ key }) => {
+              keys = key;
+            },
+            streamChains: () =>
+              new Promise((resolve) => {
+                resolveKey = resolve;
+              }),
+          }),
+        },
+      },
+    },
+  });
+
+  const pending = helper({
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'TSLA'],
+    symbol: 'TSLA',
+    data: {
+      strikeProximity: 0,
+      optionType: 'All',
+    },
+  });
+
+  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  timer();
+  const result = await pending;
+  resolveKey('chains-key');
+  await Promise.resolve();
+
+  assert.equal(result.strikes, 0);
+  assert.deepEqual(Object.keys(result.chain), []);
+  assert.equal(result.metadata.actualStrikes, 0);
+  assert.equal(result.metadata.actualLegs, 0);
+  assert.equal(result.metadata.partial, true);
+  assert.equal(result.metadata.reason, 'timeout');
+  assert.equal(keys, null);
+});
+
+test('optionChain invalid packets still timeout and clean up stream', async () => {
+  let timer = null;
+  const keys = [];
+  const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
+    setTimeout: (fn) => {
+      timer = () => fn();
+      return 1;
+    },
+    clearTimeout: () => {},
+    lib: makeLib({
+      ts: {
+        readOptionChain: () => null,
+      },
+    }),
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            stopStoredStream: async ({ key }) => {
+              keys.push(key);
+            },
+            streamChains: async ({ onData }) => {
+              onData({ Error: 'bad row' });
+              return 'chains-key';
+            },
+          }),
+        },
+      },
+    },
+  });
+
+  const pending = helper({
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'TSLA'],
+    symbol: 'TSLA',
+    data: {
+      strikeProximity: 0,
+      optionType: 'All',
+    },
+  });
+
+  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  timer();
+  const result = await pending;
+  timer();
+
+  assert.equal(result.strikes, 0);
+  assert.deepEqual(Object.keys(result.chain), []);
+  assert.equal(result.metadata.reason, 'timeout');
+  assert.deepEqual(keys, ['chains-key']);
+});
+
 test('optionChain returns partial metadata instead of masking incomplete chain', async () => {
   const utils = loadUtils();
   const sent = [];
@@ -1530,7 +1637,7 @@ test('optionChain preserves call-only and put-only strikes while marking missing
   let timer = null;
   const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
     setTimeout: (fn) => {
-      timer = fn;
+      timer = () => fn();
       return 1;
     },
     clearTimeout: () => {},
@@ -1566,7 +1673,6 @@ test('optionChain preserves call-only and put-only strikes while marking missing
                   },
                 ],
               });
-              timer();
               return 'chains-key';
             },
           }),
@@ -1575,7 +1681,7 @@ test('optionChain preserves call-only and put-only strikes while marking missing
     },
   });
 
-  const result = await helper({
+  const pending = helper({
     endpoint: ['marketdata', 'stream', 'options', 'chains', 'CRWV'],
     symbol: 'CRWV',
     data: {
@@ -1584,6 +1690,9 @@ test('optionChain preserves call-only and put-only strikes while marking missing
       optionType: 'All',
     },
   });
+  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  timer();
+  const result = await pending;
 
   assert.equal(result.strikes, 2);
   assert.equal(result.chain['00080000'].C.symbol_raw, 'CRWV280121C00080000');

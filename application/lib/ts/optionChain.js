@@ -150,12 +150,6 @@ async ({ endpoint, symbol, data }) => {
       if (response.chain[option.strike] === undefined) response.chain[option.strike] = {};
       response.chain[option.strike][option.type] = option;
 
-      if (timeoutId === null) {
-        timeoutId = setTimeout(() => {
-          void finalize(response, null, 'timeout');
-        }, 5000);
-      }
-
       if (expectedStrikes === null) return;
 
       const keys = Object.keys(response.chain);
@@ -173,8 +167,14 @@ async ({ endpoint, symbol, data }) => {
       void finalize(response, normalizeError(err), 'error');
     };
 
-    client
-      .streamChains({ endpoint, symbol, data, onData, onError })
+    const stream = client.streamChains({ endpoint, symbol, data, onData, onError });
+    if (!settled) {
+      timeoutId = setTimeout(() => {
+        void finalize(response, null, 'timeout');
+      }, 5000);
+    }
+
+    stream
       .then((key) => {
         streamKey = key;
       })
