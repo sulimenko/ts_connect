@@ -1497,7 +1497,7 @@ test('optionChain snapshot times out with no option packets', async () => {
   assert.equal(result.metadata.actualLegs, 0);
   assert.equal(result.metadata.partial, true);
   assert.equal(result.metadata.reason, 'timeout');
-  assert.equal(keys, null);
+  assert.equal(keys, 'chains-key');
 });
 
 test('optionChain invalid packets still timeout and clean up stream', async () => {

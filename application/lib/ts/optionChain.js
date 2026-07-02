@@ -128,6 +128,15 @@ async ({ endpoint, symbol, data }) => {
       response.metadata.reason = response.metadata.partial ? reason : 'complete';
     };
 
+    const stop = async (key) => {
+      if (!key) return;
+      try {
+        await client.stopStoredStream({ group: 'chains', key });
+      } catch (error) {
+        console.warn('chains stream cleanup failed:', key, error);
+      }
+    };
+
     const finalize = async (result, error = null, reason = 'complete') => {
       if (settled) return;
       settled = true;
@@ -138,7 +147,7 @@ async ({ endpoint, symbol, data }) => {
         timeoutId = null;
       }
 
-      if (streamKey) await client.stopStoredStream({ group: 'chains', key: streamKey });
+      await stop(streamKey);
 
       if (error) reject(error);
       else resolve(result);
@@ -177,6 +186,7 @@ async ({ endpoint, symbol, data }) => {
     stream
       .then((key) => {
         streamKey = key;
+        if (settled) void stop(key);
       })
       .catch((error) => {
         void finalize(response, error);
