@@ -53,6 +53,22 @@ Runner читает `ai-task-contract` как источник правды.
 doc/tasks/ready/*.md
 ```
 
+## Task ID and branch naming
+
+- Перед draft новой задачи ChatGPT должен найти максимальный завершённый `T-NNN` в `doc/changelog.md`, `doc/task.md` и `doc/tasks/done/*.md`.
+- Следующий task ID получает `T-NNN`, где `NNN = max existing + 1`.
+- Если создаётся несколько primary tasks одновременно, номера идут последовательно.
+- Work branch должен начинаться с `ai/T-NNN-...`.
+- Название задачи в markdown: `# Task T-NNN: <short title>`.
+- `task_id` в `ai-task-contract` должен быть только `T-NNN`, без slug.
+
+## Naming style
+
+- Имена функций и переменных должны быть лаконичными.
+- 1 слово лучше 2, 2 слова лучше 3.
+- Длинное имя допустимо только если короткое теряет смысл или создаёт ambiguity.
+- Не вводить helper/function/class только ради декоративной абстракции.
+
 `doc/task.md` больше не является источником активных задач.
 
 ## Роли
@@ -106,6 +122,7 @@ git:
   base_branch: develop
   queue_branch: ai-task-queue
   parent_branch: none
+  work_branch: ai/T-NNN-short-title
   work_branch_policy: create_task_branch
   allow_new_branch: true
   allow_codex_git: false
@@ -113,6 +130,8 @@ pr:
   mode: create_new
   base: develop
 ```
+
+ChatGPT не должен придумывать `T-NNN`; сначала проверить историю задач.
 
 Follow-up к открытому PR:
 

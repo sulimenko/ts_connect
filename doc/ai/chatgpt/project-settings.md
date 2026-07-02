@@ -74,6 +74,22 @@ Opening fence должен быть строго ` ```ai-task-contract `.
 
 Запрещены `id`, `yaml`, attributes или metadata в opening fence.
 
+## Task ID and branch naming
+
+- Перед draft новой задачи ChatGPT должен найти максимальный существующий `T-NNN` в `doc/changelog.md`, `doc/task.md` и `doc/tasks/done/*.md`.
+- Следующий task ID получает `T-NNN`, где `NNN = max existing + 1`.
+- Если создаётся несколько primary tasks одновременно, номера идут последовательно.
+- Название задачи в markdown: `# Task T-NNN: <short title>`.
+- `task_id` в `ai-task-contract` должен быть только `T-NNN`, без slug.
+- Work branch должен начинаться с `ai/T-NNN-`.
+
+## Naming style
+
+- Имена функций и переменных должны быть лаконичными.
+- 1 слово лучше 2.
+- 2 слова лучше 3.
+- Длинное имя допустимо только если короткое теряет смысл или создаёт ambiguity.
+
 ## Required contract fields
 
 ```yaml
@@ -99,6 +115,7 @@ git:
   base_branch: develop
   queue_branch: ai-task-queue
   parent_branch: none
+  work_branch: ai/T-NNN-short-title
   work_branch_policy: create_task_branch
   allow_new_branch: true
   allow_codex_git: false
