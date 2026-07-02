@@ -1,5 +1,17 @@
 # Review
 
+> Legacy review history and checklist.
+>
+> Active PR review rules for AI Pipeline v8 are now defined in:
+>
+> - `AGENTS.md`
+> - `doc/ai/chatgpt/project-settings.md`
+> - `doc/ai/chatgpt/review-checklist.md`
+
+---
+
+# Review
+
 ## Назначение документа
 
 Этот документ задает постоянный review-checklist для `ts_connect`. Его задача: проверять качество изменений до merge или деплоя, а не пересказывать историю конкретной задачи.

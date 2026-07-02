@@ -1,5 +1,15 @@
 # Task
 
+> Legacy document.
+>
+> `ts_connect` migrated to AI Pipeline v8 task queue.
+> New active tasks must be created as `doc/tasks/ready/*.md` with an `ai-task-contract`.
+> This file is kept only as historical reference for pre-migration T-NNN blocks.
+
+---
+
+# Task
+
 ## Правила ведения документа
 
 ### Структура и нумерация

@@ -36,6 +36,18 @@ module.exports = [
     },
   },
   {
+    files: ['application/test/run.js'],
+    languageOptions: {
+      sourceType: 'commonjs',
+      globals: {
+        require: true,
+        __dirname: true,
+        module: true,
+        process: true,
+      },
+    },
+  },
+  {
     files: ['application/lib/ts/refresh.js'],
     rules: {
       camelcase: 'off',
