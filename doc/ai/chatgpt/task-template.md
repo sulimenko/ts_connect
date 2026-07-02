@@ -2,7 +2,7 @@
 
 ```ai-task-contract
 version: 1
-task_id: T-XXX-example
+task_id: T-XXX
 type: primary
 human_summary: "<short summary>"
 execution_mode: codex
@@ -11,6 +11,7 @@ git:
   base_branch: develop
   queue_branch: ai-task-queue
   parent_branch: none
+  work_branch: ai/T-XXX-short-slug
   work_branch_policy: create_task_branch
   allow_new_branch: true
   allow_codex_git: false
@@ -50,6 +51,12 @@ diff_budget:
 commit:
   message: "<commit message>"
 ```
+## Naming rule
+
+- Имена функций и переменных лаконичные.
+- 1 слово лучше 2.
+- 2 слова лучше 3.
+- Длинное имя допускается только если короткое теряет смысл.
 
 ## Human summary
 
