@@ -11,7 +11,7 @@ git:
   base_branch: develop
   queue_branch: ai-task-queue
   parent_branch: none
-  work_branch: ai/T-XXX-short-slug
+  work_branch: ai/T-XXX-short-title
   work_branch_policy: create_task_branch
   allow_new_branch: true
   allow_codex_git: false
@@ -51,6 +51,7 @@ diff_budget:
 commit:
   message: "<commit message>"
 ```
+
 ## Naming rule
 
 - Имена функций и переменных лаконичные.

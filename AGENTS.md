@@ -56,7 +56,7 @@ doc/tasks/ready/*.md
 ## Task ID and branch naming
 
 - Перед draft новой задачи ChatGPT должен найти максимальный завершённый `T-NNN` в `doc/changelog.md`, `doc/task.md` и `doc/tasks/done/*.md`.
-- Новый primary task получает `task_id: T-NNN`, где `NNN = max_completed + 1`.
+- Следующий task ID получает `T-NNN`, где `NNN = max existing + 1`.
 - Если создаётся несколько primary tasks одновременно, номера идут последовательно.
 - Work branch должен начинаться с `ai/T-NNN-...`.
 - Название задачи в markdown: `# Task T-NNN: <short title>`.
@@ -122,7 +122,7 @@ git:
   base_branch: develop
   queue_branch: ai-task-queue
   parent_branch: none
-  work_branch: ai/T-NNN-short-slug
+  work_branch: ai/T-NNN-short-title
   work_branch_policy: create_task_branch
   allow_new_branch: true
   allow_codex_git: false
@@ -130,6 +130,7 @@ pr:
   mode: create_new
   base: develop
 ```
+
 ChatGPT не должен придумывать `T-NNN`; сначала проверить историю задач.
 
 Follow-up к открытому PR:
