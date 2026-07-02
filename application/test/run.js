@@ -499,6 +499,37 @@ test('readOptionChain and positions share the same canonical option symbol contr
   assert.equal(positions.getPosition({ account: 'A1', symbol: 'CRWV 280121C80' }), null);
 });
 
+test('readOptionChain keeps structurally valid rows with missing quotes and greeks', async () => {
+  const utils = loadUtils();
+  const readOptionChain = loadExpressionModule('application/lib/ts/readOptionChain.js', {
+    lib: { utils },
+  });
+
+  const option = readOptionChain({
+    message: {
+      Legs: [
+        {
+          Symbol: 'CRWV 280121P75',
+          Expiration: '2028-01-21T00:00:00Z',
+          OptionType: 'Put',
+        },
+      ],
+    },
+  });
+
+  assert.ok(option);
+  assert.equal(option.symbol_raw, 'CRWV280121P00075000');
+  assert.equal(option.strike, '00075000');
+  assert.equal(option.type, 'P');
+  assert.equal(option.ask, null);
+  assert.equal(option.bid, null);
+  assert.equal(option.trade_price, null);
+  assert.equal(option.delta, null);
+  assert.equal(option.gamma, null);
+  assert.equal(option.theta, null);
+  assert.equal(option.vega, null);
+});
+
 test('marketdata quotes and order execution use the shared symbol formatter', async () => {
   const utils = loadUtils();
   const readQuote = loadExpressionModule('application/lib/ts/readQuote.js', {
@@ -1232,6 +1263,157 @@ test('optionChain rejects object errors with a readable message', async () => {
       return true;
     },
   );
+});
+
+test('optionChain returns partial metadata instead of masking incomplete chain', async () => {
+  const utils = loadUtils();
+  const sent = [];
+  const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
+    setTimeout: (fn) => {
+      fn();
+      return 1;
+    },
+    clearTimeout: () => {},
+    lib: makeLib({
+      utils,
+      ts: {
+        readOptionChain: loadExpressionModule('application/lib/ts/readOptionChain.js', {
+          lib: { utils },
+        }),
+        send: async (args) => {
+          sent.push(args);
+          return {
+            Strikes: [
+              ['70', '75'],
+              ['75', '80'],
+            ],
+          };
+        },
+      },
+    }),
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            tokens: { access: 'token' },
+            stopStoredStream: async () => {},
+            streamChains: async ({ onData }) => {
+              onData({
+                Legs: [
+                  {
+                    Symbol: 'CRWV 280121C80',
+                    Expiration: '2028-01-21T00:00:00Z',
+                    OptionType: 'Call',
+                  },
+                ],
+              });
+              return 'chains-key';
+            },
+          }),
+        },
+      },
+    },
+  });
+
+  const result = await helper({
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'CRWV'],
+    symbol: 'CRWV',
+    data: {
+      strikeProximity: 0,
+      strikeRange: 'All',
+      strikeInterval: 1,
+      optionType: 'All',
+      expiration: '2028-01-21',
+    },
+  });
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].endpoint.join('/'), 'marketdata/options/strikes/CRWV');
+  assert.equal(result.symbol, 'CRWV');
+  assert.equal(result.expiration, '2028-01-21');
+  assert.equal(result.strikes, 1);
+  assert.deepEqual(Object.keys(result.chain), ['00080000']);
+  assert.equal(result.chain['00080000'].C.symbol_raw, 'CRWV280121C00080000');
+  assert.equal(result.chain['00080000'].P, undefined);
+  assert.equal(result.metadata.expectedStrikes, 3);
+  assert.equal(result.metadata.actualStrikes, 1);
+  assert.equal(result.metadata.expectedLegsPerStrike, 2);
+  assert.equal(result.metadata.actualLegs, 1);
+  assert.equal(result.metadata.partial, true);
+  assert.equal(result.metadata.source, 'stream-snapshot');
+  assert.equal(result.metadata.reason, 'timeout');
+  assert.equal(result.metadata.requested.strikeRange, 'All');
+  assert.equal(result.metadata.requested.strikeProximity, 0);
+});
+
+test('optionChain preserves call-only and put-only strikes while marking missing legs partial', async () => {
+  const utils = loadUtils();
+  let timer = null;
+  const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
+    setTimeout: (fn) => {
+      timer = fn;
+      return 1;
+    },
+    clearTimeout: () => {},
+    lib: makeLib({
+      utils,
+      ts: {
+        readOptionChain: loadExpressionModule('application/lib/ts/readOptionChain.js', {
+          lib: { utils },
+        }),
+      },
+    }),
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            stopStoredStream: async () => {},
+            streamChains: async ({ onData }) => {
+              onData({
+                Legs: [
+                  {
+                    Symbol: 'CRWV 280121C80',
+                    Expiration: '2028-01-21T00:00:00Z',
+                    OptionType: 'Call',
+                  },
+                ],
+              });
+              onData({
+                Legs: [
+                  {
+                    Symbol: 'CRWV 280121P75',
+                    Expiration: '2028-01-21T00:00:00Z',
+                    OptionType: 'Put',
+                  },
+                ],
+              });
+              timer();
+              return 'chains-key';
+            },
+          }),
+        },
+      },
+    },
+  });
+
+  const result = await helper({
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'CRWV'],
+    symbol: 'CRWV',
+    data: {
+      strikeProximity: 2,
+      strikeRange: 'NearTheMoney',
+      optionType: 'All',
+    },
+  });
+
+  assert.equal(result.strikes, 2);
+  assert.equal(result.chain['00080000'].C.symbol_raw, 'CRWV280121C00080000');
+  assert.equal(result.chain['00075000'].P.symbol_raw, 'CRWV280121P00075000');
+  assert.equal(result.metadata.expectedStrikes, 4);
+  assert.equal(result.metadata.actualStrikes, 2);
+  assert.equal(result.metadata.actualLegs, 2);
+  assert.equal(result.metadata.partial, true);
+  assert.equal(result.metadata.reason, 'timeout');
 });
 
 test('brokerage streams start once and update orders and positions', async () => {
