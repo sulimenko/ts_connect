@@ -252,6 +252,185 @@ test('stream packet Failed/Internal server error is permanent and stops reconnec
   assert.equal(errors[0].symbol, 'TSLA');
 });
 
+test('stream read terminated by socket close is transient and does not log unexpected error', async () => {
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
+  const warnings = [];
+  const errors = [];
+  let reconnectCalls = 0;
+
+  const instance = {
+    ...streamFactory({
+      live: true,
+      endpoint: ['marketdata', 'stream', 'quotes', 'TSLA'],
+      tokens: { access: 'token' },
+      onData: () => {},
+      onError: () => {},
+    }),
+    scheduleReconnect: async () => {
+      reconnectCalls += 1;
+    },
+  };
+
+  const originalWarn = console.warn;
+  const originalError = console.error;
+  console.warn = (...args) => warnings.push(args);
+  console.error = (...args) => errors.push(args);
+
+  try {
+    await instance.processStream(
+      {
+        read: async () => {
+          throw new TypeError('terminated');
+        },
+      },
+      null,
+      null,
+      { aborted: false },
+    );
+  } finally {
+    console.warn = originalWarn;
+    console.error = originalError;
+  }
+
+  assert.equal(reconnectCalls, 1);
+  assert.equal(
+    errors.some((args) => args[0] === 'Unexpected stream error:'),
+    false,
+  );
+  assert.equal(
+    warnings.some((args) => args[0] === 'Transient stream close:'),
+    true,
+  );
+});
+
+test('controlled stream stops do not reconnect', async () => {
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
+
+  for (const reason of ['manual', 'unsubscribe', 'idle', 'client.close']) {
+    let reconnectCalls = 0;
+    let aborted = false;
+
+    const instance = {
+      ...streamFactory({
+        live: true,
+        endpoint: ['marketdata', 'stream', 'quotes', 'TSLA'],
+        tokens: { access: 'token' },
+        onData: () => {},
+        onError: () => {},
+      }),
+      abortController: {
+        signal: {
+          get aborted() {
+            return aborted;
+          },
+        },
+        abort: () => {
+          aborted = true;
+        },
+      },
+      scheduleReconnect: async () => {
+        reconnectCalls += 1;
+      },
+    };
+
+    instance.stopStream(reason);
+
+    await instance.processStream(
+      {
+        read: async () => {
+          throw Object.assign(new Error('abort'), { name: 'AbortError' });
+        },
+      },
+      null,
+      null,
+      { aborted: true },
+    );
+
+    assert.equal(instance.shouldReconnect, false);
+    assert.equal(instance.stopReason, reason);
+    assert.equal(reconnectCalls, 0);
+  }
+});
+
+test('transient stream reconnect uses one bounded timer', async () => {
+  const timers = [];
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: () => {},
+  });
+
+  let aborts = 0;
+  const instance = streamFactory({
+    live: true,
+    endpoint: ['marketdata', 'stream', 'quotes', 'TSLA'],
+    tokens: { access: 'token' },
+    onData: () => {},
+    onError: () => {},
+  });
+  instance.abortController = {
+    signal: { aborted: false },
+    abort: () => {
+      aborts += 1;
+    },
+  };
+
+  await instance.scheduleReconnect();
+  await instance.scheduleReconnect();
+
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, 5000);
+  assert.equal(instance.reconnectDelay, 10000);
+  assert.equal(aborts, 1);
+
+  instance.reconnectTimer = null;
+  instance.reconnectDelay = instance.maxReconnectDelay;
+  await instance.scheduleReconnect();
+
+  assert.equal(timers.length, 2);
+  assert.equal(timers[1].delay, instance.maxReconnectDelay);
+  assert.equal(instance.reconnectDelay, instance.maxReconnectDelay);
+});
+
+test('GoAway reconnects while INVALID SYMBOL remains permanent stop', async () => {
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
+  const stopReasons = [];
+  let reconnectCalls = 0;
+
+  const instance = {
+    ...streamFactory({
+      live: true,
+      endpoint: ['marketdata', 'stream', 'quotes', 'TSLA'],
+      tokens: { access: 'token' },
+      onData: () => {},
+      onError: () => {},
+    }),
+    scheduleReconnect: async () => {
+      reconnectCalls += 1;
+    },
+    stopStream(reason = 'unknown') {
+      stopReasons.push(reason);
+      this.shouldReconnect = false;
+      this.stopReason = reason;
+    },
+  };
+
+  assert.equal(instance.handlePacket({ StreamStatus: 'GoAway' }, null, null), false);
+  assert.equal(reconnectCalls, 1);
+  assert.deepEqual(stopReasons, []);
+
+  instance.shouldReconnect = true;
+  assert.equal(
+    instance.handlePacket({ Error: 'INVALID SYMBOL', Message: 'bad symbol', Symbol: 'BAD' }, null, () => {}),
+    false,
+  );
+  assert.equal(reconnectCalls, 1);
+  assert.deepEqual(stopReasons, ['permanent-error']);
+});
+
 test('serializeError preserves upstream error metadata', async () => {
   const streams = loadExpressionModule('application/domain/ts/streams.js', {});
 
