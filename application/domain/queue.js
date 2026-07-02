@@ -56,7 +56,10 @@
     this.send(task, finish);
   },
   takeNext() {
-    const { task, start } = this.queue.shift();
+    const item = this.queue.shift();
+    if (!item) return;
+    const { task, start } = item;
+
     if (this.waitTimeout !== Infinity) {
       if (Date.now() - start > this.waitTimeout) {
         const error = new Error('Waiting timed out');
@@ -69,8 +72,12 @@
         return;
       }
     }
-    if (this.count < this.concurrency) this.next(task);
-    else this.queue.unshift({ task, start: Date.now() });
+
+    if (this.count < this.concurrency) {
+      this.next(task);
+    } else {
+      this.queue.unshift({ task, start });
+    }
   },
   addTask(task) {
     this.queue.push({ task, start: Date.now() });
