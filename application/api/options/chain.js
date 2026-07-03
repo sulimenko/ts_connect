@@ -49,7 +49,6 @@
     const proximity = Math.max(0, Number(range) || 0);
     const interval = Math.max(1, Number(strikeInterval) || 1);
     const chainData = {
-      strikeProximity: proximity,
       spreadType: 'Single',
       strikeInterval: interval,
       enableGreeks: toBoolean(enableGreeks),
@@ -60,7 +59,10 @@
     if (expiration) chainData.expiration = expiration;
     if (expiration2) chainData.expiration2 = expiration2;
     const centerPrice = toNumber(priceCenter);
-    if (centerPrice !== null) chainData.priceCenter = centerPrice;
+    if (strikeRange !== 'All') {
+      chainData.strikeProximity = proximity;
+      if (centerPrice !== null) chainData.priceCenter = centerPrice;
+    }
 
     if (!streamMode) {
       const endpoint = ['marketdata', 'stream', 'options', 'chains', chainSymbol];
