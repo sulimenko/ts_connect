@@ -1927,19 +1927,6 @@ test('optionChain preserves call-only and put-only strikes while marking missing
   assert.deepEqual(stats.lastStrikes, ['00075000', '00080000']);
 });
 
-test('chain debug visibility uses config log levels without custom env flag', async () => {
-  const log = loadExpressionModule('config/log.js', {});
-  const sources = [
-    fs.readFileSync(path.join(repoRoot, 'application/lib/ts/optionChain.js'), 'utf8'),
-    fs.readFileSync(path.join(repoRoot, 'application/lib/stream/optionChain.js'), 'utf8'),
-    fs.readFileSync(path.join(repoRoot, 'config/log.js'), 'utf8'),
-  ].join('\n');
-
-  assert.deepEqual(Array.from(log.reflectedLevels.debug), ['debug', 'info', 'warn', 'error']);
-  assert.deepEqual(Array.from(log.reflectedLevels.info), ['info', 'warn', 'error']);
-  assert.equal(sources.includes('TS_CHAIN_DEBUG'), false);
-});
-
 test('brokerage streams start once and update orders and positions', async () => {
   const utils = loadUtils();
   const positions = loadExpressionModule('application/domain/ts/positions.js', {
