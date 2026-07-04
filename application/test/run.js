@@ -175,9 +175,9 @@ test('options.chain strips riskFreeRate from snapshot and stream requests', asyn
     stream: true,
   });
 
-  assert.equal(snapshotCalls[1].data.strikeProximity, 20);
+  assert.equal(snapshotCalls[1].data.strikeProximity, 1000);
   assert.equal(snapshotCalls[1].data.priceCenter, undefined);
-  assert.equal(streamCalls[1].data.strikeProximity, 20);
+  assert.equal(streamCalls[1].data.strikeProximity, 1000);
   assert.equal(streamCalls[1].data.priceCenter, undefined);
 
   await api.method({
@@ -194,9 +194,9 @@ test('options.chain strips riskFreeRate from snapshot and stream requests', asyn
     stream: true,
   });
 
-  assert.equal(snapshotCalls[2].data.strikeProximity, undefined);
+  assert.equal(snapshotCalls[2].data.strikeProximity, 1000);
   assert.equal(snapshotCalls[2].data.priceCenter, undefined);
-  assert.equal(streamCalls[2].data.strikeProximity, undefined);
+  assert.equal(streamCalls[2].data.strikeProximity, 1000);
   assert.equal(streamCalls[2].data.priceCenter, undefined);
 });
 
@@ -1316,10 +1316,31 @@ test('stream addBarchart emits canonical symbol for TS-style input', async () =>
 
 test('stream optionChain emits root instrument payload while preserving chain symbols', async () => {
   const utils = loadUtils();
+  const debugCalls = [];
   let emitted = null;
+  let now = 0;
   let streamChainsArgs = null;
+  const timers = [];
+  let stopHandle = null;
 
   const optionChain = loadExpressionModule('application/lib/stream/optionChain.js', {
+    Date: {
+      now: () => now,
+    },
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+    console: {
+      debug: (...args) => debugCalls.push(args),
+      error: () => {},
+      info: () => {},
+      warn: () => {},
+    },
     lib: {
       utils,
       ts: {
@@ -1358,6 +1379,9 @@ test('stream optionChain emits root instrument payload while preserving chain sy
                 ImpliedVolatility: '0.5',
                 Volume: 11,
               });
+              await args.onData({
+                Legs: [{ Symbol: 'CRWV 280121P75', Expiration: '2028-01-19T00:00:00Z', OptionType: 'Put' }],
+              });
               return 'chains-registered-key';
             },
             stopStoredStream: async () => {},
@@ -1365,9 +1389,9 @@ test('stream optionChain emits root instrument payload while preserving chain sy
         },
         streams: {
           subscribe: async ({ start }) => {
-            await start({
+            stopHandle = await start({
               emit: (eventName, payload) => {
-                emitted = { eventName, payload };
+                if (!emitted) emitted = { eventName, payload };
               },
               notifyError: () => {},
             });
@@ -1402,6 +1426,20 @@ test('stream optionChain emits root instrument payload while preserving chain sy
   assert.equal(emitted.payload.instrument.currency, 'USD');
   assert.equal(emitted.payload.symbol, undefined);
   assert.equal(emitted.payload.chain['00080000'].C.symbol_raw, 'CRWV280121C00080000');
+  assert.equal(timers[0].delay, 15000);
+  now = 42;
+  await stopHandle.stop({ reason: 'test.cleanup' });
+
+  assert.equal(debugCalls.length, 1);
+  assert.equal(debugCalls[0][0], 'stream/chains observed stats');
+  const stats = JSON.parse(JSON.stringify(debugCalls[0][1]));
+  for (const key of ['observedStrikes', 'observedLegs', 'minStrike', 'maxStrike', 'firstStrikes', 'lastStrikes']) {
+    assert.ok(Object.hasOwn(stats, key));
+  }
+  assert.equal(stats.phase, 'test.cleanup');
+  assert.equal(stats.observedStrikes, 2);
+  assert.equal(stats.observedLegs, 2);
+  assert.deepEqual(stats.firstStrikes, ['00075000', '00080000']);
 });
 
 test('stream clear returns removed entries and total count', async () => {
@@ -1800,6 +1838,7 @@ test('optionChain All waits for idle and keeps chain limited to real packets', a
 
 test('optionChain preserves call-only and put-only strikes while marking missing legs partial', async () => {
   const utils = loadUtils();
+  const debugCalls = [];
   let timer = null;
   const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
     setTimeout: (fn) => {
@@ -1807,6 +1846,12 @@ test('optionChain preserves call-only and put-only strikes while marking missing
       return 1;
     },
     clearTimeout: () => {},
+    console: {
+      debug: (...args) => debugCalls.push(args),
+      error: () => {},
+      info: () => {},
+      warn: () => {},
+    },
     lib: makeLib({
       utils,
       ts: {
@@ -1868,6 +1913,31 @@ test('optionChain preserves call-only and put-only strikes while marking missing
   assert.equal(result.metadata.actualLegs, 2);
   assert.equal(result.metadata.partial, true);
   assert.equal(result.metadata.reason, 'timeout');
+
+  assert.equal(debugCalls.length, 1);
+  assert.equal(debugCalls[0][0], 'options/chain snapshot stats');
+  const stats = JSON.parse(JSON.stringify(debugCalls[0][1]));
+  for (const key of ['actualStrikes', 'expectedStrikes', 'minStrike', 'maxStrike', 'firstStrikes', 'lastStrikes']) {
+    assert.ok(Object.hasOwn(stats, key));
+  }
+  assert.equal(stats.actualStrikes, 2);
+  assert.equal(stats.actualLegs, 2);
+  assert.equal(stats.minStrike, '00075000');
+  assert.equal(stats.maxStrike, '00080000');
+  assert.deepEqual(stats.lastStrikes, ['00075000', '00080000']);
+});
+
+test('chain debug visibility uses config log levels without custom env flag', async () => {
+  const log = loadExpressionModule('config/log.js', {});
+  const sources = [
+    fs.readFileSync(path.join(repoRoot, 'application/lib/ts/optionChain.js'), 'utf8'),
+    fs.readFileSync(path.join(repoRoot, 'application/lib/stream/optionChain.js'), 'utf8'),
+    fs.readFileSync(path.join(repoRoot, 'config/log.js'), 'utf8'),
+  ].join('\n');
+
+  assert.deepEqual(Array.from(log.reflectedLevels.debug), ['debug', 'info', 'warn', 'error']);
+  assert.deepEqual(Array.from(log.reflectedLevels.info), ['info', 'warn', 'error']);
+  assert.equal(sources.includes('TS_CHAIN_DEBUG'), false);
 });
 
 test('brokerage streams start once and update orders and positions', async () => {

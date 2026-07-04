@@ -46,7 +46,9 @@
     const symbolRequired = !actionValue || actionValue === 'subscribe';
     if (!chainSymbol && (symbolRequired || !chainKey)) return new DomainError('ESYMBOL');
 
-    const proximity = Math.max(0, Number(range) || 0);
+    const requestedProximity = Math.max(0, Number(range) || 0);
+    const allStrikeProximity = 1000;
+    const proximity = strikeRange === 'All' ? allStrikeProximity : requestedProximity;
     const interval = Math.max(1, Number(strikeInterval) || 1);
     const chainData = {
       spreadType: 'Single',
@@ -60,7 +62,7 @@
     if (expiration2) chainData.expiration2 = expiration2;
     const centerPrice = toNumber(priceCenter);
     if (strikeRange === 'All') {
-      if (proximity > 0) chainData.strikeProximity = proximity;
+      chainData.strikeProximity = proximity;
     } else {
       chainData.strikeProximity = proximity;
       if (centerPrice !== null) chainData.priceCenter = centerPrice;

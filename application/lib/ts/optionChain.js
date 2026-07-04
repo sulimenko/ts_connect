@@ -24,6 +24,20 @@ async ({ endpoint, symbol, data }) => {
   const all = data.strikeRange === 'All';
   let expectedStrikes = proximity > 0 ? proximity * 2 : null;
   let expectedSource = proximity > 0 ? 'strikeProximity' : 'unknown';
+  const strikeStats = (chain) => {
+    const strikes = Object.keys(chain).sort((a, b) => Number(a) - Number(b));
+    const strikeValues = strikes.map((strike) => Number(strike) / 1000);
+    const minStrike = strikes[0] ?? null;
+    const maxStrike = strikes.at(-1) ?? null;
+    return {
+      minStrike,
+      maxStrike,
+      minStrikeValue: strikeValues[0] ?? null,
+      maxStrikeValue: strikeValues.at(-1) ?? null,
+      firstStrikes: strikes.slice(0, 10),
+      lastStrikes: strikes.slice(-10),
+    };
+  };
 
   if (all && typeof lib.ts.send === 'function') {
     try {
@@ -151,6 +165,23 @@ async ({ endpoint, symbol, data }) => {
       }
 
       await stop(streamKey);
+
+      console.debug('options/chain snapshot stats', {
+        symbol: response.symbol,
+        expiration: response.expiration,
+        reason: response.metadata.reason,
+        durationMs: Date.now() - startedAt,
+        lastPacketAgeMs: lastPacketAt === null ? null : Date.now() - lastPacketAt,
+        partial: response.metadata.partial,
+        expectedSource: response.metadata.expectedSource,
+        expectedStrikes: response.metadata.expectedStrikes,
+        actualStrikes: response.metadata.actualStrikes,
+        actualLegs: response.metadata.actualLegs,
+        missingStrikes: response.metadata.missingStrikes,
+        missingLegs: response.metadata.missingLegs,
+        requested: response.metadata.requested,
+        ...strikeStats(response.chain),
+      });
 
       if (error) reject(error);
       else resolve(result);
