@@ -7,6 +7,7 @@
   reconnectTimer: null,
   timeoutHeartbeat: null,
   shouldReconnect: true,
+  stopReason: null,
 
   endpointName() {
     return this.currentParams.endpoint.join('/');
@@ -42,6 +43,23 @@
     if (!this.abortController || this.abortController.signal.aborted) return;
     console.log('Stopping stream...', this.endpointName(), 'reason:', reason);
     this.abortController.abort();
+  },
+
+  classifyReadError(err, signal) {
+    if (err?.name === 'AbortError' || signal.aborted || !this.shouldReconnect) return 'controlled';
+
+    const message = `${err?.message ?? err}`.toLowerCase();
+    if (
+      err?.name === 'TypeError' ||
+      message.includes('terminated') ||
+      message.includes('socket') ||
+      message.includes('network') ||
+      message.includes('connection')
+    ) {
+      return 'transient-close';
+    }
+
+    return 'unexpected';
   },
 
   async initiateStream() {
@@ -153,8 +171,14 @@
         }
       }
     } catch (err) {
-      if (err.name === 'AbortError' || signal.aborted || !this.shouldReconnect) {
-        console.warn('Stream stopped gracefully:', this.endpointName());
+      const classification = this.classifyReadError(err, signal);
+      if (classification === 'controlled') {
+        console.warn('Stream stopped gracefully:', this.endpointName(), 'reason:', this.stopReason ?? 'controlled');
+        return;
+      }
+      if (classification === 'transient-close') {
+        console.warn('Transient stream close:', this.endpointName(), err);
+        void this.scheduleReconnect();
         return;
       }
       console.error('Unexpected stream error:', this.endpointName(), err);
@@ -207,6 +231,7 @@
 
   stopStream(reason = 'unknown') {
     this.shouldReconnect = false;
+    this.stopReason = reason;
     this.clearReconnectTimer();
     this.clearHeartbeatTimer();
     this.abortActiveStream(reason);

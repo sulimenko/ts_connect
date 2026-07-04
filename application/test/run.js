@@ -252,6 +252,185 @@ test('stream packet Failed/Internal server error is permanent and stops reconnec
   assert.equal(errors[0].symbol, 'TSLA');
 });
 
+test('stream read terminated by socket close is transient and does not log unexpected error', async () => {
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
+  const warnings = [];
+  const errors = [];
+  let reconnectCalls = 0;
+
+  const instance = {
+    ...streamFactory({
+      live: true,
+      endpoint: ['marketdata', 'stream', 'quotes', 'TSLA'],
+      tokens: { access: 'token' },
+      onData: () => {},
+      onError: () => {},
+    }),
+    scheduleReconnect: async () => {
+      reconnectCalls += 1;
+    },
+  };
+
+  const originalWarn = console.warn;
+  const originalError = console.error;
+  console.warn = (...args) => warnings.push(args);
+  console.error = (...args) => errors.push(args);
+
+  try {
+    await instance.processStream(
+      {
+        read: async () => {
+          throw new TypeError('terminated');
+        },
+      },
+      null,
+      null,
+      { aborted: false },
+    );
+  } finally {
+    console.warn = originalWarn;
+    console.error = originalError;
+  }
+
+  assert.equal(reconnectCalls, 1);
+  assert.equal(
+    errors.some((args) => args[0] === 'Unexpected stream error:'),
+    false,
+  );
+  assert.equal(
+    warnings.some((args) => args[0] === 'Transient stream close:'),
+    true,
+  );
+});
+
+test('controlled stream stops do not reconnect', async () => {
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
+
+  for (const reason of ['manual', 'unsubscribe', 'idle', 'client.close']) {
+    let reconnectCalls = 0;
+    let aborted = false;
+
+    const instance = {
+      ...streamFactory({
+        live: true,
+        endpoint: ['marketdata', 'stream', 'quotes', 'TSLA'],
+        tokens: { access: 'token' },
+        onData: () => {},
+        onError: () => {},
+      }),
+      abortController: {
+        signal: {
+          get aborted() {
+            return aborted;
+          },
+        },
+        abort: () => {
+          aborted = true;
+        },
+      },
+      scheduleReconnect: async () => {
+        reconnectCalls += 1;
+      },
+    };
+
+    instance.stopStream(reason);
+
+    await instance.processStream(
+      {
+        read: async () => {
+          throw Object.assign(new Error('abort'), { name: 'AbortError' });
+        },
+      },
+      null,
+      null,
+      { aborted: true },
+    );
+
+    assert.equal(instance.shouldReconnect, false);
+    assert.equal(instance.stopReason, reason);
+    assert.equal(reconnectCalls, 0);
+  }
+});
+
+test('transient stream reconnect uses one bounded timer', async () => {
+  const timers = [];
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: () => {},
+  });
+
+  let aborts = 0;
+  const instance = streamFactory({
+    live: true,
+    endpoint: ['marketdata', 'stream', 'quotes', 'TSLA'],
+    tokens: { access: 'token' },
+    onData: () => {},
+    onError: () => {},
+  });
+  instance.abortController = {
+    signal: { aborted: false },
+    abort: () => {
+      aborts += 1;
+    },
+  };
+
+  await instance.scheduleReconnect();
+  await instance.scheduleReconnect();
+
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, 5000);
+  assert.equal(instance.reconnectDelay, 10000);
+  assert.equal(aborts, 1);
+
+  instance.reconnectTimer = null;
+  instance.reconnectDelay = instance.maxReconnectDelay;
+  await instance.scheduleReconnect();
+
+  assert.equal(timers.length, 2);
+  assert.equal(timers[1].delay, instance.maxReconnectDelay);
+  assert.equal(instance.reconnectDelay, instance.maxReconnectDelay);
+});
+
+test('GoAway reconnects while INVALID SYMBOL remains permanent stop', async () => {
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
+  const stopReasons = [];
+  let reconnectCalls = 0;
+
+  const instance = {
+    ...streamFactory({
+      live: true,
+      endpoint: ['marketdata', 'stream', 'quotes', 'TSLA'],
+      tokens: { access: 'token' },
+      onData: () => {},
+      onError: () => {},
+    }),
+    scheduleReconnect: async () => {
+      reconnectCalls += 1;
+    },
+    stopStream(reason = 'unknown') {
+      stopReasons.push(reason);
+      this.shouldReconnect = false;
+      this.stopReason = reason;
+    },
+  };
+
+  assert.equal(instance.handlePacket({ StreamStatus: 'GoAway' }, null, null), false);
+  assert.equal(reconnectCalls, 1);
+  assert.deepEqual(stopReasons, []);
+
+  instance.shouldReconnect = true;
+  assert.equal(
+    instance.handlePacket({ Error: 'INVALID SYMBOL', Message: 'bad symbol', Symbol: 'BAD' }, null, () => {}),
+    false,
+  );
+  assert.equal(reconnectCalls, 1);
+  assert.deepEqual(stopReasons, ['permanent-error']);
+});
+
 test('serializeError preserves upstream error metadata', async () => {
   const streams = loadExpressionModule('application/domain/ts/streams.js', {});
 
@@ -497,6 +676,37 @@ test('readOptionChain and positions share the same canonical option symbol contr
   assert.equal(byInternal.get('Quantity'), '2');
   assert.equal(positions.clearPosition({ account: 'A1', symbol: 'CRWV280121C00080000' }), true);
   assert.equal(positions.getPosition({ account: 'A1', symbol: 'CRWV 280121C80' }), null);
+});
+
+test('readOptionChain keeps structurally valid rows with missing quotes and greeks', async () => {
+  const utils = loadUtils();
+  const readOptionChain = loadExpressionModule('application/lib/ts/readOptionChain.js', {
+    lib: { utils },
+  });
+
+  const option = readOptionChain({
+    message: {
+      Legs: [
+        {
+          Symbol: 'CRWV 280121P75',
+          Expiration: '2028-01-21T00:00:00Z',
+          OptionType: 'Put',
+        },
+      ],
+    },
+  });
+
+  assert.ok(option);
+  assert.equal(option.symbol_raw, 'CRWV280121P00075000');
+  assert.equal(option.strike, '00075000');
+  assert.equal(option.type, 'P');
+  assert.equal(option.ask, null);
+  assert.equal(option.bid, null);
+  assert.equal(option.trade_price, null);
+  assert.equal(option.delta, null);
+  assert.equal(option.gamma, null);
+  assert.equal(option.theta, null);
+  assert.equal(option.vega, null);
 });
 
 test('marketdata quotes and order execution use the shared symbol formatter', async () => {
@@ -1232,6 +1442,266 @@ test('optionChain rejects object errors with a readable message', async () => {
       return true;
     },
   );
+});
+
+test('optionChain snapshot times out with no option packets', async () => {
+  let timer = null;
+  let keys = null;
+  let resolveKey = null;
+  const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
+    setTimeout: (fn) => {
+      timer = () => fn();
+      return 1;
+    },
+    clearTimeout: () => {},
+    lib: makeLib({
+      ts: {
+        readOptionChain: () => null,
+      },
+    }),
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            stopStoredStream: async ({ key }) => {
+              keys = key;
+            },
+            streamChains: () =>
+              new Promise((resolve) => {
+                resolveKey = resolve;
+              }),
+          }),
+        },
+      },
+    },
+  });
+
+  const pending = helper({
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'TSLA'],
+    symbol: 'TSLA',
+    data: {
+      strikeProximity: 0,
+      optionType: 'All',
+    },
+  });
+
+  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  timer();
+  const result = await pending;
+  resolveKey('chains-key');
+  await Promise.resolve();
+
+  assert.equal(result.strikes, 0);
+  assert.deepEqual(Object.keys(result.chain), []);
+  assert.equal(result.metadata.actualStrikes, 0);
+  assert.equal(result.metadata.actualLegs, 0);
+  assert.equal(result.metadata.partial, true);
+  assert.equal(result.metadata.reason, 'timeout');
+  assert.equal(keys, 'chains-key');
+});
+
+test('optionChain invalid packets still timeout and clean up stream', async () => {
+  let timer = null;
+  const keys = [];
+  const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
+    setTimeout: (fn) => {
+      timer = () => fn();
+      return 1;
+    },
+    clearTimeout: () => {},
+    lib: makeLib({
+      ts: {
+        readOptionChain: () => null,
+      },
+    }),
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            stopStoredStream: async ({ key }) => {
+              keys.push(key);
+            },
+            streamChains: async ({ onData }) => {
+              onData({ Error: 'bad row' });
+              return 'chains-key';
+            },
+          }),
+        },
+      },
+    },
+  });
+
+  const pending = helper({
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'TSLA'],
+    symbol: 'TSLA',
+    data: {
+      strikeProximity: 0,
+      optionType: 'All',
+    },
+  });
+
+  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  timer();
+  const result = await pending;
+  timer();
+
+  assert.equal(result.strikes, 0);
+  assert.deepEqual(Object.keys(result.chain), []);
+  assert.equal(result.metadata.reason, 'timeout');
+  assert.deepEqual(keys, ['chains-key']);
+});
+
+test('optionChain returns partial metadata instead of masking incomplete chain', async () => {
+  const utils = loadUtils();
+  const sent = [];
+  const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
+    setTimeout: (fn) => {
+      fn();
+      return 1;
+    },
+    clearTimeout: () => {},
+    lib: makeLib({
+      utils,
+      ts: {
+        readOptionChain: loadExpressionModule('application/lib/ts/readOptionChain.js', {
+          lib: { utils },
+        }),
+        send: async (args) => {
+          sent.push(args);
+          return {
+            Strikes: [
+              ['70', '75'],
+              ['75', '80'],
+            ],
+          };
+        },
+      },
+    }),
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            tokens: { access: 'token' },
+            stopStoredStream: async () => {},
+            streamChains: async ({ onData }) => {
+              onData({
+                Legs: [
+                  {
+                    Symbol: 'CRWV 280121C80',
+                    Expiration: '2028-01-21T00:00:00Z',
+                    OptionType: 'Call',
+                  },
+                ],
+              });
+              return 'chains-key';
+            },
+          }),
+        },
+      },
+    },
+  });
+
+  const result = await helper({
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'CRWV'],
+    symbol: 'CRWV',
+    data: {
+      strikeProximity: 0,
+      strikeRange: 'All',
+      strikeInterval: 1,
+      optionType: 'All',
+      expiration: '2028-01-21',
+    },
+  });
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].endpoint.join('/'), 'marketdata/options/strikes/CRWV');
+  assert.equal(result.symbol, 'CRWV');
+  assert.equal(result.expiration, '2028-01-21');
+  assert.equal(result.strikes, 1);
+  assert.deepEqual(Object.keys(result.chain), ['00080000']);
+  assert.equal(result.chain['00080000'].C.symbol_raw, 'CRWV280121C00080000');
+  assert.equal(result.chain['00080000'].P, undefined);
+  assert.equal(result.metadata.expectedStrikes, 3);
+  assert.equal(result.metadata.actualStrikes, 1);
+  assert.equal(result.metadata.expectedLegsPerStrike, 2);
+  assert.equal(result.metadata.actualLegs, 1);
+  assert.equal(result.metadata.partial, true);
+  assert.equal(result.metadata.source, 'stream-snapshot');
+  assert.equal(result.metadata.reason, 'timeout');
+  assert.equal(result.metadata.requested.strikeRange, 'All');
+  assert.equal(result.metadata.requested.strikeProximity, 0);
+});
+
+test('optionChain preserves call-only and put-only strikes while marking missing legs partial', async () => {
+  const utils = loadUtils();
+  let timer = null;
+  const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
+    setTimeout: (fn) => {
+      timer = () => fn();
+      return 1;
+    },
+    clearTimeout: () => {},
+    lib: makeLib({
+      utils,
+      ts: {
+        readOptionChain: loadExpressionModule('application/lib/ts/readOptionChain.js', {
+          lib: { utils },
+        }),
+      },
+    }),
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            stopStoredStream: async () => {},
+            streamChains: async ({ onData }) => {
+              onData({
+                Legs: [
+                  {
+                    Symbol: 'CRWV 280121C80',
+                    Expiration: '2028-01-21T00:00:00Z',
+                    OptionType: 'Call',
+                  },
+                ],
+              });
+              onData({
+                Legs: [
+                  {
+                    Symbol: 'CRWV 280121P75',
+                    Expiration: '2028-01-21T00:00:00Z',
+                    OptionType: 'Put',
+                  },
+                ],
+              });
+              return 'chains-key';
+            },
+          }),
+        },
+      },
+    },
+  });
+
+  const pending = helper({
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'CRWV'],
+    symbol: 'CRWV',
+    data: {
+      strikeProximity: 2,
+      strikeRange: 'NearTheMoney',
+      optionType: 'All',
+    },
+  });
+  for (let i = 0; i < 4; i += 1) await Promise.resolve();
+  timer();
+  const result = await pending;
+
+  assert.equal(result.strikes, 2);
+  assert.equal(result.chain['00080000'].C.symbol_raw, 'CRWV280121C00080000');
+  assert.equal(result.chain['00075000'].P.symbol_raw, 'CRWV280121P00075000');
+  assert.equal(result.metadata.expectedStrikes, 4);
+  assert.equal(result.metadata.actualStrikes, 2);
+  assert.equal(result.metadata.actualLegs, 2);
+  assert.equal(result.metadata.partial, true);
+  assert.equal(result.metadata.reason, 'timeout');
 });
 
 test('brokerage streams start once and update orders and positions', async () => {
