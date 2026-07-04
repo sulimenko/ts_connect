@@ -144,6 +144,7 @@ test('options.chain strips riskFreeRate from snapshot and stream requests', asyn
   });
   assert.equal(snapshotCalls.length, 1);
   assert.equal(snapshotCalls[0].data.riskFreeRate, undefined);
+  assert.equal(snapshotCalls[0].data.strikeProximity, 94);
   assert.equal(snapshotCalls[0].data.priceCenter, 123.45);
 
   await api.method({
@@ -157,6 +158,7 @@ test('options.chain strips riskFreeRate from snapshot and stream requests', asyn
   });
   assert.equal(streamCalls.length, 1);
   assert.equal(streamCalls[0].data.riskFreeRate, undefined);
+  assert.equal(streamCalls[0].data.strikeProximity, 94);
   assert.equal(streamCalls[0].data.priceCenter, 123.45);
 
   await api.method({
@@ -173,10 +175,29 @@ test('options.chain strips riskFreeRate from snapshot and stream requests', asyn
     stream: true,
   });
 
-  assert.equal(snapshotCalls[1].data.strikeProximity, undefined);
+  assert.equal(snapshotCalls[1].data.strikeProximity, 20);
   assert.equal(snapshotCalls[1].data.priceCenter, undefined);
-  assert.equal(streamCalls[1].data.strikeProximity, undefined);
+  assert.equal(streamCalls[1].data.strikeProximity, 20);
   assert.equal(streamCalls[1].data.priceCenter, undefined);
+
+  await api.method({
+    symbol: 'TSLA',
+    range: 0,
+    priceCenter: 123.45,
+    strikeRange: 'All',
+  });
+  await api.method({
+    symbol: 'TSLA',
+    range: 0,
+    priceCenter: 123.45,
+    strikeRange: 'All',
+    stream: true,
+  });
+
+  assert.equal(snapshotCalls[2].data.strikeProximity, undefined);
+  assert.equal(snapshotCalls[2].data.priceCenter, undefined);
+  assert.equal(streamCalls[2].data.strikeProximity, undefined);
+  assert.equal(streamCalls[2].data.priceCenter, undefined);
 });
 
 test('stream helper builds stream key from cleaned option chain payload', async () => {

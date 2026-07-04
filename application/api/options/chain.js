@@ -59,7 +59,9 @@
     if (expiration) chainData.expiration = expiration;
     if (expiration2) chainData.expiration2 = expiration2;
     const centerPrice = toNumber(priceCenter);
-    if (strikeRange !== 'All') {
+    if (strikeRange === 'All') {
+      if (proximity > 0) chainData.strikeProximity = proximity;
+    } else {
       chainData.strikeProximity = proximity;
       if (centerPrice !== null) chainData.priceCenter = centerPrice;
     }
