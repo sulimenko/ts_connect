@@ -140,9 +140,11 @@ test('options.chain strips riskFreeRate from snapshot and stream requests', asyn
     range: 94,
     riskFreeRate: 0,
     priceCenter: 123.45,
+    strikeRange: 'NearTheMoney',
   });
   assert.equal(snapshotCalls.length, 1);
   assert.equal(snapshotCalls[0].data.riskFreeRate, undefined);
+  assert.equal(snapshotCalls[0].data.strikeProximity, 94);
   assert.equal(snapshotCalls[0].data.priceCenter, 123.45);
 
   await api.method({
@@ -151,11 +153,51 @@ test('options.chain strips riskFreeRate from snapshot and stream requests', asyn
     range: 94,
     riskFreeRate: 0,
     priceCenter: 123.45,
+    strikeRange: 'NearTheMoney',
     stream: true,
   });
   assert.equal(streamCalls.length, 1);
   assert.equal(streamCalls[0].data.riskFreeRate, undefined);
+  assert.equal(streamCalls[0].data.strikeProximity, 94);
   assert.equal(streamCalls[0].data.priceCenter, 123.45);
+
+  await api.method({
+    symbol: 'TSLA',
+    range: 20,
+    priceCenter: 123.45,
+    strikeRange: 'All',
+  });
+  await api.method({
+    symbol: 'TSLA',
+    range: 20,
+    priceCenter: 123.45,
+    strikeRange: 'All',
+    stream: true,
+  });
+
+  assert.equal(snapshotCalls[1].data.strikeProximity, 1000);
+  assert.equal(snapshotCalls[1].data.priceCenter, undefined);
+  assert.equal(streamCalls[1].data.strikeProximity, 1000);
+  assert.equal(streamCalls[1].data.priceCenter, undefined);
+
+  await api.method({
+    symbol: 'TSLA',
+    range: 0,
+    priceCenter: 123.45,
+    strikeRange: 'All',
+  });
+  await api.method({
+    symbol: 'TSLA',
+    range: 0,
+    priceCenter: 123.45,
+    strikeRange: 'All',
+    stream: true,
+  });
+
+  assert.equal(snapshotCalls[2].data.strikeProximity, 1000);
+  assert.equal(snapshotCalls[2].data.priceCenter, undefined);
+  assert.equal(streamCalls[2].data.strikeProximity, 1000);
+  assert.equal(streamCalls[2].data.priceCenter, undefined);
 });
 
 test('stream helper builds stream key from cleaned option chain payload', async () => {
@@ -460,6 +502,42 @@ test('serializeError preserves upstream error metadata', async () => {
   assert.equal(errorResult.details, 'more detail');
   assert.equal(errorResult.upstreamMessage, 'upstream detail');
   assert.equal(errorResult.symbol, 'TSLA');
+});
+
+test('managed stream touch reports resubscribe state explicitly', async () => {
+  const streams = loadExpressionModule('application/domain/ts/streams.js', {
+    lib: makeLib(),
+  });
+  const clientA = new EventEmitter();
+  const clientB = new EventEmitter();
+
+  const missing = streams.touch({ kind: 'chains', key: 'missing-key', client: clientA });
+  assert.equal(missing.active, false);
+  assert.equal(missing.resubscribeRequired, true);
+  assert.equal(missing.reason, 'missing');
+
+  await streams.subscribe({
+    kind: 'chains',
+    key: 'chains-key',
+    client: clientA,
+    start: async () => ({ stop: async () => {} }),
+  });
+
+  const inactive = streams.touch({ kind: 'chains', key: 'chains-key', client: clientB });
+  assert.equal(inactive.active, false);
+  assert.equal(inactive.resubscribeRequired, true);
+  assert.equal(inactive.reason, 'not-subscribed');
+
+  const active = streams.touch({ kind: 'chains', key: 'chains-key', client: clientA });
+  assert.equal(active.active, true);
+  assert.equal(active.resubscribeRequired, false);
+
+  await streams.unsubscribe({
+    kind: 'chains',
+    key: 'chains-key',
+    client: clientA,
+    reason: 'test.cleanup',
+  });
 });
 
 test('managed stream subscribe registers the client before synchronous startup emit', async () => {
@@ -1238,10 +1316,31 @@ test('stream addBarchart emits canonical symbol for TS-style input', async () =>
 
 test('stream optionChain emits root instrument payload while preserving chain symbols', async () => {
   const utils = loadUtils();
+  const debugCalls = [];
   let emitted = null;
+  let now = 0;
   let streamChainsArgs = null;
+  const timers = [];
+  let stopHandle = null;
 
   const optionChain = loadExpressionModule('application/lib/stream/optionChain.js', {
+    Date: {
+      now: () => now,
+    },
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+    console: {
+      debug: (...args) => debugCalls.push(args),
+      error: () => {},
+      info: () => {},
+      warn: () => {},
+    },
     lib: {
       utils,
       ts: {
@@ -1280,6 +1379,9 @@ test('stream optionChain emits root instrument payload while preserving chain sy
                 ImpliedVolatility: '0.5',
                 Volume: 11,
               });
+              await args.onData({
+                Legs: [{ Symbol: 'CRWV 280121P75', Expiration: '2028-01-19T00:00:00Z', OptionType: 'Put' }],
+              });
               return 'chains-registered-key';
             },
             stopStoredStream: async () => {},
@@ -1287,9 +1389,9 @@ test('stream optionChain emits root instrument payload while preserving chain sy
         },
         streams: {
           subscribe: async ({ start }) => {
-            await start({
+            stopHandle = await start({
               emit: (eventName, payload) => {
-                emitted = { eventName, payload };
+                if (!emitted) emitted = { eventName, payload };
               },
               notifyError: () => {},
             });
@@ -1324,6 +1426,20 @@ test('stream optionChain emits root instrument payload while preserving chain sy
   assert.equal(emitted.payload.instrument.currency, 'USD');
   assert.equal(emitted.payload.symbol, undefined);
   assert.equal(emitted.payload.chain['00080000'].C.symbol_raw, 'CRWV280121C00080000');
+  assert.equal(timers[0].delay, 15000);
+  now = 42;
+  await stopHandle.stop({ reason: 'test.cleanup' });
+
+  assert.equal(debugCalls.length, 1);
+  assert.equal(debugCalls[0][0], 'stream/chains observed stats');
+  const stats = JSON.parse(JSON.stringify(debugCalls[0][1]));
+  for (const key of ['observedStrikes', 'observedLegs', 'minStrike', 'maxStrike', 'firstStrikes', 'lastStrikes']) {
+    assert.ok(Object.hasOwn(stats, key));
+  }
+  assert.equal(stats.phase, 'test.cleanup');
+  assert.equal(stats.observedStrikes, 2);
+  assert.equal(stats.observedLegs, 2);
+  assert.deepEqual(stats.firstStrikes, ['00075000', '00080000']);
 });
 
 test('stream clear returns removed entries and total count', async () => {
@@ -1554,9 +1670,14 @@ test('optionChain invalid packets still timeout and clean up stream', async () =
 test('optionChain returns partial metadata instead of masking incomplete chain', async () => {
   const utils = loadUtils();
   const sent = [];
+  let now = 0;
+  let timer = null;
   const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
+    Date: {
+      now: () => now,
+    },
     setTimeout: (fn) => {
-      fn();
+      timer = fn;
       return 1;
     },
     clearTimeout: () => {},
@@ -1585,13 +1706,7 @@ test('optionChain returns partial metadata instead of masking incomplete chain',
             stopStoredStream: async () => {},
             streamChains: async ({ onData }) => {
               onData({
-                Legs: [
-                  {
-                    Symbol: 'CRWV 280121C80',
-                    Expiration: '2028-01-21T00:00:00Z',
-                    OptionType: 'Call',
-                  },
-                ],
+                Legs: [{ Symbol: 'CRWV 280121C80', Expiration: '2028-01-21T00:00:00Z', OptionType: 'Call' }],
               });
               return 'chains-key';
             },
@@ -1601,7 +1716,7 @@ test('optionChain returns partial metadata instead of masking incomplete chain',
     },
   });
 
-  const result = await helper({
+  const pending = helper({
     endpoint: ['marketdata', 'stream', 'options', 'chains', 'CRWV'],
     symbol: 'CRWV',
     data: {
@@ -1612,6 +1727,10 @@ test('optionChain returns partial metadata instead of masking incomplete chain',
       expiration: '2028-01-21',
     },
   });
+  for (let i = 0; i < 6; i += 1) await Promise.resolve();
+  now = 15000;
+  timer();
+  const result = await pending;
 
   assert.equal(sent.length, 1);
   assert.equal(sent[0].endpoint.join('/'), 'marketdata/options/strikes/CRWV');
@@ -1632,8 +1751,94 @@ test('optionChain returns partial metadata instead of masking incomplete chain',
   assert.equal(result.metadata.requested.strikeProximity, 0);
 });
 
+test('optionChain All waits for idle and keeps chain limited to real packets', async () => {
+  const utils = loadUtils();
+  let now = 0;
+  const timers = [];
+  let onDataRef = null;
+  const row = (Symbol, OptionType) => ({
+    Legs: [{ Symbol, Expiration: '2028-01-21T00:00:00Z', OptionType }],
+  });
+  const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
+    Date: {
+      now: () => now,
+    },
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+    lib: makeLib({
+      utils,
+      ts: {
+        readOptionChain: loadExpressionModule('application/lib/ts/readOptionChain.js', {
+          lib: { utils },
+        }),
+        send: async () => ({
+          Strikes: [['70', '75', '80', '85']],
+        }),
+      },
+    }),
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            tokens: { access: 'token' },
+            stopStoredStream: async () => {},
+            streamChains: async ({ onData }) => {
+              onDataRef = onData;
+              onData(row('CRWV 280121C80', 'Call'));
+              return 'chains-key';
+            },
+          }),
+        },
+      },
+    },
+  });
+
+  const pending = helper({
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'CRWV'],
+    symbol: 'CRWV',
+    data: {
+      strikeRange: 'All',
+      strikeInterval: 1,
+      optionType: 'All',
+      expiration: '2028-01-21',
+    },
+  });
+
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+  assert.equal(timers[0].delay, 5000);
+
+  const fire = (timer) => {
+    timer.cleared = true;
+    timer.fn();
+  };
+
+  now = 5000;
+  onDataRef(row('CRWV 280121P75', 'Put'));
+  fire(timers.find((item) => !item.cleared));
+  await Promise.resolve();
+
+  assert.equal(timers[timers.length - 1].delay, 1500);
+  now = 6500;
+  fire(timers.find((item) => !item.cleared));
+  const result = await pending;
+
+  assert.equal(result.strikes, 2);
+  assert.deepEqual(Object.keys(result.chain).sort(), ['00075000', '00080000']);
+  assert.equal(result.metadata.expectedStrikes, 4);
+  assert.equal(result.metadata.actualStrikes, 2);
+  assert.equal(result.metadata.partial, true);
+  assert.equal(result.metadata.reason, 'idle');
+});
+
 test('optionChain preserves call-only and put-only strikes while marking missing legs partial', async () => {
   const utils = loadUtils();
+  const debugCalls = [];
   let timer = null;
   const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
     setTimeout: (fn) => {
@@ -1641,6 +1846,12 @@ test('optionChain preserves call-only and put-only strikes while marking missing
       return 1;
     },
     clearTimeout: () => {},
+    console: {
+      debug: (...args) => debugCalls.push(args),
+      error: () => {},
+      info: () => {},
+      warn: () => {},
+    },
     lib: makeLib({
       utils,
       ts: {
@@ -1702,6 +1913,18 @@ test('optionChain preserves call-only and put-only strikes while marking missing
   assert.equal(result.metadata.actualLegs, 2);
   assert.equal(result.metadata.partial, true);
   assert.equal(result.metadata.reason, 'timeout');
+
+  assert.equal(debugCalls.length, 1);
+  assert.equal(debugCalls[0][0], 'options/chain snapshot stats');
+  const stats = JSON.parse(JSON.stringify(debugCalls[0][1]));
+  for (const key of ['actualStrikes', 'expectedStrikes', 'minStrike', 'maxStrike', 'firstStrikes', 'lastStrikes']) {
+    assert.ok(Object.hasOwn(stats, key));
+  }
+  assert.equal(stats.actualStrikes, 2);
+  assert.equal(stats.actualLegs, 2);
+  assert.equal(stats.minStrike, '00075000');
+  assert.equal(stats.maxStrike, '00080000');
+  assert.deepEqual(stats.lastStrikes, ['00075000', '00080000']);
 });
 
 test('brokerage streams start once and update orders and positions', async () => {

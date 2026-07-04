@@ -123,7 +123,14 @@
         streamKey: key,
         extra: { active: false, subscribers: 0, idleMs: this.resolveIdleMs(idleMs) },
       });
-      return { active: false, kind, streamKey: key, subscribers: 0 };
+      return {
+        active: false,
+        kind,
+        streamKey: key,
+        subscribers: 0,
+        resubscribeRequired: true,
+        reason: 'missing',
+      };
     }
 
     const subscription = entry.subscribers.get(client);
@@ -134,7 +141,14 @@
         streamKey: key,
         extra: { active: false, subscribers: entry.subscribers.size, idleMs: this.resolveIdleMs(idleMs, this.defaultIdleMs) },
       });
-      return { active: false, kind, streamKey: key, subscribers: entry.subscribers.size };
+      return {
+        active: false,
+        kind,
+        streamKey: key,
+        subscribers: entry.subscribers.size,
+        resubscribeRequired: true,
+        reason: 'not-subscribed',
+      };
     }
 
     const timeout = this.resolveIdleMs(idleMs, subscription.idleMs);
@@ -161,6 +175,7 @@
       streamKey: key,
       subscribers: entry.subscribers.size,
       idleMs: timeout,
+      resubscribeRequired: false,
     };
   },
 

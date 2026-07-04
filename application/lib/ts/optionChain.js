@@ -24,6 +24,20 @@ async ({ endpoint, symbol, data }) => {
   const all = data.strikeRange === 'All';
   let expectedStrikes = proximity > 0 ? proximity * 2 : null;
   let expectedSource = proximity > 0 ? 'strikeProximity' : 'unknown';
+  const strikeStats = (chain) => {
+    const strikes = Object.keys(chain).sort((a, b) => Number(a) - Number(b));
+    const strikeValues = strikes.map((strike) => Number(strike) / 1000);
+    const minStrike = strikes[0] ?? null;
+    const maxStrike = strikes.at(-1) ?? null;
+    return {
+      minStrike,
+      maxStrike,
+      minStrikeValue: strikeValues[0] ?? null,
+      maxStrikeValue: strikeValues.at(-1) ?? null,
+      firstStrikes: strikes.slice(0, 10),
+      lastStrikes: strikes.slice(-10),
+    };
+  };
 
   if (all && typeof lib.ts.send === 'function') {
     try {
@@ -108,7 +122,10 @@ async ({ endpoint, symbol, data }) => {
     };
 
     let streamKey = null;
-    let timeoutId = null;
+    const timing = all ? { minWaitMs: 5000, idleMs: 1500, hardTimeoutMs: 15000 } : { minWaitMs: 0, idleMs: 5000, hardTimeoutMs: 5000 };
+    const startedAt = Date.now();
+    let lastPacketAt = null;
+    let timerId = null;
     let settled = false;
 
     const updateMeta = (reason) => {
@@ -142,12 +159,29 @@ async ({ endpoint, symbol, data }) => {
       settled = true;
       updateMeta(reason);
 
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-        timeoutId = null;
+      if (timerId) {
+        clearTimeout(timerId);
+        timerId = null;
       }
 
       await stop(streamKey);
+
+      console.debug('options/chain snapshot stats', {
+        symbol: response.symbol,
+        expiration: response.expiration,
+        reason: response.metadata.reason,
+        durationMs: Date.now() - startedAt,
+        lastPacketAgeMs: lastPacketAt === null ? null : Date.now() - lastPacketAt,
+        partial: response.metadata.partial,
+        expectedSource: response.metadata.expectedSource,
+        expectedStrikes: response.metadata.expectedStrikes,
+        actualStrikes: response.metadata.actualStrikes,
+        actualLegs: response.metadata.actualLegs,
+        missingStrikes: response.metadata.missingStrikes,
+        missingLegs: response.metadata.missingLegs,
+        requested: response.metadata.requested,
+        ...strikeStats(response.chain),
+      });
 
       if (error) reject(error);
       else resolve(result);
@@ -156,6 +190,7 @@ async ({ endpoint, symbol, data }) => {
     const onData = (message) => {
       const option = lib.ts.readOptionChain({ message });
       if (!option) return;
+      lastPacketAt = Date.now();
       if (response.chain[option.strike] === undefined) response.chain[option.strike] = {};
       response.chain[option.strike][option.type] = option;
 
@@ -176,12 +211,44 @@ async ({ endpoint, symbol, data }) => {
       void finalize(response, normalizeError(err), 'error');
     };
 
-    const stream = client.streamChains({ endpoint, symbol, data, onData, onError });
-    if (!settled) {
-      timeoutId = setTimeout(() => {
+    const schedule = (forceReason = null) => {
+      if (settled) return;
+
+      if (forceReason) {
+        void finalize(response, null, forceReason);
+        return;
+      }
+
+      const elapsed = Date.now() - startedAt;
+      if (elapsed >= timing.hardTimeoutMs) {
         void finalize(response, null, 'timeout');
-      }, 5000);
-    }
+        return;
+      }
+
+      if (elapsed >= timing.minWaitMs && lastPacketAt !== null) {
+        const idleFor = Date.now() - lastPacketAt;
+        if (idleFor >= timing.idleMs) {
+          void finalize(response, null, 'idle');
+          return;
+        }
+      }
+
+      const waitForMin = Math.max(timing.minWaitMs - elapsed, 0);
+      let waitForIdle = timing.idleMs;
+      if (lastPacketAt !== null && elapsed >= timing.minWaitMs) {
+        waitForIdle = Math.max(timing.idleMs - (Date.now() - lastPacketAt), 0);
+      }
+      const waitForHard = Math.max(timing.hardTimeoutMs - elapsed, 0);
+      const delay = Math.max(1, Math.min(waitForHard, waitForMin || waitForIdle));
+      let reason = null;
+      if (delay === waitForHard) reason = 'timeout';
+      else if (delay === waitForIdle && lastPacketAt !== null && elapsed >= timing.minWaitMs) reason = 'idle';
+
+      timerId = setTimeout(() => schedule(reason), delay);
+    };
+
+    const stream = client.streamChains({ endpoint, symbol, data, onData, onError });
+    schedule();
 
     stream
       .then((key) => {
