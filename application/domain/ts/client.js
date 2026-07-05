@@ -246,11 +246,12 @@ async () => ({
     }
   },
 
-  async streamChains({ endpoint, symbol, data, onData, onError }) {
+  async streamChains({ endpoint, symbol, data, onData, onError, onStatus }) {
     try {
       const key = this.buildStreamKey({ group: 'chains', symbol, data });
+      const retryPolicy = { packetErrors: { failedInternalServerError: { retryable: true, maxRetries: 2 } } };
 
-      const stream = lib.ts.stream({ live: true, endpoint, tokens: this.tokens, data, onData, onError });
+      const stream = lib.ts.stream({ live: true, endpoint, tokens: this.tokens, data, onData, onError, onStatus, retryPolicy });
       await stream.initiateStream();
       await this.setStoredStream({ group: 'chains', key, stream });
       return key;

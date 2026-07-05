@@ -122,12 +122,47 @@
   },
 
   notifyError(entry, error) {
+    entry.state = 'failed';
+    entry.lastError = this.serializeError(error);
     const payload = {
       kind: entry.kind,
       streamKey: entry.key,
-      error: this.serializeError(error),
+      metadata: entry.metadata,
+      state: 'failed',
+      active: false,
+      resubscribeRequired: true,
+      terminal: error?.terminal ?? error?.permanent ?? true,
+      retryable: false,
+      error: entry.lastError,
     };
     this.emit(entry, 'stream/error', payload);
+  },
+
+  notifyStatus(entry, status = {}) {
+    const state = status.state ?? entry.state ?? 'active';
+    const previousState = entry.state;
+    const active = status.active ?? true;
+    const resubscribeRequired = status.resubscribeRequired ?? false;
+    entry.state = state;
+    if (previousState !== state) {
+      console.debug('managed stream state change', this.entryLog(entry, { from: previousState, to: state }));
+    }
+    if (status.error) entry.lastError = this.serializeError(status.error);
+    console.debug('managed stream status', this.entryLog(entry, { state, reason: status.reason ?? null, active, resubscribeRequired }));
+    this.emit(entry, 'stream/status', {
+      kind: entry.kind,
+      streamKey: entry.key,
+      metadata: entry.metadata,
+      state,
+      reason: status.reason ?? null,
+      active,
+      resubscribeRequired,
+      retryable: status.retryable ?? false,
+      terminal: status.terminal ?? false,
+      retryAttempt: status.retryAttempt ?? null,
+      maxRetries: status.maxRetries ?? null,
+      error: status.error ? this.serializeError(status.error) : undefined,
+    });
   },
 
   touch({ kind, key, client, idleMs = null }) {
@@ -196,6 +231,8 @@
       subscribers: entry.subscribers.size,
       idleMs: timeout,
       resubscribeRequired: false,
+      recovering: entry.state === 'recovering',
+      state: entry.state ?? 'active',
     };
   },
 
@@ -352,6 +389,7 @@
             entry,
             emit: (eventName, payload) => this.emit(entry, eventName, payload),
             notifyError: (error) => this.notifyError(entry, error),
+            notifyStatus: (status) => this.notifyStatus(entry, status),
           });
 
           if (!upstream || typeof upstream.stop !== 'function') {
@@ -360,7 +398,7 @@
 
           entry.upstream = upstream;
           entry.upstreamReady = true;
-          entry.state = 'active';
+          if (entry.state !== 'recovering' && entry.state !== 'failed') entry.state = 'active';
 
           if (entry.subscribers.size === 0) {
             await this.stopEntry({ kind, key, reason: 'startup.no-subscribers' });

@@ -109,10 +109,13 @@ async ({
       metadata: {
         symbol: symbol.toUpperCase(),
         expiration: data.expiration ?? null,
+        expiration2: data.expiration2 ?? null,
         optionType: data.optionType ?? 'All',
+        strikeRange: data.strikeRange ?? null,
+        strikeProximity: data.strikeProximity ?? null,
         strikeInterval: data.strikeInterval ?? 1,
       },
-      start: async ({ emit, notifyError }) => {
+      start: async ({ emit, notifyError, notifyStatus }) => {
         debug('stream/chains upstream start');
         statsTimer = setTimeout(() => {
           statsTimer = null;
@@ -151,24 +154,50 @@ async ({
             reconnectable: error?.reconnectable ?? null,
           });
           console.error('stream chain error:', error);
+          if (!permanent) return;
           notifyError(error);
-          if (permanent) {
-            const reason = error?.code ? `upstream.${error.code}` : 'upstream.permanent-error';
-            debug('stream/chains terminal cleanup start', { reason });
-            void domain.ts.streams
-              .stopEntry({ kind: 'chains', key, reason })
-              .then(() => {
-                debug('stream/chains terminal cleanup done', { reason });
-              })
-              .catch((cleanupError) => {
-                console.error('Failed to stop failed chain managed stream:', key, cleanupError);
-              });
+          const reason = error?.code ? `upstream.${error.code}` : 'upstream.permanent-error';
+          if (error?.exhausted) {
+            debug('stream/chains retry exhausted', {
+              reason,
+              retryAttempt: error?.retryAttempt ?? null,
+              maxRetries: error?.maxRetries ?? null,
+            });
+            debug('stream/chains terminal error after retries', {
+              reason,
+              retryAttempt: error?.retryAttempt ?? null,
+              maxRetries: error?.maxRetries ?? null,
+            });
           }
+          debug('stream/chains terminal cleanup start', { reason });
+          void domain.ts.streams
+            .stopEntry({ kind: 'chains', key, reason })
+            .then(() => {
+              debug('stream/chains terminal cleanup done', { reason });
+            })
+            .catch((cleanupError) => {
+              console.error('Failed to stop failed chain managed stream:', key, cleanupError);
+            });
+        };
+
+        const onStatus = (status) => {
+          const state = status?.state ?? 'recovering';
+          debug(state === 'active' ? 'stream/chains recovered' : 'stream/chains recovering status', {
+            state,
+            reason: status?.reason ?? null,
+            retryAttempt: status?.retryAttempt ?? null,
+            maxRetries: status?.maxRetries ?? null,
+            active: status?.active ?? true,
+            resubscribeRequired: status?.resubscribeRequired ?? false,
+            observedStrikes: observedStrikes.size,
+            observedLegs: [...observedLegs.values()].reduce((sum, legs) => sum + legs.size, 0),
+          });
+          notifyStatus({ ...status, state, active: status?.active ?? true, resubscribeRequired: status?.resubscribeRequired ?? false });
         };
 
         let registeredKey = null;
         try {
-          registeredKey = await tsClient.streamChains({ endpoint, symbol, data, onData, onError });
+          registeredKey = await tsClient.streamChains({ endpoint, symbol, data, onData, onError, onStatus });
           debug('stream/chains upstream ready');
         } catch (error) {
           clearStats();
