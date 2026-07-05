@@ -12,7 +12,7 @@ git:
   queue_branch: ai-task-queue
   parent_branch: none
   work_branch_policy: create_task_branch
-  work_branch: ai/T-054-fix-stale-chain-stream-after-upstream-error
+  work_branch: ai/T-054-stale-chain-stream
   allow_new_branch: true
   allow_codex_git: false
 
@@ -150,13 +150,15 @@ const onError = (error) => {
   notifyError(error);
 
   if (error?.permanent || error?.streamStopped) {
-    void domain.ts.streams.stopEntry({
-      kind: 'chains',
-      key,
-      reason: error.code ? `upstream.${error.code}` : 'upstream.permanent-error',
-    }).catch((cleanupError) => {
-      console.error('Failed to stop failed chain managed stream:', key, cleanupError);
-    });
+    void domain.ts.streams
+      .stopEntry({
+        kind: 'chains',
+        key,
+        reason: error.code ? `upstream.${error.code}` : 'upstream.permanent-error',
+      })
+      .catch((cleanupError) => {
+        console.error('Failed to stop failed chain managed stream:', key, cleanupError);
+      });
   }
 };
 ```
@@ -312,8 +314,8 @@ error.reconnectable = false;
 5. Проверить, что следующий `touch` возвращает:
 
 ```js
-active: false
-resubscribeRequired: true
+active: false;
+resubscribeRequired: true;
 ```
 
 #### Scenario B — transient error does not remove managed entry
@@ -333,21 +335,21 @@ error.reconnectable = true;
 Проверить, что `packet.Error` создаёт error object с полями:
 
 ```js
-permanent
-reconnectable
-streamStopped
-code
-upstreamMessage
-details
-symbol
+permanent;
+reconnectable;
+streamStopped;
+code;
+upstreamMessage;
+details;
+symbol;
 ```
 
 Для `INVALID SYMBOL`:
 
 ```js
-permanent === true
-reconnectable === false
-streamStopped === true
+permanent === true;
+reconnectable === false;
+streamStopped === true;
 ```
 
 Для `GoAway` не должно быть terminal error path.
