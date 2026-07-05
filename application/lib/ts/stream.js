@@ -62,6 +62,10 @@
     return 'unexpected';
   },
 
+  classifyPacketError(packet) {
+    return /INVALID/i.test(packet.Error) || (/Failed/i.test(packet.Error) && /Internal server error/i.test(packet.Message ?? ''));
+  },
+
   async initiateStream() {
     this.clearReconnectTimer();
     this.clearHeartbeatTimer();
@@ -124,16 +128,17 @@
 
     if (packet.Error) {
       const errorText = `${packet.Error} ${packet.Message ?? ''}`.trim();
+      const permanent = this.classifyPacketError(packet);
       console.error('Stream error:', this.endpointName(), errorText);
       const error = new Error(errorText);
       error.code = packet.Error;
       error.upstreamMessage = packet.Message ?? null;
       error.details = packet.Message ?? null;
       error.symbol = packet.Symbol ?? null;
-      error.packet = packet;
+      error.permanent = permanent;
+      error.reconnectable = !permanent;
+      error.streamStopped = permanent;
       if (onError) onError(error);
-      const permanent =
-        /INVALID/i.test(packet.Error) || (/Failed/i.test(packet.Error) && /Internal server error/i.test(packet.Message ?? ''));
       console.warn('Stream error classification:', this.endpointName(), permanent ? 'PERMANENT -> stop' : 'TRANSIENT -> reconnect');
       if (permanent) {
         this.stopStream('permanent-error');
