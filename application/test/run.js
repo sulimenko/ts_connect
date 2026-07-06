@@ -249,11 +249,12 @@ test('stream helper builds stream key from cleaned option chain payload', async 
   assert.equal(subscribeArgs.key, 'chains-key');
 });
 
-test('stream packet Failed/Internal server error is permanent and stops reconnect', async () => {
+test('option chain Failed/Internal server error is retryable before terminal cleanup', async () => {
   const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
   let reconnectCalls = 0;
   const stopReasons = [];
   const errors = [];
+  const statuses = [];
 
   const instance = {
     ...streamFactory({
@@ -262,11 +263,21 @@ test('stream packet Failed/Internal server error is permanent and stops reconnec
       tokens: { access: 'token' },
       onData: () => {},
       onError: () => {},
+      onStatus: (status) => statuses.push(status),
+      retryPolicy: {
+        packetErrors: {
+          failedInternalServerError: {
+            retryable: true,
+            maxRetries: 2,
+          },
+        },
+      },
     }),
     shouldReconnect: true,
     checkTimeout() {},
-    scheduleReconnect: async () => {
+    scheduleReconnect: async (args) => {
       reconnectCalls += 1;
+      assert.equal(args.maxRetries, 2);
     },
     stopStream(reason = 'unknown') {
       stopReasons.push(reason);
@@ -283,15 +294,194 @@ test('stream packet Failed/Internal server error is permanent and stops reconnec
   const result = instance.handlePacket(packet, null, (error) => errors.push(error));
 
   assert.equal(result, false);
-  assert.equal(reconnectCalls, 0);
+  assert.equal(reconnectCalls, 1);
+  assert.deepEqual(stopReasons, []);
+  assert.equal(errors.length, 0);
+  assert.equal(statuses.length, 1);
+  assert.equal(statuses[0].state, 'recovering');
+  assert.equal(statuses[0].retryAttempt, 1);
+  assert.equal(statuses[0].maxRetries, 2);
+
+  instance.handlePacket(
+    { Legs: [] },
+    () => {},
+    () => {},
+  );
+  assert.equal(statuses[1].state, 'active');
+  assert.equal(instance.packetRetryAttempt, 0);
+
+  assert.equal(
+    instance.handlePacket(packet, null, (error) => errors.push(error)),
+    false,
+  );
+  assert.equal(
+    instance.handlePacket(packet, null, (error) => errors.push(error)),
+    false,
+  );
+  assert.equal(
+    instance.handlePacket(packet, null, (error) => errors.push(error)),
+    false,
+  );
+
+  assert.equal(reconnectCalls, 3);
   assert.deepEqual(stopReasons, ['permanent-error']);
+  assert.deepEqual(
+    statuses.map((status) => status.retryAttempt),
+    [1, 0, 1, 2],
+  );
   assert.equal(errors.length, 1);
-  assert.ok(errors[0] instanceof Error);
-  assert.equal(errors[0].message, 'Failed Internal server error');
   assert.equal(errors[0].code, 'Failed');
-  assert.equal(errors[0].upstreamMessage, 'Internal server error');
-  assert.equal(errors[0].details, 'Internal server error');
-  assert.equal(errors[0].symbol, 'TSLA');
+  assert.equal(errors[0].permanent, true);
+  assert.equal(errors[0].retryable, false);
+});
+
+test('unknown packet errors stay transient without bounded retry exhaustion', async () => {
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
+  const retryPolicy = { packetErrors: { failedInternalServerError: { retryable: true, maxRetries: 0 } } };
+  const statuses = [];
+  const errors = [];
+  const stops = [];
+  let reconnectCalls = 0;
+
+  const instance = {
+    ...streamFactory({
+      live: true,
+      endpoint: ['marketdata', 'stream', 'quotes', 'TSLA'],
+      tokens: { access: 'token' },
+      onData: () => {},
+      onError: () => {},
+      onStatus: (status) => statuses.push(status),
+      retryPolicy,
+    }),
+    checkTimeout() {},
+    scheduleReconnect: async () => {
+      reconnectCalls += 1;
+    },
+    stopStream(reason = 'unknown') {
+      stops.push(reason);
+      this.shouldReconnect = false;
+    },
+  };
+
+  const result = instance.handlePacket(
+    { Error: 'SomeTransient', Message: 'temporary', Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }], Bid: '1.20', Ask: '1.30' },
+    null,
+    (error) => errors.push(error),
+  );
+
+  assert.equal(result, false);
+  assert.equal(reconnectCalls, 1);
+  assert.equal(errors.length, 0);
+  assert.deepEqual(stops, []);
+  assert.equal(statuses.length, 1);
+  assert.equal(statuses[0].retryAttempt, null);
+  assert.equal(statuses[0].maxRetries, null);
+  assert.equal(statuses[0].terminal, false);
+  assert.equal(statuses[0].retryable, true);
+  assert.equal(JSON.stringify(statuses[0]).includes('SHOULD_NOT_LEAK'), false);
+});
+
+test('stream bounded packet retry uses real reconnect flow', async () => {
+  const timers = [];
+  const retryPolicy = { packetErrors: { failedInternalServerError: { retryable: true, maxRetries: 2 } } };
+  const packets = [
+    { Error: 'Failed', Message: 'Internal server error', Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }], Bid: '1.20', Ask: '1.30' },
+    { Error: 'Failed', Message: 'Internal server error', Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }], Bid: '1.20', Ask: '1.30' },
+    { Error: 'Failed', Message: 'Internal server error', Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }], Bid: '1.20', Ask: '1.30' },
+  ];
+  let connectionCount = 0;
+
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+    fetch: async () => {
+      const packet = packets[connectionCount];
+      connectionCount += 1;
+      let read = false;
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: async () => {
+              if (read) return { done: true };
+              read = true;
+              return { done: false, value: new TextEncoder().encode(`${JSON.stringify(packet)}\n`) };
+            },
+          }),
+        },
+      };
+    },
+    lib: {
+      utils: {
+        constructURL: () => 'https://live.example/v3/marketdata/stream/options/chains/TSLA',
+        traceLog: () => {},
+      },
+    },
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+  });
+
+  const statusEvents = [];
+  const terminalErrors = [];
+  const stopReasons = [];
+  const instance = streamFactory({
+    domain: 'https://live.example',
+    live: true,
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'TSLA'],
+    tokens: { access: 'token' },
+    onData: () => {},
+    onError: (error) => terminalErrors.push(error),
+    onStatus: (status) => statusEvents.push(status),
+    retryPolicy,
+  });
+  const originalStop = instance.stopStream;
+  instance.stopStream = function stop(reason = 'unknown') {
+    stopReasons.push(reason);
+    return originalStop.call(this, reason);
+  };
+
+  const flush = async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+  const runReconnect = async () => {
+    const timer = timers.find((item) => !item.cleared);
+    assert.ok(timer);
+    timer.cleared = true;
+    await timer.fn();
+    await flush();
+  };
+
+  await instance.initiateStream();
+  await flush();
+  assert.equal(connectionCount, 1);
+  assert.equal(statusEvents.length, 1);
+  assert.equal(statusEvents[0].retryAttempt, 1);
+  assert.equal(statusEvents[0].maxRetries, 2);
+  assert.equal(terminalErrors.length, 0);
+
+  await runReconnect();
+  assert.equal(connectionCount, 2);
+  assert.equal(statusEvents.length, 2);
+  assert.equal(statusEvents[1].retryAttempt, 2);
+  assert.equal(statusEvents[1].maxRetries, 2);
+  assert.equal(terminalErrors.length, 0);
+
+  await runReconnect();
+  assert.equal(connectionCount, 3);
+  assert.equal(statusEvents.length, 2);
+  assert.equal(terminalErrors.length, 1);
+  assert.equal(terminalErrors[0].exhausted, true);
+  assert.equal(terminalErrors[0].terminal, true);
+  assert.equal(terminalErrors[0].retryable, false);
+  assert.equal(stopReasons[0], 'permanent-error');
+  assert.equal(timers.filter((timer) => !timer.cleared).length, 0);
+  assert.equal(JSON.stringify(statusEvents).includes('SHOULD_NOT_LEAK'), false);
+  assert.equal(JSON.stringify(terminalErrors).includes('SHOULD_NOT_LEAK'), false);
 });
 
 test('stream read terminated by socket close is transient and does not log unexpected error', async () => {
@@ -440,6 +630,7 @@ test('transient stream reconnect uses one bounded timer', async () => {
 test('GoAway reconnects while INVALID SYMBOL remains permanent stop', async () => {
   const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
   const stopReasons = [];
+  const statuses = [];
   let reconnectCalls = 0;
 
   const instance = {
@@ -449,6 +640,7 @@ test('GoAway reconnects while INVALID SYMBOL remains permanent stop', async () =
       tokens: { access: 'token' },
       onData: () => {},
       onError: () => {},
+      onStatus: (status) => statuses.push(status),
     }),
     scheduleReconnect: async () => {
       reconnectCalls += 1;
@@ -463,14 +655,34 @@ test('GoAway reconnects while INVALID SYMBOL remains permanent stop', async () =
   assert.equal(instance.handlePacket({ StreamStatus: 'GoAway' }, null, null), false);
   assert.equal(reconnectCalls, 1);
   assert.deepEqual(stopReasons, []);
+  assert.equal(statuses.length, 1);
+  assert.equal(statuses[0].state, 'recovering');
+  assert.equal(statuses[0].reason, 'upstream.GoAway');
+  assert.equal(statuses[0].retryAttempt, null);
+  assert.equal(statuses[0].maxRetries, null);
+  assert.equal(statuses[0].retryable, true);
+  assert.equal(statuses[0].terminal, false);
+  assert.equal(statuses[0].active, true);
+  assert.equal(statuses[0].resubscribeRequired, false);
+  assert.equal(instance.packetRetryAttempt, 0);
 
   instance.shouldReconnect = true;
+  const errors = [];
   assert.equal(
-    instance.handlePacket({ Error: 'INVALID SYMBOL', Message: 'bad symbol', Symbol: 'BAD' }, null, () => {}),
+    instance.handlePacket({ Error: 'INVALID SYMBOL', Message: 'bad symbol', Symbol: 'BAD' }, null, (error) => errors.push(error)),
     false,
   );
   assert.equal(reconnectCalls, 1);
   assert.deepEqual(stopReasons, ['permanent-error']);
+  assert.equal(errors[0].code, 'INVALID SYMBOL');
+  assert.equal(errors[0].upstreamMessage, 'bad symbol');
+  assert.equal(errors[0].details, 'bad symbol');
+  assert.equal(errors[0].symbol, 'BAD');
+  assert.equal(errors[0].permanent, true);
+  assert.equal(errors[0].reconnectable, false);
+  assert.equal(errors[0].streamStopped, true);
+  assert.equal(errors[0].packet, undefined);
+  assert.equal(statuses.length, 1);
 });
 
 test('serializeError preserves upstream error metadata', async () => {
@@ -1430,16 +1642,198 @@ test('stream optionChain emits root instrument payload while preserving chain sy
   now = 42;
   await stopHandle.stop({ reason: 'test.cleanup' });
 
-  assert.equal(debugCalls.length, 1);
-  assert.equal(debugCalls[0][0], 'stream/chains observed stats');
-  const stats = JSON.parse(JSON.stringify(debugCalls[0][1]));
-  for (const key of ['observedStrikes', 'observedLegs', 'minStrike', 'maxStrike', 'firstStrikes', 'lastStrikes']) {
+  const statsCall = debugCalls.find((args) => args[0] === 'stream/chains observed stats');
+  assert.ok(statsCall);
+  const stats = JSON.parse(JSON.stringify(statsCall[1]));
+  for (const key of [
+    'observedStrikes',
+    'observedLegs',
+    'minStrike',
+    'maxStrike',
+    'minStrikeValue',
+    'maxStrikeValue',
+    'firstStrikes',
+    'lastStrikes',
+    'durationMs',
+  ]) {
     assert.ok(Object.hasOwn(stats, key));
   }
   assert.equal(stats.phase, 'test.cleanup');
   assert.equal(stats.observedStrikes, 2);
   assert.equal(stats.observedLegs, 2);
+  assert.equal(stats.minStrike, '00075000');
+  assert.equal(stats.maxStrike, '00080000');
+  assert.equal(stats.minStrikeValue, 75);
+  assert.equal(stats.maxStrikeValue, 80);
   assert.deepEqual(stats.firstStrikes, ['00075000', '00080000']);
+  assert.deepEqual(stats.lastStrikes, ['00075000', '00080000']);
+  assert.equal(JSON.stringify(stats).includes('CRWV280121C00080000'), false);
+  assert.equal(JSON.stringify(debugCalls).includes('"Legs"'), false);
+  assert.equal(JSON.stringify(debugCalls).includes('"Bid"'), false);
+  assert.equal(JSON.stringify(debugCalls).includes('"Ask"'), false);
+});
+
+test('stream optionChain error lifecycle cleans terminal streams and keeps transient streams', async () => {
+  const utils = loadUtils();
+  const debugCalls = [];
+  const errorCalls = [];
+  const stops = [];
+  const handlers = [];
+  const statusHandlers = [];
+  const streams = loadExpressionModule('application/domain/ts/streams.js', {
+    lib: makeLib(),
+    console: {
+      debug: (...args) => debugCalls.push(args),
+      error: (...args) => errorCalls.push(args),
+      info: () => {},
+      warn: () => {},
+    },
+  });
+  const clients = [new EventEmitter(), new EventEmitter()];
+  const events = [];
+
+  for (const [index, client] of clients.entries()) {
+    client.emit = (eventName, payload) => {
+      events.push({ eventName, payload, entryPresent: Boolean(streams.getEntry({ kind: 'chains', key: `chains-key-${index}` })) });
+      return EventEmitter.prototype.emit.call(client, eventName, payload);
+    };
+  }
+
+  const optionChain = loadExpressionModule('application/lib/stream/optionChain.js', {
+    console: {
+      debug: (...args) => debugCalls.push(args),
+      error: (...args) => errorCalls.push(args),
+      info: () => {},
+      warn: () => {},
+    },
+    lib: {
+      utils,
+      ts: {
+        readOptionChain: loadExpressionModule('application/lib/ts/readOptionChain.js', {
+          lib: { utils },
+        }),
+      },
+    },
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            buildStreamKey: ({ data }) => `chains-key-${data.case}`,
+            streamChains: async ({ onError, onStatus }) => {
+              handlers.push(onError);
+              statusHandlers.push(onStatus);
+              return `chains-key-${handlers.length - 1}`;
+            },
+            stopStoredStream: async (args) => {
+              stops.push(args);
+            },
+          }),
+        },
+        streams,
+      },
+    },
+  });
+
+  for (const index of [0, 1]) {
+    const result = await optionChain({
+      client: clients[index],
+      endpoint: ['marketdata', 'stream', 'options', 'chains', 'TSLA'],
+      symbol: 'TSLA',
+      data: { case: index, expiration: '2028-01-21', optionType: 'All' },
+    });
+    assert.equal(result.active, true);
+  }
+
+  const terminal = Object.assign(new Error('Failed: Internal server error'), {
+    code: 'Failed',
+    upstreamMessage: 'Internal server error',
+    permanent: true,
+    streamStopped: true,
+    reconnectable: false,
+  });
+  handlers[0](terminal);
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(events[0].eventName, 'stream/error');
+  assert.equal(events[0].entryPresent, true);
+  assert.equal(events[0].payload.streamKey, 'chains-key-0');
+  assert.equal(events[0].payload.metadata.expiration, '2028-01-21');
+  assert.equal(events[0].payload.state, 'failed');
+  assert.equal(events[0].payload.resubscribeRequired, true);
+  assert.equal(events[0].payload.terminal, true);
+  assert.equal(streams.getEntry({ kind: 'chains', key: 'chains-key-0' }), null);
+  assert.equal(stops[0].group, 'chains');
+  assert.equal(stops[0].key, 'chains-key-0');
+  assert.equal(stops[0].reason, 'upstream.Failed');
+  assert.equal(streams.touch({ kind: 'chains', key: 'chains-key-0', client: clients[0] }).resubscribeRequired, true);
+
+  statusHandlers[1]({
+    state: 'recovering',
+    reason: 'upstream.Failed',
+    active: true,
+    resubscribeRequired: false,
+    retryable: true,
+    terminal: false,
+    retryAttempt: 1,
+    maxRetries: 2,
+    error: Object.assign(new Error('Failed Internal server error'), {
+      code: 'Failed',
+      upstreamMessage: 'Internal server error',
+    }),
+  });
+  await Promise.resolve();
+  assert.ok(streams.getEntry({ kind: 'chains', key: 'chains-key-1' }));
+  assert.equal(events[1].eventName, 'stream/status');
+  assert.equal(events[1].payload.streamKey, 'chains-key-1');
+  assert.equal(events[1].payload.state, 'recovering');
+  assert.equal(events[1].payload.active, true);
+  assert.equal(events[1].payload.resubscribeRequired, false);
+  assert.equal(streams.touch({ kind: 'chains', key: 'chains-key-1', client: clients[1] }).recovering, true);
+  await optionChain({
+    client: clients[1],
+    action: 'touch',
+    streamKey: 'chains-key-1',
+    symbol: 'TSLA',
+    data: { case: 1, expiration: '2028-01-21', optionType: 'All' },
+  });
+  await optionChain({
+    client: clients[1],
+    action: 'unsubscribe',
+    streamKey: 'chains-key-1',
+    symbol: 'TSLA',
+    data: { case: 1, expiration: '2028-01-21', optionType: 'All' },
+  });
+
+  const labels = debugCalls.map((args) => args[0]);
+  const lifecycle = [
+    'action start',
+    'action done',
+    'subscribe requested',
+    'subscribe result',
+    'touch requested',
+    'touch result',
+    'unsubscribe requested',
+    'unsubscribe result',
+    'upstream start',
+    'upstream ready',
+    'upstream error',
+    'terminal cleanup start',
+    'terminal cleanup done',
+    'stop requested',
+    'stop done',
+    'observed stats',
+  ];
+  for (const label of lifecycle.map((item) => `stream/chains ${item}`)) {
+    assert.equal(labels.includes(label), true, label);
+  }
+
+  const serialized = JSON.stringify(debugCalls);
+  assert.equal(serialized.includes('"Legs":'), false);
+  assert.equal(serialized.includes('"Bid":'), false);
+  assert.equal(serialized.includes('"Ask":'), false);
+  assert.equal(errorCalls.length, 1);
+  assert.equal(errorCalls[0][0], 'stream chain error:');
 });
 
 test('stream clear returns removed entries and total count', async () => {

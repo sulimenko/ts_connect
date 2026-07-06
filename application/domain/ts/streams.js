@@ -24,16 +24,15 @@
   },
 
   logStop({ kind, key, reason, clientCount = null }) {
-    const suffix = clientCount === null ? '' : ` subscribers=${clientCount}`;
-    console.info(`Managed stream stop: ${kind}:${key} reason=${reason}${suffix}`);
+    console.debug('managed stream stop done', { kind, streamKey: key, reason, subscribers: clientCount });
   },
 
   logUnsubscribe({ kind, key, reason, remaining }) {
-    console.info(`Subscriber removed: ${kind}:${key} reason=${reason} remaining=${remaining}`);
+    console.debug('managed stream unsubscribe', { kind, streamKey: key, reason, subscribers: remaining });
   },
 
   logDroppedEvent({ entry, eventName }) {
-    console.info('Stream event dropped: no subscribers', {
+    console.debug('managed stream dropped event', {
       kind: entry.kind,
       streamKey: entry.key,
       eventName,
@@ -42,6 +41,17 @@
       lastMessageAt: entry.lastMessageAt,
       subscriberCount: entry.subscribers.size,
     });
+  },
+
+  entryLog(entry, extra = {}) {
+    return {
+      kind: entry.kind,
+      streamKey: entry.key,
+      subscribers: entry.subscribers.size,
+      state: entry.state,
+      upstreamReady: Boolean(entry.upstreamReady),
+      ...extra,
+    };
   },
 
   serializeError(error) {
@@ -57,6 +67,9 @@
       if (error.details !== undefined) serialized.details = error.details;
       if (error.upstreamMessage !== undefined) serialized.upstreamMessage = error.upstreamMessage;
       if (error.symbol !== undefined) serialized.symbol = error.symbol;
+      if (error.permanent !== undefined) serialized.permanent = error.permanent;
+      if (error.reconnectable !== undefined) serialized.reconnectable = error.reconnectable;
+      if (error.streamStopped !== undefined) serialized.streamStopped = error.streamStopped;
       return serialized;
     }
 
@@ -81,6 +94,9 @@
       if (error.details !== undefined) serialized.details = error.details;
       if (error.upstreamMessage !== undefined) serialized.upstreamMessage = error.upstreamMessage;
       if (error.symbol !== undefined) serialized.symbol = error.symbol;
+      if (error.permanent !== undefined) serialized.permanent = error.permanent;
+      if (error.reconnectable !== undefined) serialized.reconnectable = error.reconnectable;
+      if (error.streamStopped !== undefined) serialized.streamStopped = error.streamStopped;
       return serialized;
     }
 
@@ -106,17 +122,53 @@
   },
 
   notifyError(entry, error) {
+    entry.state = 'failed';
+    entry.lastError = this.serializeError(error);
     const payload = {
       kind: entry.kind,
       streamKey: entry.key,
-      error: this.serializeError(error),
+      metadata: entry.metadata,
+      state: 'failed',
+      active: false,
+      resubscribeRequired: true,
+      terminal: error?.terminal ?? error?.permanent ?? true,
+      retryable: false,
+      error: entry.lastError,
     };
     this.emit(entry, 'stream/error', payload);
+  },
+
+  notifyStatus(entry, status = {}) {
+    const state = status.state ?? entry.state ?? 'active';
+    const previousState = entry.state;
+    const active = status.active ?? true;
+    const resubscribeRequired = status.resubscribeRequired ?? false;
+    entry.state = state;
+    if (previousState !== state) {
+      console.debug('managed stream state change', this.entryLog(entry, { from: previousState, to: state }));
+    }
+    if (status.error) entry.lastError = this.serializeError(status.error);
+    console.debug('managed stream status', this.entryLog(entry, { state, reason: status.reason ?? null, active, resubscribeRequired }));
+    this.emit(entry, 'stream/status', {
+      kind: entry.kind,
+      streamKey: entry.key,
+      metadata: entry.metadata,
+      state,
+      reason: status.reason ?? null,
+      active,
+      resubscribeRequired,
+      retryable: status.retryable ?? false,
+      terminal: status.terminal ?? false,
+      retryAttempt: status.retryAttempt ?? null,
+      maxRetries: status.maxRetries ?? null,
+      error: status.error ? this.serializeError(status.error) : undefined,
+    });
   },
 
   touch({ kind, key, client, idleMs = null }) {
     const entry = this.getEntry({ kind, key });
     if (!entry) {
+      console.debug('managed stream touch missing', { kind, streamKey: key, active: false, subscribers: 0 });
       lib.utils.traceLog({
         scope: `stream/${kind}`,
         phase: 'touch',
@@ -135,6 +187,7 @@
 
     const subscription = entry.subscribers.get(client);
     if (!subscription) {
+      console.debug('managed stream touch not-subscribed', this.entryLog(entry, { active: false }));
       lib.utils.traceLog({
         scope: `stream/${kind}`,
         phase: 'touch',
@@ -169,6 +222,8 @@
       extra: { active: true, subscribers: entry.subscribers.size, idleMs: timeout },
     });
 
+    console.debug('managed stream touch active', this.entryLog(entry, { active: true }));
+
     return {
       active: true,
       kind,
@@ -176,6 +231,8 @@
       subscribers: entry.subscribers.size,
       idleMs: timeout,
       resubscribeRequired: false,
+      recovering: entry.state === 'recovering',
+      state: entry.state ?? 'active',
     };
   },
 
@@ -187,6 +244,7 @@
     if (entry.stopPromise) return entry.stopPromise;
 
     entry.state = 'stopping';
+    console.debug('managed stream stop start', this.entryLog(entry, { reason }));
     entry.stopPromise = (async () => {
       bucket.delete(key);
       this.logStop({ kind, key, reason, clientCount: entry.subscribers.size });
@@ -220,10 +278,20 @@
 
   async unsubscribe({ kind, key, client, reason = 'unsubscribe' }) {
     const entry = this.getEntry({ kind, key });
-    if (!entry) return { active: false, kind, streamKey: key, subscribers: 0, removed: false };
+    if (!entry) {
+      console.debug('managed stream unsubscribe', { kind, streamKey: key, active: false, subscribers: 0, removed: false });
+      return { active: false, kind, streamKey: key, subscribers: 0, removed: false };
+    }
 
     const subscription = entry.subscribers.get(client);
     if (!subscription) {
+      console.debug('managed stream unsubscribe', {
+        kind,
+        streamKey: key,
+        active: true,
+        subscribers: entry.subscribers.size,
+        removed: false,
+      });
       return { active: true, kind, streamKey: key, subscribers: entry.subscribers.size, removed: false };
     }
 
@@ -268,6 +336,7 @@
     // Consumer counts live above this helper in metaterminal.
     let entry = bucket.get(key);
     const created = entry === undefined;
+    console.debug('managed stream subscribe requested', { kind, streamKey: key, created, idleMs: this.resolveIdleMs(idleMs) });
 
     if (!entry) {
       entry = {
@@ -285,8 +354,10 @@
         lastError: null,
       };
       bucket.set(key, entry);
+      console.debug('managed stream subscribe created', { kind, streamKey: key, subscribers: 0, upstreamReady: false });
     } else if (Object.keys(metadata).length > 0) {
       entry.metadata = { ...entry.metadata, ...metadata };
+      console.debug('managed stream subscribe existing', this.entryLog(entry));
     }
 
     let subscription = entry.subscribers.get(client);
@@ -318,6 +389,7 @@
             entry,
             emit: (eventName, payload) => this.emit(entry, eventName, payload),
             notifyError: (error) => this.notifyError(entry, error),
+            notifyStatus: (status) => this.notifyStatus(entry, status),
           });
 
           if (!upstream || typeof upstream.stop !== 'function') {
@@ -326,7 +398,7 @@
 
           entry.upstream = upstream;
           entry.upstreamReady = true;
-          entry.state = 'active';
+          if (entry.state !== 'recovering' && entry.state !== 'failed') entry.state = 'active';
 
           if (entry.subscribers.size === 0) {
             await this.stopEntry({ kind, key, reason: 'startup.no-subscribers' });
@@ -358,9 +430,7 @@
     }
 
     const state = this.touch({ kind, key, client, idleMs });
-    console.info(
-      `Stream subscribe: ${kind}:${key} created=${created} subscribed=${subscribed} total=${state.subscribers} idleMs=${state.idleMs}`,
-    );
+    console.debug('managed stream subscribe done', this.entryLog(liveEntry, { created, subscribed, active: state.active }));
     return { ...state, created, subscribed, metadata: liveEntry.metadata };
   },
 

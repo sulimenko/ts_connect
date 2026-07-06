@@ -44,21 +44,27 @@ async () => ({
   async stopStoredStream({ group, key, reason = 'unknown' }) {
     const bucket = this.getStreamBucket(group);
     const stream = bucket[key];
-    if (!stream) return false;
+    if (!stream) {
+      console.debug('stored stream stop missing', { group, streamKey: key, reason });
+      return false;
+    }
 
     try {
+      console.debug('stored stream stop requested', { group, streamKey: key, reason });
       await stream.stopStream(reason);
     } catch (error) {
       console.warn(`Failed to stop stream ${group}:${key}:`, error);
     }
 
     delete bucket[key];
+    console.debug('stored stream stop done', { group, streamKey: key, reason });
     return true;
   },
 
   async setStoredStream({ group, key, stream }) {
     await this.stopStoredStream({ group, key });
     this.getStreamBucket(group)[key] = stream;
+    console.debug('stored stream set', { group, streamKey: key });
     return key;
   },
 
@@ -240,11 +246,12 @@ async () => ({
     }
   },
 
-  async streamChains({ endpoint, symbol, data, onData, onError }) {
+  async streamChains({ endpoint, symbol, data, onData, onError, onStatus }) {
     try {
       const key = this.buildStreamKey({ group: 'chains', symbol, data });
+      const retryPolicy = { packetErrors: { failedInternalServerError: { retryable: true, maxRetries: 2 } } };
 
-      const stream = lib.ts.stream({ live: true, endpoint, tokens: this.tokens, data, onData, onError });
+      const stream = lib.ts.stream({ live: true, endpoint, tokens: this.tokens, data, onData, onError, onStatus, retryPolicy });
       await stream.initiateStream();
       await this.setStoredStream({ group: 'chains', key, stream });
       return key;
