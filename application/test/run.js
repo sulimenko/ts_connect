@@ -335,6 +335,155 @@ test('option chain Failed/Internal server error is retryable before terminal cle
   assert.equal(errors[0].retryable, false);
 });
 
+test('unknown packet errors stay transient without bounded retry exhaustion', async () => {
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
+  const retryPolicy = { packetErrors: { failedInternalServerError: { retryable: true, maxRetries: 0 } } };
+  const statuses = [];
+  const errors = [];
+  const stops = [];
+  let reconnectCalls = 0;
+
+  const instance = {
+    ...streamFactory({
+      live: true,
+      endpoint: ['marketdata', 'stream', 'quotes', 'TSLA'],
+      tokens: { access: 'token' },
+      onData: () => {},
+      onError: () => {},
+      onStatus: (status) => statuses.push(status),
+      retryPolicy,
+    }),
+    checkTimeout() {},
+    scheduleReconnect: async () => {
+      reconnectCalls += 1;
+    },
+    stopStream(reason = 'unknown') {
+      stops.push(reason);
+      this.shouldReconnect = false;
+    },
+  };
+
+  const result = instance.handlePacket(
+    { Error: 'SomeTransient', Message: 'temporary', Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }], Bid: '1.20', Ask: '1.30' },
+    null,
+    (error) => errors.push(error),
+  );
+
+  assert.equal(result, false);
+  assert.equal(reconnectCalls, 1);
+  assert.equal(errors.length, 0);
+  assert.deepEqual(stops, []);
+  assert.equal(statuses.length, 1);
+  assert.equal(statuses[0].retryAttempt, null);
+  assert.equal(statuses[0].maxRetries, null);
+  assert.equal(statuses[0].terminal, false);
+  assert.equal(statuses[0].retryable, true);
+  assert.equal(JSON.stringify(statuses[0]).includes('SHOULD_NOT_LEAK'), false);
+});
+
+test('stream bounded packet retry uses real reconnect flow', async () => {
+  const timers = [];
+  const retryPolicy = { packetErrors: { failedInternalServerError: { retryable: true, maxRetries: 2 } } };
+  const packets = [
+    { Error: 'Failed', Message: 'Internal server error', Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }], Bid: '1.20', Ask: '1.30' },
+    { Error: 'Failed', Message: 'Internal server error', Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }], Bid: '1.20', Ask: '1.30' },
+    { Error: 'Failed', Message: 'Internal server error', Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }], Bid: '1.20', Ask: '1.30' },
+  ];
+  let connectionCount = 0;
+
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+    fetch: async () => {
+      const packet = packets[connectionCount];
+      connectionCount += 1;
+      let read = false;
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: async () => {
+              if (read) return { done: true };
+              read = true;
+              return { done: false, value: new TextEncoder().encode(`${JSON.stringify(packet)}\n`) };
+            },
+          }),
+        },
+      };
+    },
+    lib: {
+      utils: {
+        constructURL: () => 'https://live.example/v3/marketdata/stream/options/chains/TSLA',
+        traceLog: () => {},
+      },
+    },
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+  });
+
+  const statusEvents = [];
+  const terminalErrors = [];
+  const stopReasons = [];
+  const instance = streamFactory({
+    domain: 'https://live.example',
+    live: true,
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'TSLA'],
+    tokens: { access: 'token' },
+    onData: () => {},
+    onError: (error) => terminalErrors.push(error),
+    onStatus: (status) => statusEvents.push(status),
+    retryPolicy,
+  });
+  const originalStop = instance.stopStream;
+  instance.stopStream = function stop(reason = 'unknown') {
+    stopReasons.push(reason);
+    return originalStop.call(this, reason);
+  };
+
+  const flush = async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+  const runReconnect = async () => {
+    const timer = timers.find((item) => !item.cleared);
+    assert.ok(timer);
+    timer.cleared = true;
+    await timer.fn();
+    await flush();
+  };
+
+  await instance.initiateStream();
+  await flush();
+  assert.equal(connectionCount, 1);
+  assert.equal(statusEvents.length, 1);
+  assert.equal(statusEvents[0].retryAttempt, 1);
+  assert.equal(statusEvents[0].maxRetries, 2);
+  assert.equal(terminalErrors.length, 0);
+
+  await runReconnect();
+  assert.equal(connectionCount, 2);
+  assert.equal(statusEvents.length, 2);
+  assert.equal(statusEvents[1].retryAttempt, 2);
+  assert.equal(statusEvents[1].maxRetries, 2);
+  assert.equal(terminalErrors.length, 0);
+
+  await runReconnect();
+  assert.equal(connectionCount, 3);
+  assert.equal(statusEvents.length, 2);
+  assert.equal(terminalErrors.length, 1);
+  assert.equal(terminalErrors[0].exhausted, true);
+  assert.equal(terminalErrors[0].terminal, true);
+  assert.equal(terminalErrors[0].retryable, false);
+  assert.equal(stopReasons[0], 'permanent-error');
+  assert.equal(timers.filter((timer) => !timer.cleared).length, 0);
+  assert.equal(JSON.stringify(statusEvents).includes('SHOULD_NOT_LEAK'), false);
+  assert.equal(JSON.stringify(terminalErrors).includes('SHOULD_NOT_LEAK'), false);
+});
+
 test('stream read terminated by socket close is transient and does not log unexpected error', async () => {
   const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
   const warnings = [];
@@ -481,6 +630,7 @@ test('transient stream reconnect uses one bounded timer', async () => {
 test('GoAway reconnects while INVALID SYMBOL remains permanent stop', async () => {
   const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
   const stopReasons = [];
+  const statuses = [];
   let reconnectCalls = 0;
 
   const instance = {
@@ -490,6 +640,7 @@ test('GoAway reconnects while INVALID SYMBOL remains permanent stop', async () =
       tokens: { access: 'token' },
       onData: () => {},
       onError: () => {},
+      onStatus: (status) => statuses.push(status),
     }),
     scheduleReconnect: async () => {
       reconnectCalls += 1;
@@ -504,6 +655,16 @@ test('GoAway reconnects while INVALID SYMBOL remains permanent stop', async () =
   assert.equal(instance.handlePacket({ StreamStatus: 'GoAway' }, null, null), false);
   assert.equal(reconnectCalls, 1);
   assert.deepEqual(stopReasons, []);
+  assert.equal(statuses.length, 1);
+  assert.equal(statuses[0].state, 'recovering');
+  assert.equal(statuses[0].reason, 'upstream.GoAway');
+  assert.equal(statuses[0].retryAttempt, null);
+  assert.equal(statuses[0].maxRetries, null);
+  assert.equal(statuses[0].retryable, true);
+  assert.equal(statuses[0].terminal, false);
+  assert.equal(statuses[0].active, true);
+  assert.equal(statuses[0].resubscribeRequired, false);
+  assert.equal(instance.packetRetryAttempt, 0);
 
   instance.shouldReconnect = true;
   const errors = [];
@@ -521,6 +682,7 @@ test('GoAway reconnects while INVALID SYMBOL remains permanent stop', async () =
   assert.equal(errors[0].reconnectable, false);
   assert.equal(errors[0].streamStopped, true);
   assert.equal(errors[0].packet, undefined);
+  assert.equal(statuses.length, 1);
 });
 
 test('serializeError preserves upstream error metadata', async () => {
@@ -1483,13 +1645,32 @@ test('stream optionChain emits root instrument payload while preserving chain sy
   const statsCall = debugCalls.find((args) => args[0] === 'stream/chains observed stats');
   assert.ok(statsCall);
   const stats = JSON.parse(JSON.stringify(statsCall[1]));
-  for (const key of ['observedStrikes', 'observedLegs', 'durationMs']) {
+  for (const key of [
+    'observedStrikes',
+    'observedLegs',
+    'minStrike',
+    'maxStrike',
+    'minStrikeValue',
+    'maxStrikeValue',
+    'firstStrikes',
+    'lastStrikes',
+    'durationMs',
+  ]) {
     assert.ok(Object.hasOwn(stats, key));
   }
   assert.equal(stats.phase, 'test.cleanup');
   assert.equal(stats.observedStrikes, 2);
   assert.equal(stats.observedLegs, 2);
+  assert.equal(stats.minStrike, '00075000');
+  assert.equal(stats.maxStrike, '00080000');
+  assert.equal(stats.minStrikeValue, 75);
+  assert.equal(stats.maxStrikeValue, 80);
+  assert.deepEqual(stats.firstStrikes, ['00075000', '00080000']);
+  assert.deepEqual(stats.lastStrikes, ['00075000', '00080000']);
   assert.equal(JSON.stringify(stats).includes('CRWV280121C00080000'), false);
+  assert.equal(JSON.stringify(debugCalls).includes('"Legs"'), false);
+  assert.equal(JSON.stringify(debugCalls).includes('"Bid"'), false);
+  assert.equal(JSON.stringify(debugCalls).includes('"Ask"'), false);
 });
 
 test('stream optionChain error lifecycle cleans terminal streams and keeps transient streams', async () => {

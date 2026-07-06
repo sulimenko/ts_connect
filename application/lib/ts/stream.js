@@ -69,19 +69,19 @@
     const internal = /Failed/i.test(packet.Error) && /Internal server error/i.test(packet.Message ?? '');
     const policy = internal ? this.retryPolicy?.packetErrors?.failedInternalServerError : null;
     if (/INVALID/i.test(packet.Error)) {
-      return { terminal: true, retryable: false, streamStopped: true, reconnectable: false, maxRetries: 0 };
+      return { terminal: true, retryable: false, bounded: false, streamStopped: true, reconnectable: false, maxRetries: 0 };
     }
 
     if (policy?.retryable) {
       const maxRetries = Number.isFinite(policy.maxRetries) ? Math.max(0, Math.floor(policy.maxRetries)) : 0;
-      return { terminal: false, retryable: true, streamStopped: false, reconnectable: true, maxRetries };
+      return { terminal: false, retryable: true, bounded: true, streamStopped: false, reconnectable: true, maxRetries };
     }
 
     if (internal) {
-      return { terminal: true, retryable: false, streamStopped: true, reconnectable: false, maxRetries: 0 };
+      return { terminal: true, retryable: false, bounded: false, streamStopped: true, reconnectable: false, maxRetries: 0 };
     }
 
-    return { terminal: false, retryable: true, streamStopped: false, reconnectable: true, maxRetries: 0 };
+    return { terminal: false, retryable: true, bounded: false, streamStopped: false, reconnectable: true, maxRetries: null };
   },
 
   buildPacketError(packet, classification) {
@@ -94,6 +94,7 @@
     error.permanent = classification.terminal;
     error.terminal = classification.terminal;
     error.retryable = classification.retryable;
+    error.bounded = classification.bounded;
     error.reconnectable = classification.reconnectable;
     error.streamStopped = classification.streamStopped;
     error.maxRetries = classification.maxRetries;
@@ -171,6 +172,16 @@
 
     if (packet.StreamStatus === 'GoAway' || packet.Error === 'GoAway') {
       console.log('Stream termination requested by server.', this.endpointName());
+      this.onStatus?.({
+        state: 'recovering',
+        reason: 'upstream.GoAway',
+        retryAttempt: null,
+        maxRetries: null,
+        retryable: true,
+        terminal: false,
+        active: true,
+        resubscribeRequired: false,
+      });
       void this.scheduleReconnect();
       return false;
     }
@@ -180,7 +191,7 @@
       const error = this.buildPacketError(packet, classification);
       console.error('Stream error:', this.endpointName(), error.message);
 
-      if (classification.retryable && !classification.terminal) {
+      if (classification.retryable && !classification.terminal && classification.bounded) {
         this.packetRetryAttempt += 1;
         error.retryAttempt = this.packetRetryAttempt;
         if (this.packetRetryAttempt <= classification.maxRetries) {
@@ -211,6 +222,21 @@
         error.streamStopped = true;
         error.exhausted = true;
         console.warn('Stream error classification:', this.endpointName(), 'RETRY EXHAUSTED -> stop');
+      } else if (classification.retryable && !classification.terminal) {
+        this.onStatus?.({
+          state: 'recovering',
+          reason: `upstream.${packet.Error}`,
+          retryAttempt: null,
+          maxRetries: null,
+          retryable: true,
+          terminal: false,
+          active: true,
+          resubscribeRequired: false,
+          error,
+        });
+        console.warn('Stream error classification:', this.endpointName(), 'TRANSIENT -> reconnect');
+        void this.scheduleReconnect({ reason: `upstream.${packet.Error}` });
+        return false;
       }
 
       if (onError) onError(error);

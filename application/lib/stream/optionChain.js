@@ -47,6 +47,7 @@ async ({
   };
   const writeStats = (phase) => {
     const strikes = [...observedStrikes].sort((a, b) => Number(a) - Number(b));
+    const strikeValues = strikes.map((strike) => Number(strike) / 1000);
     const observedLegCount = [...observedLegs.values()].reduce((sum, legs) => sum + legs.size, 0);
     console.debug('stream/chains observed stats', {
       phase,
@@ -59,6 +60,12 @@ async ({
       strikeInterval: data.strikeInterval ?? 1,
       observedStrikes: strikes.length,
       observedLegs: observedLegCount,
+      minStrike: strikes[0] ?? null,
+      maxStrike: strikes.at(-1) ?? null,
+      minStrikeValue: strikeValues[0] ?? null,
+      maxStrikeValue: strikeValues.at(-1) ?? null,
+      firstStrikes: strikes.slice(0, 10),
+      lastStrikes: strikes.slice(-10),
       durationMs: Date.now() - startedAt,
     });
   };
