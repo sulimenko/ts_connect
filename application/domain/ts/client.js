@@ -232,12 +232,17 @@ async () => ({
     }
   },
 
-  async streamMatrix({ endpoint, symbol, data, onData, onError }) {
+  async streamMatrix({ endpoint, symbol, data, onData, onError, onStatus }) {
     try {
+      if (this.closed) throw new Error('TradeStation client is closed');
       const key = this.buildStreamKey({ group: 'matrix', symbol, data });
 
-      const stream = lib.ts.stream({ live: true, ver: 'v2', endpoint, tokens: this.tokens, data, onData, onError });
+      const stream = lib.ts.stream({ live: true, ver: 'v2', endpoint, tokens: this.tokens, data, onData, onError, onStatus });
       await stream.initiateStream();
+      if (this.closed) {
+        stream.stopStream('client.close');
+        throw new Error('TradeStation client closed during matrix startup');
+      }
       await this.setStoredStream({ group: 'matrix', key, stream });
       return key;
     } catch (error) {
