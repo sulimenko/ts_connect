@@ -678,7 +678,97 @@ test('initial HTTP stream failure is normalized and does not start reconnect', a
   assert.equal(instance.classifyHttpError({ status: 403, body: 'not entitled' }), 'entitlement');
   assert.equal(instance.classifyHttpError({ status: 400, body: 'invalid request' }), 'invalid');
   assert.equal(instance.classifyHttpError({ status: 503 }), 'transient');
+  assert.equal(instance.classifyHttpError({ status: 503, headers: { 'retry-after': '5' } }), 'transient');
+  assert.equal(instance.classifyHttpError({ status: 503, body: 'Concurrent stream capacity exceeded' }), 'capacity');
+  for (const header of ['x-ratelimit-remaining', 'ratelimit-remaining', 'rate-limit-remaining']) {
+    assert.equal(instance.classifyHttpError({ status: 403, headers: { [header]: '0' } }), 'capacity');
+  }
   assert.equal(instance.classifyHttpError({ status: 403 }), 'forbidden');
+});
+
+test('reconnect HTTP outcomes stop capacity and permanent retries while transient recovers', async () => {
+  const cases = [
+    { status: 429, classification: 'capacity', outcome: 'queued' },
+    { status: 403, body: 'Concurrent stream capacity exceeded', classification: 'capacity', outcome: 'queued' },
+    { status: 401, classification: 'authorization', outcome: 'failed' },
+    { status: 403, body: 'not entitled', classification: 'entitlement', outcome: 'failed' },
+    { status: 403, classification: 'forbidden', outcome: 'failed' },
+    { status: 400, body: 'invalid request', classification: 'invalid', outcome: 'failed' },
+    { status: 503, body: 'Concurrent stream capacity exceeded', classification: 'capacity', outcome: 'queued' },
+    { status: 503, headers: { 'retry-after': '5' }, classification: 'transient', outcome: 'recovering' },
+  ];
+
+  for (const item of cases) {
+    const timers = [];
+    const statuses = [];
+    const errors = [];
+    const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+      fetch: async () => ({
+        ok: false,
+        status: item.status,
+        statusText: 'Failure',
+        headers: new Map(Object.entries(item.headers ?? {})),
+        text: async () => item.body ?? '',
+      }),
+      lib: { utils: { constructURL: () => 'https://live.example/stream', traceLog: () => {} } },
+      setTimeout: (fn, delay) => {
+        const timer = { fn, delay, cleared: false };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout: (timer) => {
+        if (timer) timer.cleared = true;
+      },
+    });
+    const instance = streamFactory({
+      domain: 'https://live.example',
+      live: true,
+      endpoint: ['stream', 'matrix', 'changes', 'TSLA'],
+      tokens: { access: 'token' },
+      onError: (error) => errors.push(error),
+      onStatus: (status) => statuses.push(status),
+    });
+    instance.timeoutHeartbeat = { heartbeat: true };
+    instance.reconnectTimer = { reconnect: true };
+
+    await instance.initiateStream({ reconnect: true, generation: 0 });
+
+    assert.equal(item.classification, (statuses[0]?.error ?? errors[0]).classification);
+    assert.equal(instance.timeoutHeartbeat, null);
+    if (item.outcome === 'recovering') {
+      assert.equal(statuses[0].state, 'recovering');
+      assert.equal(errors.length, 0);
+      assert.ok(instance.reconnectTimer);
+      assert.equal(instance.shouldReconnect, true);
+    } else {
+      assert.equal(statuses[0]?.state ?? 'failed', item.outcome);
+      assert.equal(errors.length, item.outcome === 'failed' ? 1 : 0);
+      assert.equal(instance.reconnectTimer, null);
+      assert.equal(instance.shouldReconnect, false);
+    }
+  }
+});
+
+test('successful reconnect returns stream status to active', async () => {
+  const statuses = [];
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+    fetch: async () => ({ ok: true, body: { getReader: () => ({}) } }),
+    lib: { utils: { constructURL: () => 'https://live.example/stream', traceLog: () => {} } },
+  });
+  const instance = streamFactory({
+    domain: 'https://live.example',
+    live: true,
+    endpoint: ['stream', 'matrix', 'changes', 'TSLA'],
+    tokens: { access: 'token' },
+    onStatus: (status) => statuses.push(status),
+  });
+  instance.processStream = async () => {};
+
+  await instance.initiateStream({ reconnect: true, generation: 0 });
+
+  assert.equal(statuses.length, 1);
+  assert.equal(statuses[0].state, 'active');
+  instance.stopStream('test.cleanup');
 });
 
 test('stopped stream generation cancels reconnect before the next connection', async () => {
@@ -1065,6 +1155,70 @@ test('matrix permanent startup classes fail without entering capacity queue', as
     assert.equal(client.listenerCount('close'), 0);
   }
   assert.equal(streams.matrixQueue.length, 0);
+});
+
+test('matrix reconnect capacity moves the active entry to the shared queue once', async () => {
+  const timers = [];
+  const events = [];
+  const streams = loadExpressionModule('application/domain/ts/streams.js', {
+    lib: makeLib(),
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+  });
+  const client = new EventEmitter();
+  const emit = client.emit.bind(client);
+  client.emit = (eventName, payload) => {
+    events.push({ eventName, payload });
+    return emit(eventName, payload);
+  };
+  let notifyStatus = null;
+  let stops = 0;
+
+  await streams.subscribe({
+    kind: 'matrix',
+    key: 'matrix-reconnect',
+    client,
+    start: async (callbacks) => {
+      notifyStatus = callbacks.notifyStatus;
+      return {
+        stop: async () => {
+          stops += 1;
+        },
+      };
+    },
+  });
+  const staleStatus = notifyStatus;
+  const capacity = Object.assign(new Error('capacity'), { classification: 'capacity', status: 429, retryable: true });
+
+  await notifyStatus({ state: 'queued', reason: 'upstream.capacity', active: false, retryable: true, terminal: false, error: capacity });
+  await staleStatus({ state: 'active', reason: 'stale', active: true });
+
+  const entry = streams.getEntry({ kind: 'matrix', key: 'matrix-reconnect' });
+  assert.ok(entry);
+  assert.equal(entry.state, 'queued');
+  assert.equal(entry.upstreamReady, false);
+  assert.equal(entry.upstream, null);
+  assert.equal(stops, 1);
+  assert.deepEqual(
+    Array.from(streams.matrixQueue, (queued) => queued.key),
+    ['matrix-reconnect'],
+  );
+  assert.ok(streams.matrixProbe);
+  assert.equal(timers.filter((timer) => !timer.cleared && timer.delay < 120000).length, 1);
+  assert.equal(
+    events.some(({ eventName }) => eventName === 'stream/error'),
+    false,
+  );
+  assert.equal(events.at(-1).payload.state, 'queued');
+
+  await streams.unsubscribe({ kind: 'matrix', key: 'matrix-reconnect', client, reason: 'test.cleanup' });
+  assert.equal(client.listenerCount('close'), 0);
 });
 
 test('managed streams keep one close listener per client and clean all entries', async () => {
@@ -1512,6 +1666,48 @@ test('stream matrix emits canonical levelII packets while routing by tsSymbol', 
   assert.equal(emitted.payload.symbol, undefined);
   assert.equal(emitted.payload.type, 'ask');
   assert.equal(emitted.payload.size, 2);
+});
+
+test('stream matrix permanent reconnect error cleans managed and stored state', async () => {
+  const utils = loadUtils();
+  const streams = loadExpressionModule('application/domain/ts/streams.js', { lib: makeLib() });
+  const client = new EventEmitter();
+  let handlers = null;
+  let stored = true;
+  const tsClient = {
+    buildStreamKey: () => 'matrix-key',
+    streamMatrix: async (args) => {
+      handlers = args;
+      return 'matrix-key';
+    },
+    stopStoredStream: async () => {
+      stored = false;
+    },
+  };
+  const matrixApi = loadExpressionModule('application/api/stream/matrix.js', {
+    DomainError: class DomainError extends Error {},
+    context: { client },
+    domain: { ts: { clients: { getClient: async () => tsClient }, streams } },
+    lib: { utils },
+  });
+
+  await matrixApi.method({ instruments: [{ symbol: 'TSLA' }] });
+  assert.ok(streams.getEntry({ kind: 'matrix', key: 'matrix-key' }));
+  const error = Object.assign(new Error('Forbidden'), {
+    classification: 'forbidden',
+    permanent: true,
+    terminal: true,
+    streamStopped: true,
+  });
+  handlers.onError(error);
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(streams.getEntry({ kind: 'matrix', key: 'matrix-key' }), null);
+  assert.equal(stored, false);
+  assert.equal(client.listenerCount('close'), 0);
+  assert.equal(streams.matrixQueue.length, 0);
+  assert.equal(streams.matrixProbe, null);
 });
 
 test('stream quotes keeps batch keys stable and guards public input', async () => {

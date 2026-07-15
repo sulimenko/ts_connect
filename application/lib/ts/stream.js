@@ -69,16 +69,22 @@
 
   classifyHttpError({ status, body = '', headers = {} }) {
     const text = body.toLowerCase();
-    const capacity = /capacity|concurrent|too many|stream limit|rate.?limit/.test(text);
+    const capacity = /concurrent.{0,40}stream|stream.{0,40}(capacity|limit)|capacity.{0,20}(exceed|reach|limit)|too many.{0,40}stream/.test(
+      text,
+    );
+    const rateLimit = /rate[\s_-]?limit/.test(text);
+    const rateHeader = Object.keys(headers).some((key) => /^(x-)?ratelimit-|^rate-limit-/i.test(key));
     const entitlement = /entitle|permission|not allowed|subscription required/.test(text);
     const invalid = /invalid (request|symbol|instrument)|bad request/.test(text);
 
-    if (status === 401 || status === 407 || /authenticat|invalid token|expired token/.test(text)) return 'authorization';
-    if (status === 403 && entitlement) return 'entitlement';
-    if (status === 429 || capacity || headers['retry-after'] || Object.keys(headers).some((key) => key.includes('rate-limit'))) {
-      return 'capacity';
+    if (status === 401 || status === 407 || /authenticat|authori[sz]ation|unauthori[sz]ed|invalid token|expired token/.test(text)) {
+      return 'authorization';
     }
-    if ([400, 404, 409, 422].includes(status) || invalid) return 'invalid';
+    if (entitlement) return 'entitlement';
+    if (status === 429) return 'capacity';
+    if (invalid) return 'invalid';
+    if (capacity || (status === 403 && (rateLimit || rateHeader))) return 'capacity';
+    if ([400, 404, 409, 422].includes(status)) return 'invalid';
     if ([408, 425].includes(status) || status >= 500) return 'transient';
     if (status === 403) return 'forbidden';
     return 'http';
@@ -117,7 +123,7 @@
     error.body = body;
     error.headers = headers;
     error.classification = classification;
-    error.permanent = ['authorization', 'entitlement', 'invalid', 'forbidden'].includes(classification);
+    error.permanent = !['capacity', 'transient'].includes(classification);
     error.retryable = classification === 'capacity' || classification === 'transient';
     error.reconnectable = classification === 'transient';
     return error;
@@ -248,6 +254,29 @@
       this.connected = false;
       console.error('Stream error:', this.endpointName(), err);
       if (!reconnect) throw err;
+      if (err.classification === 'capacity') {
+        this.stopStream('upstream.capacity');
+        this.onStatus?.({
+          state: 'queued',
+          reason: 'upstream.capacity',
+          retryable: true,
+          terminal: false,
+          active: false,
+          resubscribeRequired: false,
+          error: err,
+        });
+        return false;
+      }
+      if (err.classification && err.classification !== 'transient') {
+        err.permanent = true;
+        err.terminal = true;
+        err.retryable = false;
+        err.reconnectable = false;
+        err.streamStopped = true;
+        this.stopStream('permanent-error');
+        onError?.(err);
+        return false;
+      }
       this.onStatus?.({
         state: 'recovering',
         reason: `upstream.${err.classification ?? 'transport'}`,

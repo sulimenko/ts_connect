@@ -307,7 +307,7 @@
     }
   },
 
-  queueMatrix(entry, error, { front = false } = {}) {
+  queueMatrix(entry, error, { front = false, from = 'starting' } = {}) {
     entry.state = 'queued';
     entry.upstreamReady = false;
     entry.lastError = this.serializeError(error);
@@ -316,11 +316,48 @@
       if (front) this.matrixQueue.unshift(entry);
       else this.matrixQueue.push(entry);
     }
-    this.matrixLog('starting -> queued', entry, {
+    this.matrixLog(`${from} -> queued`, entry, {
       classification: error.classification,
       status: error.status ?? null,
       observedActive: this.activeMatrixCount(),
     });
+  },
+
+  async queueMatrixReconnect(entry, status, generation) {
+    if (
+      this.getEntry({ kind: 'matrix', key: entry.key }) !== entry ||
+      entry.generation !== generation ||
+      !['active', 'recovering'].includes(entry.state)
+    ) {
+      return false;
+    }
+
+    const from = entry.state;
+    const upstream = entry.upstream;
+    entry.generation += 1;
+    const queuedGeneration = entry.generation;
+    entry.upstream = null;
+    this.queueMatrix(entry, status.error, { from });
+    this.notifyStatus(entry, { ...status, state: 'queued', active: false, terminal: false, resubscribeRequired: false });
+
+    if (upstream?.stop) {
+      try {
+        await upstream.stop({ reason: 'upstream.capacity' });
+      } catch (error) {
+        console.error(`Failed to stop capacity stream matrix:${entry.key}:`, error);
+      }
+    }
+
+    if (
+      this.getEntry({ kind: 'matrix', key: entry.key }) !== entry ||
+      entry.generation !== queuedGeneration ||
+      entry.state !== 'queued' ||
+      entry.subscribers.size === 0
+    ) {
+      return false;
+    }
+    this.scheduleMatrixProbe('capacity');
+    return true;
   },
 
   scheduleMatrixProbe(reason = 'capacity') {
@@ -397,7 +434,11 @@
             if (current()) this.notifyError(entry, error);
           },
           notifyStatus: (status) => {
-            if (current()) this.notifyStatus(entry, status);
+            if (!current()) return false;
+            if (entry.kind === 'matrix' && status.state === 'queued' && status.error?.classification === 'capacity') {
+              return this.queueMatrixReconnect(entry, status, generation);
+            }
+            return this.notifyStatus(entry, status);
           },
         });
 
