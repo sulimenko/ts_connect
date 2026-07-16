@@ -629,18 +629,28 @@ test('transient stream reconnect uses one bounded timer', async () => {
 
 test('initial HTTP stream failure is normalized and does not start reconnect', async () => {
   const timers = [];
-  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
-    fetch: async () => ({
-      ok: false,
-      status: 403,
-      statusText: 'Forbidden',
+  const responses = [
+    {
       headers: new Map([
         ['retry-after', '5'],
         ['x-request-id', 'req-1'],
         ['authorization', 'secret'],
       ]),
-      text: async () => 'Concurrent stream capacity exceeded Bearer secret-token',
-    }),
+      body: 'Concurrent stream capacity exceeded Bearer secret-token',
+    },
+    { headers: new Map(), body: 'Stream quota exceeded' },
+  ];
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+    fetch: async () => {
+      const response = responses.shift();
+      return {
+        ok: false,
+        status: 403,
+        statusText: 'Forbidden',
+        headers: response.headers,
+        text: async () => response.body,
+      };
+    },
     lib: {
       utils: {
         constructURL: () => 'https://live.example/v2/stream/matrix/changes/TSLA',
@@ -670,6 +680,19 @@ test('initial HTTP stream failure is normalized and does not start reconnect', a
     assert.equal(error.headers['x-request-id'], 'req-1');
     assert.equal(error.headers.authorization, undefined);
     assert.equal(error.classification, 'capacity');
+    assert.equal(error.permanent, false);
+    assert.equal(error.retryable, true);
+    assert.equal(error.reconnectable, false);
+    return true;
+  });
+  await assert.rejects(instance.initiateStream(), (error) => {
+    assert.equal(error.status, 403);
+    assert.equal(error.statusText, 'Forbidden');
+    assert.equal(error.body, 'Stream quota exceeded');
+    assert.equal(error.classification, 'capacity');
+    assert.equal(error.permanent, false);
+    assert.equal(error.retryable, true);
+    assert.equal(error.reconnectable, false);
     return true;
   });
   assert.equal(errors.length, 0);
@@ -680,6 +703,27 @@ test('initial HTTP stream failure is normalized and does not start reconnect', a
   assert.equal(instance.classifyHttpError({ status: 503 }), 'transient');
   assert.equal(instance.classifyHttpError({ status: 503, headers: { 'retry-after': '5' } }), 'transient');
   assert.equal(instance.classifyHttpError({ status: 503, body: 'Concurrent stream capacity exceeded' }), 'capacity');
+  assert.equal(instance.classifyHttpError({ status: 503, body: 'Stream quota exceeded' }), 'capacity');
+  assert.equal(instance.classifyHttpError({ status: 429 }), 'capacity');
+  for (const body of [
+    'Stream quota exceeded',
+    'STREAM QUOTA EXCEEDED',
+    'stream   quota   exceeded',
+    'Stream quota exceeded.',
+    'stream-quota reached',
+    'quota exceeded',
+    'stream quota reached',
+    'quota limit reached',
+  ]) {
+    assert.equal(instance.classifyHttpError({ status: 403, body }), 'capacity', body);
+  }
+  for (const body of ['Forbidden', 'quota information unavailable']) {
+    assert.equal(instance.classifyHttpError({ status: 403, body }), 'forbidden', body);
+  }
+  for (const body of ['not entitled to market depth', 'permission denied', 'permission denied: stream quota exceeded']) {
+    assert.equal(instance.classifyHttpError({ status: 403, body }), 'entitlement', body);
+  }
+  assert.equal(instance.classifyHttpError({ status: 401, body: 'Stream quota exceeded' }), 'authorization');
   for (const header of ['x-ratelimit-remaining', 'ratelimit-remaining', 'rate-limit-remaining']) {
     assert.equal(instance.classifyHttpError({ status: 403, headers: { [header]: '0' } }), 'capacity');
   }
@@ -1068,6 +1112,83 @@ test('managed stream concurrent subscribe shares one startup promise', async () 
   });
   assert.equal(stopCalls, 1);
   assert.equal(streams.getEntry({ kind: 'matrix', key: 'matrix-key' }), null);
+});
+
+test('matrix quota startup queues until the shared drain frees capacity', async () => {
+  let attempts = 0;
+  const lowTimers = [];
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+    fetch: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return {
+          ok: false,
+          status: 403,
+          statusText: 'Forbidden',
+          headers: new Map(),
+          text: async () => 'Stream quota exceeded',
+        };
+      }
+      return { ok: true, body: { getReader: () => ({}) } };
+    },
+    lib: { utils: { constructURL: () => 'https://live.example/v2/stream/matrix/changes/MSFT', traceLog: () => {} } },
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      lowTimers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+  });
+  const stream = streamFactory({
+    domain: 'https://live.example',
+    live: true,
+    endpoint: ['stream', 'matrix', 'changes', 'MSFT'],
+    tokens: { access: 'token' },
+    onData: () => {},
+    onError: () => {},
+  });
+  stream.processStream = async () => {};
+
+  const streams = loadExpressionModule('application/domain/ts/streams.js', { lib: makeLib() });
+  const activeClient = new EventEmitter();
+  const queuedClient = new EventEmitter();
+  await streams.subscribe({
+    kind: 'matrix',
+    key: 'active',
+    client: activeClient,
+    start: async () => ({ stop: async () => {} }),
+  });
+
+  const queued = await streams.subscribe({
+    kind: 'matrix',
+    key: 'quota',
+    client: queuedClient,
+    start: async () => {
+      await stream.initiateStream();
+      return { stop: async () => stream.stopStream('test.cleanup') };
+    },
+  });
+
+  const entry = streams.getEntry({ kind: 'matrix', key: 'quota' });
+  assert.equal(queued.state, 'queued');
+  assert.equal(queued.active, false);
+  assert.equal(queued.upstreamReady, false);
+  assert.ok(entry);
+  assert.equal(entry.subscribers.size, 1);
+  assert.equal(stream.reconnectTimer, null);
+  assert.equal(lowTimers.length, 0);
+
+  await streams.unsubscribe({ kind: 'matrix', key: 'active', client: activeClient });
+  if (streams.matrixDrain) await streams.matrixDrain;
+
+  assert.equal(attempts, 2);
+  assert.equal(streams.getEntry({ kind: 'matrix', key: 'quota' }), entry);
+  assert.equal(entry.state, 'active');
+  assert.equal(entry.upstreamReady, true);
+  assert.equal(entry.subscribers.size, 1);
+  await streams.unsubscribe({ kind: 'matrix', key: 'quota', client: queuedClient });
 });
 
 test('matrix capacity queue is FIFO, single-flight, and skips cancelled entries', async () => {

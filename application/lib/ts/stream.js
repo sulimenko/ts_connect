@@ -69,9 +69,9 @@
 
   classifyHttpError({ status, body = '', headers = {} }) {
     const text = body.toLowerCase();
-    const capacity = /concurrent.{0,40}stream|stream.{0,40}(capacity|limit)|capacity.{0,20}(exceed|reach|limit)|too many.{0,40}stream/.test(
-      text,
-    );
+    const quota = /(?:stream[\W_]*quota|quota)(?:[\W_]*limit)?[\W_]*(?:exceed(?:ed)?|reach(?:ed)?)/.test(text);
+    const capacity =
+      quota || /concurrent.{0,40}stream|stream.{0,40}(capacity|limit)|capacity.{0,20}(exceed|reach|limit)|too many.{0,40}stream/.test(text);
     const rateLimit = /rate[\s_-]?limit/.test(text);
     const rateHeader = Object.keys(headers).some((key) => /^(x-)?ratelimit-|^rate-limit-/i.test(key));
     const entitlement = /entitle|permission|not allowed|subscription required/.test(text);
@@ -82,8 +82,8 @@
     }
     if (entitlement) return 'entitlement';
     if (status === 429) return 'capacity';
-    if (invalid) return 'invalid';
     if (capacity || (status === 403 && (rateLimit || rateHeader))) return 'capacity';
+    if (invalid) return 'invalid';
     if ([400, 404, 409, 422].includes(status)) return 'invalid';
     if ([408, 425].includes(status) || status >= 500) return 'transient';
     if (status === 403) return 'forbidden';
