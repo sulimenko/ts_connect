@@ -140,9 +140,11 @@ test('options.chain strips riskFreeRate from snapshot and stream requests', asyn
     range: 94,
     riskFreeRate: 0,
     priceCenter: 123.45,
+    strikeRange: 'NearTheMoney',
   });
   assert.equal(snapshotCalls.length, 1);
   assert.equal(snapshotCalls[0].data.riskFreeRate, undefined);
+  assert.equal(snapshotCalls[0].data.strikeProximity, 94);
   assert.equal(snapshotCalls[0].data.priceCenter, 123.45);
 
   await api.method({
@@ -151,11 +153,51 @@ test('options.chain strips riskFreeRate from snapshot and stream requests', asyn
     range: 94,
     riskFreeRate: 0,
     priceCenter: 123.45,
+    strikeRange: 'NearTheMoney',
     stream: true,
   });
   assert.equal(streamCalls.length, 1);
   assert.equal(streamCalls[0].data.riskFreeRate, undefined);
+  assert.equal(streamCalls[0].data.strikeProximity, 94);
   assert.equal(streamCalls[0].data.priceCenter, 123.45);
+
+  await api.method({
+    symbol: 'TSLA',
+    range: 20,
+    priceCenter: 123.45,
+    strikeRange: 'All',
+  });
+  await api.method({
+    symbol: 'TSLA',
+    range: 20,
+    priceCenter: 123.45,
+    strikeRange: 'All',
+    stream: true,
+  });
+
+  assert.equal(snapshotCalls[1].data.strikeProximity, 1000);
+  assert.equal(snapshotCalls[1].data.priceCenter, undefined);
+  assert.equal(streamCalls[1].data.strikeProximity, 1000);
+  assert.equal(streamCalls[1].data.priceCenter, undefined);
+
+  await api.method({
+    symbol: 'TSLA',
+    range: 0,
+    priceCenter: 123.45,
+    strikeRange: 'All',
+  });
+  await api.method({
+    symbol: 'TSLA',
+    range: 0,
+    priceCenter: 123.45,
+    strikeRange: 'All',
+    stream: true,
+  });
+
+  assert.equal(snapshotCalls[2].data.strikeProximity, 1000);
+  assert.equal(snapshotCalls[2].data.priceCenter, undefined);
+  assert.equal(streamCalls[2].data.strikeProximity, 1000);
+  assert.equal(streamCalls[2].data.priceCenter, undefined);
 });
 
 test('stream helper builds stream key from cleaned option chain payload', async () => {
@@ -207,11 +249,12 @@ test('stream helper builds stream key from cleaned option chain payload', async 
   assert.equal(subscribeArgs.key, 'chains-key');
 });
 
-test('stream packet Failed/Internal server error is permanent and stops reconnect', async () => {
+test('option chain Failed/Internal server error is retryable before terminal cleanup', async () => {
   const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
   let reconnectCalls = 0;
   const stopReasons = [];
   const errors = [];
+  const statuses = [];
 
   const instance = {
     ...streamFactory({
@@ -220,11 +263,21 @@ test('stream packet Failed/Internal server error is permanent and stops reconnec
       tokens: { access: 'token' },
       onData: () => {},
       onError: () => {},
+      onStatus: (status) => statuses.push(status),
+      retryPolicy: {
+        packetErrors: {
+          failedInternalServerError: {
+            retryable: true,
+            maxRetries: 2,
+          },
+        },
+      },
     }),
     shouldReconnect: true,
     checkTimeout() {},
-    scheduleReconnect: async () => {
+    scheduleReconnect: async (args) => {
       reconnectCalls += 1;
+      assert.equal(args.maxRetries, 2);
     },
     stopStream(reason = 'unknown') {
       stopReasons.push(reason);
@@ -241,15 +294,194 @@ test('stream packet Failed/Internal server error is permanent and stops reconnec
   const result = instance.handlePacket(packet, null, (error) => errors.push(error));
 
   assert.equal(result, false);
-  assert.equal(reconnectCalls, 0);
+  assert.equal(reconnectCalls, 1);
+  assert.deepEqual(stopReasons, []);
+  assert.equal(errors.length, 0);
+  assert.equal(statuses.length, 1);
+  assert.equal(statuses[0].state, 'recovering');
+  assert.equal(statuses[0].retryAttempt, 1);
+  assert.equal(statuses[0].maxRetries, 2);
+
+  instance.handlePacket(
+    { Legs: [] },
+    () => {},
+    () => {},
+  );
+  assert.equal(statuses[1].state, 'active');
+  assert.equal(instance.packetRetryAttempt, 0);
+
+  assert.equal(
+    instance.handlePacket(packet, null, (error) => errors.push(error)),
+    false,
+  );
+  assert.equal(
+    instance.handlePacket(packet, null, (error) => errors.push(error)),
+    false,
+  );
+  assert.equal(
+    instance.handlePacket(packet, null, (error) => errors.push(error)),
+    false,
+  );
+
+  assert.equal(reconnectCalls, 3);
   assert.deepEqual(stopReasons, ['permanent-error']);
+  assert.deepEqual(
+    statuses.map((status) => status.retryAttempt),
+    [1, 0, 1, 2],
+  );
   assert.equal(errors.length, 1);
-  assert.ok(errors[0] instanceof Error);
-  assert.equal(errors[0].message, 'Failed Internal server error');
   assert.equal(errors[0].code, 'Failed');
-  assert.equal(errors[0].upstreamMessage, 'Internal server error');
-  assert.equal(errors[0].details, 'Internal server error');
-  assert.equal(errors[0].symbol, 'TSLA');
+  assert.equal(errors[0].permanent, true);
+  assert.equal(errors[0].retryable, false);
+});
+
+test('unknown packet errors stay transient without bounded retry exhaustion', async () => {
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
+  const retryPolicy = { packetErrors: { failedInternalServerError: { retryable: true, maxRetries: 0 } } };
+  const statuses = [];
+  const errors = [];
+  const stops = [];
+  let reconnectCalls = 0;
+
+  const instance = {
+    ...streamFactory({
+      live: true,
+      endpoint: ['marketdata', 'stream', 'quotes', 'TSLA'],
+      tokens: { access: 'token' },
+      onData: () => {},
+      onError: () => {},
+      onStatus: (status) => statuses.push(status),
+      retryPolicy,
+    }),
+    checkTimeout() {},
+    scheduleReconnect: async () => {
+      reconnectCalls += 1;
+    },
+    stopStream(reason = 'unknown') {
+      stops.push(reason);
+      this.shouldReconnect = false;
+    },
+  };
+
+  const result = instance.handlePacket(
+    { Error: 'SomeTransient', Message: 'temporary', Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }], Bid: '1.20', Ask: '1.30' },
+    null,
+    (error) => errors.push(error),
+  );
+
+  assert.equal(result, false);
+  assert.equal(reconnectCalls, 1);
+  assert.equal(errors.length, 0);
+  assert.deepEqual(stops, []);
+  assert.equal(statuses.length, 1);
+  assert.equal(statuses[0].retryAttempt, null);
+  assert.equal(statuses[0].maxRetries, null);
+  assert.equal(statuses[0].terminal, false);
+  assert.equal(statuses[0].retryable, true);
+  assert.equal(JSON.stringify(statuses[0]).includes('SHOULD_NOT_LEAK'), false);
+});
+
+test('stream bounded packet retry uses real reconnect flow', async () => {
+  const timers = [];
+  const retryPolicy = { packetErrors: { failedInternalServerError: { retryable: true, maxRetries: 2 } } };
+  const packets = [
+    { Error: 'Failed', Message: 'Internal server error', Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }], Bid: '1.20', Ask: '1.30' },
+    { Error: 'Failed', Message: 'Internal server error', Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }], Bid: '1.20', Ask: '1.30' },
+    { Error: 'Failed', Message: 'Internal server error', Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }], Bid: '1.20', Ask: '1.30' },
+  ];
+  let connectionCount = 0;
+
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+    fetch: async () => {
+      const packet = packets[connectionCount];
+      connectionCount += 1;
+      let read = false;
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: async () => {
+              if (read) return { done: true };
+              read = true;
+              return { done: false, value: new TextEncoder().encode(`${JSON.stringify(packet)}\n`) };
+            },
+          }),
+        },
+      };
+    },
+    lib: {
+      utils: {
+        constructURL: () => 'https://live.example/v3/marketdata/stream/options/chains/TSLA',
+        traceLog: () => {},
+      },
+    },
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+  });
+
+  const statusEvents = [];
+  const terminalErrors = [];
+  const stopReasons = [];
+  const instance = streamFactory({
+    domain: 'https://live.example',
+    live: true,
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'TSLA'],
+    tokens: { access: 'token' },
+    onData: () => {},
+    onError: (error) => terminalErrors.push(error),
+    onStatus: (status) => statusEvents.push(status),
+    retryPolicy,
+  });
+  const originalStop = instance.stopStream;
+  instance.stopStream = function stop(reason = 'unknown') {
+    stopReasons.push(reason);
+    return originalStop.call(this, reason);
+  };
+
+  const flush = async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+  const runReconnect = async () => {
+    const timer = timers.find((item) => !item.cleared);
+    assert.ok(timer);
+    timer.cleared = true;
+    await timer.fn();
+    await flush();
+  };
+
+  await instance.initiateStream();
+  await flush();
+  assert.equal(connectionCount, 1);
+  assert.equal(statusEvents.length, 1);
+  assert.equal(statusEvents[0].retryAttempt, 1);
+  assert.equal(statusEvents[0].maxRetries, 2);
+  assert.equal(terminalErrors.length, 0);
+
+  await runReconnect();
+  assert.equal(connectionCount, 2);
+  assert.equal(statusEvents.length, 2);
+  assert.equal(statusEvents[1].retryAttempt, 2);
+  assert.equal(statusEvents[1].maxRetries, 2);
+  assert.equal(terminalErrors.length, 0);
+
+  await runReconnect();
+  assert.equal(connectionCount, 3);
+  assert.equal(statusEvents.length, 2);
+  assert.equal(terminalErrors.length, 1);
+  assert.equal(terminalErrors[0].exhausted, true);
+  assert.equal(terminalErrors[0].terminal, true);
+  assert.equal(terminalErrors[0].retryable, false);
+  assert.equal(stopReasons[0], 'permanent-error');
+  assert.equal(timers.filter((timer) => !timer.cleared).length, 0);
+  assert.equal(JSON.stringify(statusEvents).includes('SHOULD_NOT_LEAK'), false);
+  assert.equal(JSON.stringify(terminalErrors).includes('SHOULD_NOT_LEAK'), false);
 });
 
 test('stream read terminated by socket close is transient and does not log unexpected error', async () => {
@@ -395,9 +627,227 @@ test('transient stream reconnect uses one bounded timer', async () => {
   assert.equal(instance.reconnectDelay, instance.maxReconnectDelay);
 });
 
+test('initial HTTP stream failure is normalized and does not start reconnect', async () => {
+  const timers = [];
+  const responses = [
+    {
+      headers: new Map([
+        ['retry-after', '5'],
+        ['x-request-id', 'req-1'],
+        ['authorization', 'secret'],
+      ]),
+      body: 'Concurrent stream capacity exceeded Bearer secret-token',
+    },
+    { headers: new Map(), body: 'Stream quota exceeded' },
+  ];
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+    fetch: async () => {
+      const response = responses.shift();
+      return {
+        ok: false,
+        status: 403,
+        statusText: 'Forbidden',
+        headers: response.headers,
+        text: async () => response.body,
+      };
+    },
+    lib: {
+      utils: {
+        constructURL: () => 'https://live.example/v2/stream/matrix/changes/TSLA',
+        traceLog: () => {},
+      },
+    },
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay };
+      timers.push(timer);
+      return timer;
+    },
+  });
+  const errors = [];
+  const instance = streamFactory({
+    domain: 'https://live.example',
+    live: true,
+    endpoint: ['stream', 'matrix', 'changes', 'TSLA'],
+    tokens: { access: 'token' },
+    onError: (error) => errors.push(error),
+  });
+
+  await assert.rejects(instance.initiateStream(), (error) => {
+    assert.equal(error.status, 403);
+    assert.equal(error.statusText, 'Forbidden');
+    assert.equal(error.body, 'Concurrent stream capacity exceeded Bearer [REDACTED]');
+    assert.equal(error.headers['retry-after'], '5');
+    assert.equal(error.headers['x-request-id'], 'req-1');
+    assert.equal(error.headers.authorization, undefined);
+    assert.equal(error.classification, 'capacity');
+    assert.equal(error.permanent, false);
+    assert.equal(error.retryable, true);
+    assert.equal(error.reconnectable, false);
+    return true;
+  });
+  await assert.rejects(instance.initiateStream(), (error) => {
+    assert.equal(error.status, 403);
+    assert.equal(error.statusText, 'Forbidden');
+    assert.equal(error.body, 'Stream quota exceeded');
+    assert.equal(error.classification, 'capacity');
+    assert.equal(error.permanent, false);
+    assert.equal(error.retryable, true);
+    assert.equal(error.reconnectable, false);
+    return true;
+  });
+  assert.equal(errors.length, 0);
+  assert.equal(timers.length, 0);
+  assert.equal(instance.classifyHttpError({ status: 401 }), 'authorization');
+  assert.equal(instance.classifyHttpError({ status: 403, body: 'not entitled' }), 'entitlement');
+  assert.equal(instance.classifyHttpError({ status: 400, body: 'invalid request' }), 'invalid');
+  assert.equal(instance.classifyHttpError({ status: 503 }), 'transient');
+  assert.equal(instance.classifyHttpError({ status: 503, headers: { 'retry-after': '5' } }), 'transient');
+  assert.equal(instance.classifyHttpError({ status: 503, body: 'Concurrent stream capacity exceeded' }), 'capacity');
+  assert.equal(instance.classifyHttpError({ status: 503, body: 'Stream quota exceeded' }), 'capacity');
+  assert.equal(instance.classifyHttpError({ status: 429 }), 'capacity');
+  for (const body of [
+    'Stream quota exceeded',
+    'STREAM QUOTA EXCEEDED',
+    'stream   quota   exceeded',
+    'Stream quota exceeded.',
+    'stream-quota reached',
+    'quota exceeded',
+    'stream quota reached',
+    'quota limit reached',
+  ]) {
+    assert.equal(instance.classifyHttpError({ status: 403, body }), 'capacity', body);
+  }
+  for (const body of ['Forbidden', 'quota information unavailable']) {
+    assert.equal(instance.classifyHttpError({ status: 403, body }), 'forbidden', body);
+  }
+  for (const body of ['not entitled to market depth', 'permission denied', 'permission denied: stream quota exceeded']) {
+    assert.equal(instance.classifyHttpError({ status: 403, body }), 'entitlement', body);
+  }
+  assert.equal(instance.classifyHttpError({ status: 401, body: 'Stream quota exceeded' }), 'authorization');
+  for (const header of ['x-ratelimit-remaining', 'ratelimit-remaining', 'rate-limit-remaining']) {
+    assert.equal(instance.classifyHttpError({ status: 403, headers: { [header]: '0' } }), 'capacity');
+  }
+  assert.equal(instance.classifyHttpError({ status: 403 }), 'forbidden');
+});
+
+test('reconnect HTTP outcomes stop capacity and permanent retries while transient recovers', async () => {
+  const cases = [
+    { status: 429, classification: 'capacity', outcome: 'queued' },
+    { status: 403, body: 'Concurrent stream capacity exceeded', classification: 'capacity', outcome: 'queued' },
+    { status: 401, classification: 'authorization', outcome: 'failed' },
+    { status: 403, body: 'not entitled', classification: 'entitlement', outcome: 'failed' },
+    { status: 403, classification: 'forbidden', outcome: 'failed' },
+    { status: 400, body: 'invalid request', classification: 'invalid', outcome: 'failed' },
+    { status: 503, body: 'Concurrent stream capacity exceeded', classification: 'capacity', outcome: 'queued' },
+    { status: 503, headers: { 'retry-after': '5' }, classification: 'transient', outcome: 'recovering' },
+  ];
+
+  for (const item of cases) {
+    const timers = [];
+    const statuses = [];
+    const errors = [];
+    const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+      fetch: async () => ({
+        ok: false,
+        status: item.status,
+        statusText: 'Failure',
+        headers: new Map(Object.entries(item.headers ?? {})),
+        text: async () => item.body ?? '',
+      }),
+      lib: { utils: { constructURL: () => 'https://live.example/stream', traceLog: () => {} } },
+      setTimeout: (fn, delay) => {
+        const timer = { fn, delay, cleared: false };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimeout: (timer) => {
+        if (timer) timer.cleared = true;
+      },
+    });
+    const instance = streamFactory({
+      domain: 'https://live.example',
+      live: true,
+      endpoint: ['stream', 'matrix', 'changes', 'TSLA'],
+      tokens: { access: 'token' },
+      onError: (error) => errors.push(error),
+      onStatus: (status) => statuses.push(status),
+    });
+    instance.timeoutHeartbeat = { heartbeat: true };
+    instance.reconnectTimer = { reconnect: true };
+
+    await instance.initiateStream({ reconnect: true, generation: 0 });
+
+    assert.equal(item.classification, (statuses[0]?.error ?? errors[0]).classification);
+    assert.equal(instance.timeoutHeartbeat, null);
+    if (item.outcome === 'recovering') {
+      assert.equal(statuses[0].state, 'recovering');
+      assert.equal(errors.length, 0);
+      assert.ok(instance.reconnectTimer);
+      assert.equal(instance.shouldReconnect, true);
+    } else {
+      assert.equal(statuses[0]?.state ?? 'failed', item.outcome);
+      assert.equal(errors.length, item.outcome === 'failed' ? 1 : 0);
+      assert.equal(instance.reconnectTimer, null);
+      assert.equal(instance.shouldReconnect, false);
+    }
+  }
+});
+
+test('successful reconnect returns stream status to active', async () => {
+  const statuses = [];
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+    fetch: async () => ({ ok: true, body: { getReader: () => ({}) } }),
+    lib: { utils: { constructURL: () => 'https://live.example/stream', traceLog: () => {} } },
+  });
+  const instance = streamFactory({
+    domain: 'https://live.example',
+    live: true,
+    endpoint: ['stream', 'matrix', 'changes', 'TSLA'],
+    tokens: { access: 'token' },
+    onStatus: (status) => statuses.push(status),
+  });
+  instance.processStream = async () => {};
+
+  await instance.initiateStream({ reconnect: true, generation: 0 });
+
+  assert.equal(statuses.length, 1);
+  assert.equal(statuses[0].state, 'active');
+  instance.stopStream('test.cleanup');
+});
+
+test('stopped stream generation cancels reconnect before the next connection', async () => {
+  const timers = [];
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+  });
+  const instance = streamFactory({
+    live: true,
+    endpoint: ['stream', 'matrix', 'changes', 'TSLA'],
+    tokens: { access: 'token' },
+  });
+  let connects = 0;
+  instance.initiateStream = async () => {
+    connects += 1;
+  };
+
+  await instance.scheduleReconnect();
+  assert.equal(timers.length, 1);
+  instance.stopStream('unsubscribe');
+  await timers[0].fn();
+  assert.equal(connects, 0);
+});
+
 test('GoAway reconnects while INVALID SYMBOL remains permanent stop', async () => {
   const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
   const stopReasons = [];
+  const statuses = [];
   let reconnectCalls = 0;
 
   const instance = {
@@ -407,6 +857,7 @@ test('GoAway reconnects while INVALID SYMBOL remains permanent stop', async () =
       tokens: { access: 'token' },
       onData: () => {},
       onError: () => {},
+      onStatus: (status) => statuses.push(status),
     }),
     scheduleReconnect: async () => {
       reconnectCalls += 1;
@@ -421,14 +872,34 @@ test('GoAway reconnects while INVALID SYMBOL remains permanent stop', async () =
   assert.equal(instance.handlePacket({ StreamStatus: 'GoAway' }, null, null), false);
   assert.equal(reconnectCalls, 1);
   assert.deepEqual(stopReasons, []);
+  assert.equal(statuses.length, 1);
+  assert.equal(statuses[0].state, 'recovering');
+  assert.equal(statuses[0].reason, 'upstream.GoAway');
+  assert.equal(statuses[0].retryAttempt, null);
+  assert.equal(statuses[0].maxRetries, null);
+  assert.equal(statuses[0].retryable, true);
+  assert.equal(statuses[0].terminal, false);
+  assert.equal(statuses[0].active, true);
+  assert.equal(statuses[0].resubscribeRequired, false);
+  assert.equal(instance.packetRetryAttempt, 0);
 
   instance.shouldReconnect = true;
+  const errors = [];
   assert.equal(
-    instance.handlePacket({ Error: 'INVALID SYMBOL', Message: 'bad symbol', Symbol: 'BAD' }, null, () => {}),
+    instance.handlePacket({ Error: 'INVALID SYMBOL', Message: 'bad symbol', Symbol: 'BAD' }, null, (error) => errors.push(error)),
     false,
   );
   assert.equal(reconnectCalls, 1);
   assert.deepEqual(stopReasons, ['permanent-error']);
+  assert.equal(errors[0].code, 'INVALID SYMBOL');
+  assert.equal(errors[0].upstreamMessage, 'bad symbol');
+  assert.equal(errors[0].details, 'bad symbol');
+  assert.equal(errors[0].symbol, 'BAD');
+  assert.equal(errors[0].permanent, true);
+  assert.equal(errors[0].reconnectable, false);
+  assert.equal(errors[0].streamStopped, true);
+  assert.equal(errors[0].packet, undefined);
+  assert.equal(statuses.length, 1);
 });
 
 test('serializeError preserves upstream error metadata', async () => {
@@ -460,6 +931,42 @@ test('serializeError preserves upstream error metadata', async () => {
   assert.equal(errorResult.details, 'more detail');
   assert.equal(errorResult.upstreamMessage, 'upstream detail');
   assert.equal(errorResult.symbol, 'TSLA');
+});
+
+test('managed stream touch reports resubscribe state explicitly', async () => {
+  const streams = loadExpressionModule('application/domain/ts/streams.js', {
+    lib: makeLib(),
+  });
+  const clientA = new EventEmitter();
+  const clientB = new EventEmitter();
+
+  const missing = streams.touch({ kind: 'chains', key: 'missing-key', client: clientA });
+  assert.equal(missing.active, false);
+  assert.equal(missing.resubscribeRequired, true);
+  assert.equal(missing.reason, 'missing');
+
+  await streams.subscribe({
+    kind: 'chains',
+    key: 'chains-key',
+    client: clientA,
+    start: async () => ({ stop: async () => {} }),
+  });
+
+  const inactive = streams.touch({ kind: 'chains', key: 'chains-key', client: clientB });
+  assert.equal(inactive.active, false);
+  assert.equal(inactive.resubscribeRequired, true);
+  assert.equal(inactive.reason, 'not-subscribed');
+
+  const active = streams.touch({ kind: 'chains', key: 'chains-key', client: clientA });
+  assert.equal(active.active, true);
+  assert.equal(active.resubscribeRequired, false);
+
+  await streams.unsubscribe({
+    kind: 'chains',
+    key: 'chains-key',
+    client: clientA,
+    reason: 'test.cleanup',
+  });
 });
 
 test('managed stream subscribe registers the client before synchronous startup emit', async () => {
@@ -542,6 +1049,7 @@ test('managed stream concurrent subscribe shares one startup promise', async () 
   const clientA = new EventEmitter();
   const clientB = new EventEmitter();
   let startCalls = 0;
+  let stopCalls = 0;
   let resolveUpstream = null;
 
   const upstreamReady = new Promise((resolve) => {
@@ -575,7 +1083,9 @@ test('managed stream concurrent subscribe shares one startup promise', async () 
   assert.equal(startCalls, 1);
 
   resolveUpstream({
-    stop: async () => {},
+    stop: async () => {
+      stopCalls += 1;
+    },
   });
 
   const [firstResult, secondResult] = await Promise.all([first, second]);
@@ -592,12 +1102,302 @@ test('managed stream concurrent subscribe shares one startup promise', async () 
     client: clientA,
     reason: 'test.cleanup',
   });
+  assert.equal(stopCalls, 0);
+  assert.ok(streams.getEntry({ kind: 'matrix', key: 'matrix-key' }));
   await streams.unsubscribe({
     kind: 'matrix',
     key: 'matrix-key',
     client: clientB,
     reason: 'test.cleanup',
   });
+  assert.equal(stopCalls, 1);
+  assert.equal(streams.getEntry({ kind: 'matrix', key: 'matrix-key' }), null);
+});
+
+test('matrix quota startup queues until the shared drain frees capacity', async () => {
+  let attempts = 0;
+  const lowTimers = [];
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+    fetch: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return {
+          ok: false,
+          status: 403,
+          statusText: 'Forbidden',
+          headers: new Map(),
+          text: async () => 'Stream quota exceeded',
+        };
+      }
+      return { ok: true, body: { getReader: () => ({}) } };
+    },
+    lib: { utils: { constructURL: () => 'https://live.example/v2/stream/matrix/changes/MSFT', traceLog: () => {} } },
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      lowTimers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+  });
+  const stream = streamFactory({
+    domain: 'https://live.example',
+    live: true,
+    endpoint: ['stream', 'matrix', 'changes', 'MSFT'],
+    tokens: { access: 'token' },
+    onData: () => {},
+    onError: () => {},
+  });
+  stream.processStream = async () => {};
+
+  const streams = loadExpressionModule('application/domain/ts/streams.js', { lib: makeLib() });
+  const activeClient = new EventEmitter();
+  const queuedClient = new EventEmitter();
+  await streams.subscribe({
+    kind: 'matrix',
+    key: 'active',
+    client: activeClient,
+    start: async () => ({ stop: async () => {} }),
+  });
+
+  const queued = await streams.subscribe({
+    kind: 'matrix',
+    key: 'quota',
+    client: queuedClient,
+    start: async () => {
+      await stream.initiateStream();
+      return { stop: async () => stream.stopStream('test.cleanup') };
+    },
+  });
+
+  const entry = streams.getEntry({ kind: 'matrix', key: 'quota' });
+  assert.equal(queued.state, 'queued');
+  assert.equal(queued.active, false);
+  assert.equal(queued.upstreamReady, false);
+  assert.ok(entry);
+  assert.equal(entry.subscribers.size, 1);
+  assert.equal(stream.reconnectTimer, null);
+  assert.equal(lowTimers.length, 0);
+
+  await streams.unsubscribe({ kind: 'matrix', key: 'active', client: activeClient });
+  if (streams.matrixDrain) await streams.matrixDrain;
+
+  assert.equal(attempts, 2);
+  assert.equal(streams.getEntry({ kind: 'matrix', key: 'quota' }), entry);
+  assert.equal(entry.state, 'active');
+  assert.equal(entry.upstreamReady, true);
+  assert.equal(entry.subscribers.size, 1);
+  await streams.unsubscribe({ kind: 'matrix', key: 'quota', client: queuedClient });
+});
+
+test('matrix capacity queue is FIFO, single-flight, and skips cancelled entries', async () => {
+  const timers = [];
+  const streams = loadExpressionModule('application/domain/ts/streams.js', {
+    lib: makeLib(),
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+  });
+  const clients = [new EventEmitter(), new EventEmitter(), new EventEmitter(), new EventEmitter()];
+  const calls = [];
+  const capacity = Object.assign(new Error('capacity'), { classification: 'capacity', status: 429 });
+  const attempts = { B: 0, C: 0, D: 0 };
+  const start = (key) => async () => {
+    calls.push(key);
+    attempts[key] += 1;
+    if (attempts[key] <= (key === 'B' ? 2 : 1)) throw capacity;
+    return { stop: async () => {} };
+  };
+
+  await streams.subscribe({ kind: 'matrix', key: 'A', client: clients[0], start: async () => ({ stop: async () => {} }) });
+  const queuedB = await streams.subscribe({ kind: 'matrix', key: 'B', client: clients[1], start: start('B') });
+  await streams.subscribe({ kind: 'matrix', key: 'C', client: clients[2], start: start('C') });
+  await streams.subscribe({ kind: 'matrix', key: 'D', client: clients[3], start: start('D') });
+
+  assert.equal(queuedB.active, false);
+  assert.equal(queuedB.upstreamReady, false);
+  assert.equal(queuedB.state, 'queued');
+  assert.deepEqual(
+    Array.from(streams.matrixQueue, (entry) => entry.key),
+    ['B', 'C', 'D'],
+  );
+  await streams.unsubscribe({ kind: 'matrix', key: 'D', client: clients[3] });
+  assert.deepEqual(
+    Array.from(streams.matrixQueue, (entry) => entry.key),
+    ['B', 'C'],
+  );
+
+  await streams.unsubscribe({ kind: 'matrix', key: 'A', client: clients[0] });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(streams.getEntry({ kind: 'matrix', key: 'B' }).state, 'queued');
+  assert.equal(timers.filter((timer) => !timer.cleared && timer.delay < 30000).length, 1);
+  assert.deepEqual(calls, ['B', 'C', 'D', 'B']);
+
+  if (streams.matrixDrain) await streams.matrixDrain;
+  await timers.find((timer) => !timer.cleared && timer.delay < 30000).fn();
+  if (streams.matrixDrain) await streams.matrixDrain;
+  assert.equal(streams.getEntry({ kind: 'matrix', key: 'B' }).state, 'active');
+  assert.deepEqual(
+    Array.from(streams.matrixQueue, (entry) => entry.key),
+    ['C'],
+  );
+
+  clients[2].emit('close');
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(streams.getEntry({ kind: 'matrix', key: 'C' }), null);
+  assert.equal(calls.filter((key) => key === 'C').length, 1);
+  assert.equal(streams.matrixQueue.length, 0);
+  await streams.unsubscribe({ kind: 'matrix', key: 'B', client: clients[1] });
+});
+
+test('matrix permanent startup classes fail without entering capacity queue', async () => {
+  const streams = loadExpressionModule('application/domain/ts/streams.js', { lib: makeLib() });
+  for (const [classification, status] of [
+    ['authorization', 401],
+    ['entitlement', 403],
+    ['invalid', 400],
+    ['forbidden', 403],
+  ]) {
+    const client = new EventEmitter();
+    const error = Object.assign(new Error(classification), { classification, status, permanent: true });
+    await assert.rejects(
+      streams.subscribe({ kind: 'matrix', key: classification, client, start: async () => Promise.reject(error) }),
+      new RegExp(classification),
+    );
+    assert.equal(streams.getEntry({ kind: 'matrix', key: classification }), null);
+    assert.equal(client.listenerCount('close'), 0);
+  }
+  assert.equal(streams.matrixQueue.length, 0);
+});
+
+test('matrix reconnect capacity moves the active entry to the shared queue once', async () => {
+  const timers = [];
+  const events = [];
+  const streams = loadExpressionModule('application/domain/ts/streams.js', {
+    lib: makeLib(),
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+  });
+  const client = new EventEmitter();
+  const emit = client.emit.bind(client);
+  client.emit = (eventName, payload) => {
+    events.push({ eventName, payload });
+    return emit(eventName, payload);
+  };
+  let notifyStatus = null;
+  let stops = 0;
+
+  await streams.subscribe({
+    kind: 'matrix',
+    key: 'matrix-reconnect',
+    client,
+    start: async (callbacks) => {
+      notifyStatus = callbacks.notifyStatus;
+      return {
+        stop: async () => {
+          stops += 1;
+        },
+      };
+    },
+  });
+  const staleStatus = notifyStatus;
+  const capacity = Object.assign(new Error('capacity'), { classification: 'capacity', status: 429, retryable: true });
+
+  await notifyStatus({ state: 'queued', reason: 'upstream.capacity', active: false, retryable: true, terminal: false, error: capacity });
+  await staleStatus({ state: 'active', reason: 'stale', active: true });
+
+  const entry = streams.getEntry({ kind: 'matrix', key: 'matrix-reconnect' });
+  assert.ok(entry);
+  assert.equal(entry.state, 'queued');
+  assert.equal(entry.upstreamReady, false);
+  assert.equal(entry.upstream, null);
+  assert.equal(stops, 1);
+  assert.deepEqual(
+    Array.from(streams.matrixQueue, (queued) => queued.key),
+    ['matrix-reconnect'],
+  );
+  assert.ok(streams.matrixProbe);
+  assert.equal(timers.filter((timer) => !timer.cleared && timer.delay < 30000).length, 1);
+  assert.equal(
+    events.some(({ eventName }) => eventName === 'stream/error'),
+    false,
+  );
+  assert.equal(events.at(-1).payload.state, 'queued');
+
+  await streams.unsubscribe({ kind: 'matrix', key: 'matrix-reconnect', client, reason: 'test.cleanup' });
+  assert.equal(client.listenerCount('close'), 0);
+});
+
+test('managed streams keep one close listener per client and clean all entries', async () => {
+  const streams = loadExpressionModule('application/domain/ts/streams.js', { lib: makeLib() });
+  const client = new EventEmitter();
+  let stops = 0;
+  const stop = async () => {
+    stops += 1;
+  };
+
+  for (let index = 0; index < 20; index += 1) {
+    await streams.subscribe({
+      kind: 'matrix',
+      key: `matrix-${index}`,
+      client,
+      start: async () => ({ stop }),
+    });
+  }
+
+  assert.equal(client.listenerCount('close'), 1);
+  await streams.unsubscribeAll({ client, reason: 'client.close' });
+  assert.equal(client.listenerCount('close'), 0);
+  assert.equal(streams.getBucket({ kind: 'matrix' }).size, 0);
+  assert.equal(stops, 20);
+});
+
+test('TradeStation client stores matrix stream only after successful startup', async () => {
+  const created = [];
+  const factory = loadExpressionModule('application/domain/ts/client.js', {
+    lib: {
+      ts: {
+        stream: () => {
+          const stream = {
+            initiateStream: async () => {
+              throw Object.assign(new Error('Forbidden'), { status: 403, classification: 'capacity' });
+            },
+            stopStream: () => {},
+          };
+          created.push(stream);
+          return stream;
+        },
+      },
+    },
+  });
+  const client = await factory();
+
+  await assert.rejects(
+    client.streamMatrix({
+      endpoint: ['stream', 'matrix', 'changes', 'TSLA'],
+      symbol: 'TSLA',
+      data: {},
+      onData: () => {},
+      onError: () => {},
+    }),
+    /Forbidden/,
+  );
+  assert.equal(created.length, 1);
+  assert.deepEqual(Object.keys(client.streams.matrix), []);
 });
 
 test('symbol helpers normalize display and internal option formats idempotently', async () => {
@@ -989,6 +1789,48 @@ test('stream matrix emits canonical levelII packets while routing by tsSymbol', 
   assert.equal(emitted.payload.size, 2);
 });
 
+test('stream matrix permanent reconnect error cleans managed and stored state', async () => {
+  const utils = loadUtils();
+  const streams = loadExpressionModule('application/domain/ts/streams.js', { lib: makeLib() });
+  const client = new EventEmitter();
+  let handlers = null;
+  let stored = true;
+  const tsClient = {
+    buildStreamKey: () => 'matrix-key',
+    streamMatrix: async (args) => {
+      handlers = args;
+      return 'matrix-key';
+    },
+    stopStoredStream: async () => {
+      stored = false;
+    },
+  };
+  const matrixApi = loadExpressionModule('application/api/stream/matrix.js', {
+    DomainError: class DomainError extends Error {},
+    context: { client },
+    domain: { ts: { clients: { getClient: async () => tsClient }, streams } },
+    lib: { utils },
+  });
+
+  await matrixApi.method({ instruments: [{ symbol: 'TSLA' }] });
+  assert.ok(streams.getEntry({ kind: 'matrix', key: 'matrix-key' }));
+  const error = Object.assign(new Error('Forbidden'), {
+    classification: 'forbidden',
+    permanent: true,
+    terminal: true,
+    streamStopped: true,
+  });
+  handlers.onError(error);
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(streams.getEntry({ kind: 'matrix', key: 'matrix-key' }), null);
+  assert.equal(stored, false);
+  assert.equal(client.listenerCount('close'), 0);
+  assert.equal(streams.matrixQueue.length, 0);
+  assert.equal(streams.matrixProbe, null);
+});
+
 test('stream quotes keeps batch keys stable and guards public input', async () => {
   const utils = loadUtils();
   const readQuote = loadExpressionModule('application/lib/ts/readQuote.js', {
@@ -1238,10 +2080,31 @@ test('stream addBarchart emits canonical symbol for TS-style input', async () =>
 
 test('stream optionChain emits root instrument payload while preserving chain symbols', async () => {
   const utils = loadUtils();
+  const debugCalls = [];
   let emitted = null;
+  let now = 0;
   let streamChainsArgs = null;
+  const timers = [];
+  let stopHandle = null;
 
   const optionChain = loadExpressionModule('application/lib/stream/optionChain.js', {
+    Date: {
+      now: () => now,
+    },
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+    console: {
+      debug: (...args) => debugCalls.push(args),
+      error: () => {},
+      info: () => {},
+      warn: () => {},
+    },
     lib: {
       utils,
       ts: {
@@ -1280,6 +2143,9 @@ test('stream optionChain emits root instrument payload while preserving chain sy
                 ImpliedVolatility: '0.5',
                 Volume: 11,
               });
+              await args.onData({
+                Legs: [{ Symbol: 'CRWV 280121P75', Expiration: '2028-01-19T00:00:00Z', OptionType: 'Put' }],
+              });
               return 'chains-registered-key';
             },
             stopStoredStream: async () => {},
@@ -1287,9 +2153,9 @@ test('stream optionChain emits root instrument payload while preserving chain sy
         },
         streams: {
           subscribe: async ({ start }) => {
-            await start({
+            stopHandle = await start({
               emit: (eventName, payload) => {
-                emitted = { eventName, payload };
+                if (!emitted) emitted = { eventName, payload };
               },
               notifyError: () => {},
             });
@@ -1324,6 +2190,202 @@ test('stream optionChain emits root instrument payload while preserving chain sy
   assert.equal(emitted.payload.instrument.currency, 'USD');
   assert.equal(emitted.payload.symbol, undefined);
   assert.equal(emitted.payload.chain['00080000'].C.symbol_raw, 'CRWV280121C00080000');
+  assert.equal(timers[0].delay, 15000);
+  now = 42;
+  await stopHandle.stop({ reason: 'test.cleanup' });
+
+  const statsCall = debugCalls.find((args) => args[0] === 'stream/chains observed stats');
+  assert.ok(statsCall);
+  const stats = JSON.parse(JSON.stringify(statsCall[1]));
+  for (const key of [
+    'observedStrikes',
+    'observedLegs',
+    'minStrike',
+    'maxStrike',
+    'minStrikeValue',
+    'maxStrikeValue',
+    'firstStrikes',
+    'lastStrikes',
+    'durationMs',
+  ]) {
+    assert.ok(Object.hasOwn(stats, key));
+  }
+  assert.equal(stats.phase, 'test.cleanup');
+  assert.equal(stats.observedStrikes, 2);
+  assert.equal(stats.observedLegs, 2);
+  assert.equal(stats.minStrike, '00075000');
+  assert.equal(stats.maxStrike, '00080000');
+  assert.equal(stats.minStrikeValue, 75);
+  assert.equal(stats.maxStrikeValue, 80);
+  assert.deepEqual(stats.firstStrikes, ['00075000', '00080000']);
+  assert.deepEqual(stats.lastStrikes, ['00075000', '00080000']);
+  assert.equal(JSON.stringify(stats).includes('CRWV280121C00080000'), false);
+  assert.equal(JSON.stringify(debugCalls).includes('"Legs"'), false);
+  assert.equal(JSON.stringify(debugCalls).includes('"Bid"'), false);
+  assert.equal(JSON.stringify(debugCalls).includes('"Ask"'), false);
+});
+
+test('stream optionChain error lifecycle cleans terminal streams and keeps transient streams', async () => {
+  const utils = loadUtils();
+  const debugCalls = [];
+  const errorCalls = [];
+  const stops = [];
+  const handlers = [];
+  const statusHandlers = [];
+  const streams = loadExpressionModule('application/domain/ts/streams.js', {
+    lib: makeLib(),
+    console: {
+      debug: (...args) => debugCalls.push(args),
+      error: (...args) => errorCalls.push(args),
+      info: () => {},
+      warn: () => {},
+    },
+  });
+  const clients = [new EventEmitter(), new EventEmitter()];
+  const events = [];
+
+  for (const [index, client] of clients.entries()) {
+    client.emit = (eventName, payload) => {
+      events.push({ eventName, payload, entryPresent: Boolean(streams.getEntry({ kind: 'chains', key: `chains-key-${index}` })) });
+      return EventEmitter.prototype.emit.call(client, eventName, payload);
+    };
+  }
+
+  const optionChain = loadExpressionModule('application/lib/stream/optionChain.js', {
+    console: {
+      debug: (...args) => debugCalls.push(args),
+      error: (...args) => errorCalls.push(args),
+      info: () => {},
+      warn: () => {},
+    },
+    lib: {
+      utils,
+      ts: {
+        readOptionChain: loadExpressionModule('application/lib/ts/readOptionChain.js', {
+          lib: { utils },
+        }),
+      },
+    },
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            buildStreamKey: ({ data }) => `chains-key-${data.case}`,
+            streamChains: async ({ onError, onStatus }) => {
+              handlers.push(onError);
+              statusHandlers.push(onStatus);
+              return `chains-key-${handlers.length - 1}`;
+            },
+            stopStoredStream: async (args) => {
+              stops.push(args);
+            },
+          }),
+        },
+        streams,
+      },
+    },
+  });
+
+  for (const index of [0, 1]) {
+    const result = await optionChain({
+      client: clients[index],
+      endpoint: ['marketdata', 'stream', 'options', 'chains', 'TSLA'],
+      symbol: 'TSLA',
+      data: { case: index, expiration: '2028-01-21', optionType: 'All' },
+    });
+    assert.equal(result.active, true);
+  }
+
+  const terminal = Object.assign(new Error('Failed: Internal server error'), {
+    code: 'Failed',
+    upstreamMessage: 'Internal server error',
+    permanent: true,
+    streamStopped: true,
+    reconnectable: false,
+  });
+  handlers[0](terminal);
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(events[0].eventName, 'stream/error');
+  assert.equal(events[0].entryPresent, true);
+  assert.equal(events[0].payload.streamKey, 'chains-key-0');
+  assert.equal(events[0].payload.metadata.expiration, '2028-01-21');
+  assert.equal(events[0].payload.state, 'failed');
+  assert.equal(events[0].payload.resubscribeRequired, true);
+  assert.equal(events[0].payload.terminal, true);
+  assert.equal(streams.getEntry({ kind: 'chains', key: 'chains-key-0' }), null);
+  assert.equal(stops[0].group, 'chains');
+  assert.equal(stops[0].key, 'chains-key-0');
+  assert.equal(stops[0].reason, 'upstream.Failed');
+  assert.equal(streams.touch({ kind: 'chains', key: 'chains-key-0', client: clients[0] }).resubscribeRequired, true);
+
+  statusHandlers[1]({
+    state: 'recovering',
+    reason: 'upstream.Failed',
+    active: true,
+    resubscribeRequired: false,
+    retryable: true,
+    terminal: false,
+    retryAttempt: 1,
+    maxRetries: 2,
+    error: Object.assign(new Error('Failed Internal server error'), {
+      code: 'Failed',
+      upstreamMessage: 'Internal server error',
+    }),
+  });
+  await Promise.resolve();
+  assert.ok(streams.getEntry({ kind: 'chains', key: 'chains-key-1' }));
+  assert.equal(events[1].eventName, 'stream/status');
+  assert.equal(events[1].payload.streamKey, 'chains-key-1');
+  assert.equal(events[1].payload.state, 'recovering');
+  assert.equal(events[1].payload.active, true);
+  assert.equal(events[1].payload.resubscribeRequired, false);
+  assert.equal(streams.touch({ kind: 'chains', key: 'chains-key-1', client: clients[1] }).recovering, true);
+  await optionChain({
+    client: clients[1],
+    action: 'touch',
+    streamKey: 'chains-key-1',
+    symbol: 'TSLA',
+    data: { case: 1, expiration: '2028-01-21', optionType: 'All' },
+  });
+  await optionChain({
+    client: clients[1],
+    action: 'unsubscribe',
+    streamKey: 'chains-key-1',
+    symbol: 'TSLA',
+    data: { case: 1, expiration: '2028-01-21', optionType: 'All' },
+  });
+
+  const labels = debugCalls.map((args) => args[0]);
+  const lifecycle = [
+    'action start',
+    'action done',
+    'subscribe requested',
+    'subscribe result',
+    'touch requested',
+    'touch result',
+    'unsubscribe requested',
+    'unsubscribe result',
+    'upstream start',
+    'upstream ready',
+    'upstream error',
+    'terminal cleanup start',
+    'terminal cleanup done',
+    'stop requested',
+    'stop done',
+    'observed stats',
+  ];
+  for (const label of lifecycle.map((item) => `stream/chains ${item}`)) {
+    assert.equal(labels.includes(label), true, label);
+  }
+
+  const serialized = JSON.stringify(debugCalls);
+  assert.equal(serialized.includes('"Legs":'), false);
+  assert.equal(serialized.includes('"Bid":'), false);
+  assert.equal(serialized.includes('"Ask":'), false);
+  assert.equal(errorCalls.length, 1);
+  assert.equal(errorCalls[0][0], 'stream chain error:');
 });
 
 test('stream clear returns removed entries and total count', async () => {
@@ -1554,9 +2616,14 @@ test('optionChain invalid packets still timeout and clean up stream', async () =
 test('optionChain returns partial metadata instead of masking incomplete chain', async () => {
   const utils = loadUtils();
   const sent = [];
+  let now = 0;
+  let timer = null;
   const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
+    Date: {
+      now: () => now,
+    },
     setTimeout: (fn) => {
-      fn();
+      timer = fn;
       return 1;
     },
     clearTimeout: () => {},
@@ -1585,13 +2652,7 @@ test('optionChain returns partial metadata instead of masking incomplete chain',
             stopStoredStream: async () => {},
             streamChains: async ({ onData }) => {
               onData({
-                Legs: [
-                  {
-                    Symbol: 'CRWV 280121C80',
-                    Expiration: '2028-01-21T00:00:00Z',
-                    OptionType: 'Call',
-                  },
-                ],
+                Legs: [{ Symbol: 'CRWV 280121C80', Expiration: '2028-01-21T00:00:00Z', OptionType: 'Call' }],
               });
               return 'chains-key';
             },
@@ -1601,7 +2662,7 @@ test('optionChain returns partial metadata instead of masking incomplete chain',
     },
   });
 
-  const result = await helper({
+  const pending = helper({
     endpoint: ['marketdata', 'stream', 'options', 'chains', 'CRWV'],
     symbol: 'CRWV',
     data: {
@@ -1612,6 +2673,10 @@ test('optionChain returns partial metadata instead of masking incomplete chain',
       expiration: '2028-01-21',
     },
   });
+  for (let i = 0; i < 6; i += 1) await Promise.resolve();
+  now = 15000;
+  timer();
+  const result = await pending;
 
   assert.equal(sent.length, 1);
   assert.equal(sent[0].endpoint.join('/'), 'marketdata/options/strikes/CRWV');
@@ -1632,8 +2697,94 @@ test('optionChain returns partial metadata instead of masking incomplete chain',
   assert.equal(result.metadata.requested.strikeProximity, 0);
 });
 
+test('optionChain All waits for idle and keeps chain limited to real packets', async () => {
+  const utils = loadUtils();
+  let now = 0;
+  const timers = [];
+  let onDataRef = null;
+  const row = (Symbol, OptionType) => ({
+    Legs: [{ Symbol, Expiration: '2028-01-21T00:00:00Z', OptionType }],
+  });
+  const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
+    Date: {
+      now: () => now,
+    },
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+    lib: makeLib({
+      utils,
+      ts: {
+        readOptionChain: loadExpressionModule('application/lib/ts/readOptionChain.js', {
+          lib: { utils },
+        }),
+        send: async () => ({
+          Strikes: [['70', '75', '80', '85']],
+        }),
+      },
+    }),
+    domain: {
+      ts: {
+        clients: {
+          getClient: async () => ({
+            tokens: { access: 'token' },
+            stopStoredStream: async () => {},
+            streamChains: async ({ onData }) => {
+              onDataRef = onData;
+              onData(row('CRWV 280121C80', 'Call'));
+              return 'chains-key';
+            },
+          }),
+        },
+      },
+    },
+  });
+
+  const pending = helper({
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'CRWV'],
+    symbol: 'CRWV',
+    data: {
+      strikeRange: 'All',
+      strikeInterval: 1,
+      optionType: 'All',
+      expiration: '2028-01-21',
+    },
+  });
+
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+  assert.equal(timers[0].delay, 5000);
+
+  const fire = (timer) => {
+    timer.cleared = true;
+    timer.fn();
+  };
+
+  now = 5000;
+  onDataRef(row('CRWV 280121P75', 'Put'));
+  fire(timers.find((item) => !item.cleared));
+  await Promise.resolve();
+
+  assert.equal(timers[timers.length - 1].delay, 1500);
+  now = 6500;
+  fire(timers.find((item) => !item.cleared));
+  const result = await pending;
+
+  assert.equal(result.strikes, 2);
+  assert.deepEqual(Object.keys(result.chain).sort(), ['00075000', '00080000']);
+  assert.equal(result.metadata.expectedStrikes, 4);
+  assert.equal(result.metadata.actualStrikes, 2);
+  assert.equal(result.metadata.partial, true);
+  assert.equal(result.metadata.reason, 'idle');
+});
+
 test('optionChain preserves call-only and put-only strikes while marking missing legs partial', async () => {
   const utils = loadUtils();
+  const debugCalls = [];
   let timer = null;
   const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
     setTimeout: (fn) => {
@@ -1641,6 +2792,12 @@ test('optionChain preserves call-only and put-only strikes while marking missing
       return 1;
     },
     clearTimeout: () => {},
+    console: {
+      debug: (...args) => debugCalls.push(args),
+      error: () => {},
+      info: () => {},
+      warn: () => {},
+    },
     lib: makeLib({
       utils,
       ts: {
@@ -1702,6 +2859,18 @@ test('optionChain preserves call-only and put-only strikes while marking missing
   assert.equal(result.metadata.actualLegs, 2);
   assert.equal(result.metadata.partial, true);
   assert.equal(result.metadata.reason, 'timeout');
+
+  assert.equal(debugCalls.length, 1);
+  assert.equal(debugCalls[0][0], 'options/chain snapshot stats');
+  const stats = JSON.parse(JSON.stringify(debugCalls[0][1]));
+  for (const key of ['actualStrikes', 'expectedStrikes', 'minStrike', 'maxStrike', 'firstStrikes', 'lastStrikes']) {
+    assert.ok(Object.hasOwn(stats, key));
+  }
+  assert.equal(stats.actualStrikes, 2);
+  assert.equal(stats.actualLegs, 2);
+  assert.equal(stats.minStrike, '00075000');
+  assert.equal(stats.maxStrike, '00080000');
+  assert.deepEqual(stats.lastStrikes, ['00075000', '00080000']);
 });
 
 test('brokerage streams start once and update orders and positions', async () => {
