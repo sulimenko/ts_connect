@@ -6,7 +6,7 @@
     quotes: new Map(),
   },
 
-  defaultIdleMs: 2 * 60 * 1000,
+  defaultIdleMs: 30 * 1000,
   clients: new Map(),
   matrixQueue: [],
   matrixDrain: null,
