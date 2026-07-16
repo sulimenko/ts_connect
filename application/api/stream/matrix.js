@@ -92,7 +92,7 @@
         client: context.client,
         idleMs,
         metadata: { symbol: tsSymbol, owner: 'metaterminal', streamKey: key },
-        start: async ({ notifyError, emit }) => {
+        start: async ({ notifyError, notifyStatus, emit }) => {
           const onData = (message) => {
             if (message.AskSize === undefined && message.BidSize === undefined) return;
 
@@ -117,6 +117,12 @@
           const onError = (error) => {
             console.error('stream matrix error:', error);
             notifyError(error);
+            if (error?.permanent || error?.streamStopped) {
+              const reason = error?.code ? `upstream.${error.code}` : 'upstream.permanent-error';
+              void domain.ts.streams.stopEntry({ kind: 'matrix', key, reason }).catch((cleanupError) => {
+                console.error('Failed to stop failed matrix managed stream:', key, cleanupError);
+              });
+            }
           };
 
           const registeredKey = await tsClient.streamMatrix({
@@ -125,6 +131,7 @@
             data,
             onData,
             onError,
+            onStatus: notifyStatus,
           });
           return {
             stop: async ({ reason = 'unknown' } = {}) => {

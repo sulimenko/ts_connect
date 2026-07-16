@@ -6,7 +6,13 @@
     quotes: new Map(),
   },
 
-  defaultIdleMs: 2 * 60 * 1000,
+  defaultIdleMs: 30 * 1000,
+  clients: new Map(),
+  matrixQueue: [],
+  matrixDrain: null,
+  matrixProbe: null,
+  matrixProbeDelay: 1000,
+  maxMatrixProbeDelay: 30000,
 
   getBucket({ kind }) {
     if (!this.entries[kind]) this.entries[kind] = new Map();
@@ -15,6 +21,52 @@
 
   getEntry({ kind, key }) {
     return this.getBucket({ kind }).get(key) ?? null;
+  },
+
+  activeMatrixCount() {
+    return Array.from(this.getBucket({ kind: 'matrix' }).values()).filter((entry) => entry.state === 'active' && entry.upstreamReady)
+      .length;
+  },
+
+  queuedMatrixCount() {
+    return this.matrixQueue.filter(
+      (entry) => this.getEntry({ kind: 'matrix', key: entry.key }) === entry && entry.state === 'queued' && entry.subscribers.size > 0,
+    ).length;
+  },
+
+  matrixLog(event, entry = null, extra = {}) {
+    console.debug('matrix stream lifecycle', {
+      event,
+      streamKey: entry?.key ?? null,
+      state: entry?.state ?? null,
+      activeMatrixCount: this.activeMatrixCount(),
+      queuedMatrixCount: this.queuedMatrixCount(),
+      ...extra,
+    });
+  },
+
+  trackClient(entry, client) {
+    let tracked = this.clients.get(client);
+    if (!tracked) {
+      const onClose = () => {
+        this.unsubscribeAll({ client, reason: 'client.close' }).catch((error) => {
+          console.error('Failed to cleanup closed client subscriptions:', error);
+        });
+      };
+      tracked = { entries: new Set(), onClose };
+      this.clients.set(client, tracked);
+      client.on('close', onClose);
+    }
+    tracked.entries.add(entry);
+  },
+
+  untrackClient(entry, client) {
+    const tracked = this.clients.get(client);
+    if (!tracked) return;
+    tracked.entries.delete(entry);
+    if (tracked.entries.size > 0) return;
+    client.removeListener('close', tracked.onClose);
+    this.clients.delete(client);
   },
 
   resolveIdleMs(idleMs, fallback = this.defaultIdleMs) {
@@ -70,6 +122,11 @@
       if (error.permanent !== undefined) serialized.permanent = error.permanent;
       if (error.reconnectable !== undefined) serialized.reconnectable = error.reconnectable;
       if (error.streamStopped !== undefined) serialized.streamStopped = error.streamStopped;
+      if (error.status !== undefined) serialized.status = error.status;
+      if (error.statusText !== undefined) serialized.statusText = error.statusText;
+      if (error.body !== undefined) serialized.body = error.body;
+      if (error.headers !== undefined) serialized.headers = error.headers;
+      if (error.classification !== undefined) serialized.classification = error.classification;
       return serialized;
     }
 
@@ -123,6 +180,7 @@
 
   notifyError(entry, error) {
     entry.state = 'failed';
+    entry.upstreamReady = false;
     entry.lastError = this.serializeError(error);
     const payload = {
       kind: entry.kind,
@@ -144,6 +202,7 @@
     const active = status.active ?? true;
     const resubscribeRequired = status.resubscribeRequired ?? false;
     entry.state = state;
+    entry.upstreamReady = state === 'active' && status.active !== false;
     if (previousState !== state) {
       console.debug('managed stream state change', this.entryLog(entry, { from: previousState, to: state }));
     }
@@ -215,25 +274,211 @@
       });
     }, timeout);
 
+    const active = entry.state === 'active' && entry.upstreamReady;
+    const resubscribeRequired = entry.state === 'failed';
     lib.utils.traceLog({
       scope: `stream/${kind}`,
       phase: 'touch',
       streamKey: key,
-      extra: { active: true, subscribers: entry.subscribers.size, idleMs: timeout },
+      extra: { active, subscribers: entry.subscribers.size, idleMs: timeout },
     });
 
-    console.debug('managed stream touch active', this.entryLog(entry, { active: true }));
+    console.debug('managed stream touch active', this.entryLog(entry, { active }));
 
     return {
-      active: true,
+      active,
       kind,
       streamKey: key,
       subscribers: entry.subscribers.size,
       idleMs: timeout,
-      resubscribeRequired: false,
+      resubscribeRequired,
       recovering: entry.state === 'recovering',
       state: entry.state ?? 'active',
+      upstreamReady: Boolean(entry.upstreamReady),
     };
+  },
+
+  dequeueMatrix(entry) {
+    this.matrixQueue = this.matrixQueue.filter((queued) => queued !== entry);
+    if (this.matrixQueue.length === 0 && this.matrixProbe) {
+      clearTimeout(this.matrixProbe);
+      this.matrixProbe = null;
+      this.matrixProbeDelay = 1000;
+    }
+  },
+
+  queueMatrix(entry, error, { front = false, from = 'starting' } = {}) {
+    entry.state = 'queued';
+    entry.upstreamReady = false;
+    entry.lastError = this.serializeError(error);
+    entry.startPromise = null;
+    if (!this.matrixQueue.includes(entry)) {
+      if (front) this.matrixQueue.unshift(entry);
+      else this.matrixQueue.push(entry);
+    }
+    this.matrixLog(`${from} -> queued`, entry, {
+      classification: error.classification,
+      status: error.status ?? null,
+      observedActive: this.activeMatrixCount(),
+    });
+  },
+
+  async queueMatrixReconnect(entry, status, generation) {
+    if (
+      this.getEntry({ kind: 'matrix', key: entry.key }) !== entry ||
+      entry.generation !== generation ||
+      !['active', 'recovering'].includes(entry.state)
+    ) {
+      return false;
+    }
+
+    const from = entry.state;
+    const upstream = entry.upstream;
+    entry.generation += 1;
+    const queuedGeneration = entry.generation;
+    entry.upstream = null;
+    this.queueMatrix(entry, status.error, { from });
+    this.notifyStatus(entry, { ...status, state: 'queued', active: false, terminal: false, resubscribeRequired: false });
+
+    if (upstream?.stop) {
+      try {
+        await upstream.stop({ reason: 'upstream.capacity' });
+      } catch (error) {
+        console.error(`Failed to stop capacity stream matrix:${entry.key}:`, error);
+      }
+    }
+
+    if (
+      this.getEntry({ kind: 'matrix', key: entry.key }) !== entry ||
+      entry.generation !== queuedGeneration ||
+      entry.state !== 'queued' ||
+      entry.subscribers.size === 0
+    ) {
+      return false;
+    }
+    this.scheduleMatrixProbe('capacity');
+    return true;
+  },
+
+  scheduleMatrixProbe(reason = 'capacity') {
+    if (this.matrixProbe || this.queuedMatrixCount() === 0) return;
+    const delay = this.matrixProbeDelay;
+    this.matrixProbe = setTimeout(() => {
+      this.matrixProbe = null;
+      void this.drainMatrix({ reason: 'probe' });
+    }, delay);
+    this.matrixProbeDelay = Math.min(delay * 2, this.maxMatrixProbeDelay);
+    this.matrixLog('queue probe scheduled', null, { reason, delay });
+  },
+
+  async drainMatrix({ reason = 'slot.freed' } = {}) {
+    if (this.matrixDrain) return this.matrixDrain;
+    if (this.matrixProbe && reason !== 'probe') {
+      clearTimeout(this.matrixProbe);
+      this.matrixProbe = null;
+    }
+
+    this.matrixDrain = (async () => {
+      this.matrixLog('queue drain start', null, { reason });
+      while (this.matrixQueue.length > 0) {
+        const entry = this.matrixQueue.shift();
+        if (this.getEntry({ kind: 'matrix', key: entry.key }) !== entry || entry.state !== 'queued' || entry.subscribers.size === 0) {
+          this.matrixLog('queue stale skipped', entry, { reason });
+          continue;
+        }
+
+        this.matrixLog('queued -> starting', entry, { reason });
+        try {
+          const result = await this.startEntry(entry, { queued: true });
+          if (result === 'active') {
+            this.matrixLog('queue drain active', entry, { reason });
+            return true;
+          }
+          if (result === 'queued') {
+            this.scheduleMatrixProbe('capacity');
+            return false;
+          }
+        } catch (error) {
+          this.matrixLog('queued -> failed', entry, {
+            reason,
+            classification: error.classification ?? 'unknown',
+          });
+        }
+      }
+      return false;
+    })();
+
+    try {
+      return await this.matrixDrain;
+    } finally {
+      this.matrixDrain = null;
+    }
+  },
+
+  startEntry(entry, { queued = false } = {}) {
+    if (entry.startPromise) return entry.startPromise;
+    const generation = entry.generation + 1;
+    entry.generation = generation;
+    entry.state = 'starting';
+    entry.upstreamReady = false;
+    const current = () => this.getEntry({ kind: entry.kind, key: entry.key }) === entry && entry.generation === generation;
+
+    const promise = (async () => {
+      try {
+        const upstream = await entry.start({
+          entry,
+          emit: (eventName, payload) => {
+            if (current()) this.emit(entry, eventName, payload);
+          },
+          notifyError: (error) => {
+            if (current()) this.notifyError(entry, error);
+          },
+          notifyStatus: (status) => {
+            if (!current()) return false;
+            if (entry.kind === 'matrix' && status.state === 'queued' && status.error?.classification === 'capacity') {
+              return this.queueMatrixReconnect(entry, status, generation);
+            }
+            return this.notifyStatus(entry, status);
+          },
+        });
+
+        if (!upstream || typeof upstream.stop !== 'function') throw new Error(`Managed stream "${entry.kind}" must provide stop()`);
+        if (!current() || entry.subscribers.size === 0) {
+          await upstream.stop({ reason: 'startup.stale' });
+          this.matrixLog('startup stale cancelled', entry, { generation });
+          return 'stale';
+        }
+
+        entry.upstream = upstream;
+        entry.upstreamReady = true;
+        entry.state = 'active';
+        entry.lastError = null;
+        this.dequeueMatrix(entry);
+        if (entry.kind === 'matrix') {
+          this.matrixProbeDelay = 1000;
+          this.matrixLog('starting -> active', entry, { generation });
+        }
+        return 'active';
+      } catch (error) {
+        if (!current()) {
+          this.matrixLog('startup error stale', entry, { generation, classification: error.classification ?? 'unknown' });
+          return 'stale';
+        }
+        if (entry.kind === 'matrix' && error.classification === 'capacity' && (queued || this.activeMatrixCount() > 0)) {
+          this.queueMatrix(entry, error, { front: queued });
+          return 'queued';
+        }
+        entry.lastError = this.serializeError(error);
+        this.notifyError(entry, error);
+        await this.stopEntry({ kind: entry.kind, key: entry.key, reason: 'startup.failed' });
+        throw error;
+      } finally {
+        if (entry.startPromise === promise) entry.startPromise = null;
+      }
+    })();
+
+    entry.startPromise = promise;
+    return promise;
   },
 
   async stopEntry({ kind, key, reason = 'unknown' }) {
@@ -243,15 +488,19 @@
 
     if (entry.stopPromise) return entry.stopPromise;
 
+    const wasActive = kind === 'matrix' && entry.state === 'active' && entry.upstreamReady;
     entry.state = 'stopping';
+    entry.generation += 1;
+    if (kind === 'matrix') this.matrixLog('active -> stopping', entry, { reason });
     console.debug('managed stream stop start', this.entryLog(entry, { reason }));
     entry.stopPromise = (async () => {
       bucket.delete(key);
+      if (kind === 'matrix') this.dequeueMatrix(entry);
       this.logStop({ kind, key, reason, clientCount: entry.subscribers.size });
 
       for (const subscription of entry.subscribers.values()) {
         clearTimeout(subscription.idleTimer);
-        subscription.client.removeListener('close', subscription.onClose);
+        this.untrackClient(entry, subscription.client);
       }
       entry.subscribers.clear();
       entry.startPromise = null;
@@ -266,6 +515,7 @@
       }
 
       entry.upstream = null;
+      if (wasActive && reason !== 'client.close') void this.drainMatrix({ reason });
       return true;
     })();
 
@@ -285,31 +535,36 @@
 
     const subscription = entry.subscribers.get(client);
     if (!subscription) {
+      const active = entry.state === 'active' && entry.upstreamReady;
       console.debug('managed stream unsubscribe', {
         kind,
         streamKey: key,
-        active: true,
+        active,
         subscribers: entry.subscribers.size,
         removed: false,
       });
-      return { active: true, kind, streamKey: key, subscribers: entry.subscribers.size, removed: false };
+      return { active, kind, streamKey: key, subscribers: entry.subscribers.size, removed: false };
     }
 
     clearTimeout(subscription.idleTimer);
-    subscription.client.removeListener('close', subscription.onClose);
+    this.untrackClient(entry, subscription.client);
     entry.subscribers.delete(client);
 
     const subscribers = entry.subscribers.size;
     if (subscribers === 0) {
       this.logUnsubscribe({ kind, key, reason, remaining: subscribers });
-      if (entry.state !== 'starting') {
-        await this.stopEntry({ kind, key, reason });
-      }
+      await this.stopEntry({ kind, key, reason });
       return { active: false, kind, streamKey: key, subscribers, removed: true };
     }
 
     this.logUnsubscribe({ kind, key, reason, remaining: subscribers });
-    return { active: true, kind, streamKey: key, subscribers, removed: true };
+    return {
+      active: entry.state === 'active' && entry.upstreamReady,
+      kind,
+      streamKey: key,
+      subscribers,
+      removed: true,
+    };
   },
 
   async unsubscribeAll({ client, reason = 'clear' }) {
@@ -324,6 +579,8 @@
       }
     }
 
+    if (reason === 'client.close') void this.drainMatrix({ reason });
+
     return removed;
   },
 
@@ -332,7 +589,7 @@
     if (typeof start !== 'function') throw new Error('Managed stream start() is required');
 
     const bucket = this.getBucket({ kind });
-    // One managed entry per client + kind + streamKey.
+    // One multiplexed managed entry per kind + streamKey.
     // Consumer counts live above this helper in metaterminal.
     let entry = bucket.get(key);
     const created = entry === undefined;
@@ -352,6 +609,8 @@
         startPromise: null,
         stopPromise: null,
         lastError: null,
+        generation: 0,
+        start,
       };
       bucket.set(key, entry);
       console.debug('managed stream subscribe created', { kind, streamKey: key, subscribers: 0, upstreamReady: false });
@@ -364,54 +623,19 @@
     const subscribed = subscription === undefined;
 
     if (!subscription) {
-      const onClose = () => {
-        this.unsubscribe({ kind, key, client, reason: 'client.close' }).catch((error) => {
-          console.error(`Failed to cleanup closed client subscription ${kind}:${key}:`, error);
-        });
-      };
-
       subscription = {
         client,
         idleMs: this.resolveIdleMs(idleMs),
         idleTimer: null,
-        onClose,
         touchedAt: Date.now(),
       };
 
-      client.on('close', onClose);
       entry.subscribers.set(client, subscription);
+      this.trackClient(entry, client);
     }
 
     if (created) {
-      entry.startPromise = (async () => {
-        try {
-          const upstream = await start({
-            entry,
-            emit: (eventName, payload) => this.emit(entry, eventName, payload),
-            notifyError: (error) => this.notifyError(entry, error),
-            notifyStatus: (status) => this.notifyStatus(entry, status),
-          });
-
-          if (!upstream || typeof upstream.stop !== 'function') {
-            throw new Error(`Managed stream "${kind}" must provide stop()`);
-          }
-
-          entry.upstream = upstream;
-          entry.upstreamReady = true;
-          if (entry.state !== 'recovering' && entry.state !== 'failed') entry.state = 'active';
-
-          if (entry.subscribers.size === 0) {
-            await this.stopEntry({ kind, key, reason: 'startup.no-subscribers' });
-            return false;
-          }
-
-          return true;
-        } catch (error) {
-          entry.lastError = this.serializeError(error);
-          await this.stopEntry({ kind, key, reason: 'startup.failed' });
-          throw error;
-        }
-      })();
+      entry.startPromise = this.startEntry(entry);
     }
 
     await entry.startPromise;
@@ -426,6 +650,8 @@
         created,
         subscribed,
         metadata: entry.metadata,
+        state: entry.state,
+        upstreamReady: false,
       };
     }
 

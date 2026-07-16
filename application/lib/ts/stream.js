@@ -11,6 +11,8 @@
   timeoutHeartbeat: null,
   shouldReconnect: true,
   stopReason: null,
+  generation: 0,
+  connected: false,
 
   endpointName() {
     return this.currentParams.endpoint.join('/');
@@ -65,6 +67,68 @@
     return 'unexpected';
   },
 
+  classifyHttpError({ status, body = '', headers = {} }) {
+    const text = body.toLowerCase();
+    const quota = /(?:stream[\W_]*quota|quota)(?:[\W_]*limit)?[\W_]*(?:exceed(?:ed)?|reach(?:ed)?)/.test(text);
+    const capacity =
+      quota || /concurrent.{0,40}stream|stream.{0,40}(capacity|limit)|capacity.{0,20}(exceed|reach|limit)|too many.{0,40}stream/.test(text);
+    const rateLimit = /rate[\s_-]?limit/.test(text);
+    const rateHeader = Object.keys(headers).some((key) => /^(x-)?ratelimit-|^rate-limit-/i.test(key));
+    const entitlement = /entitle|permission|not allowed|subscription required/.test(text);
+    const invalid = /invalid (request|symbol|instrument)|bad request/.test(text);
+
+    if (status === 401 || status === 407 || /authenticat|authori[sz]ation|unauthori[sz]ed|invalid token|expired token/.test(text)) {
+      return 'authorization';
+    }
+    if (entitlement) return 'entitlement';
+    if (status === 429) return 'capacity';
+    if (capacity || (status === 403 && (rateLimit || rateHeader))) return 'capacity';
+    if (invalid) return 'invalid';
+    if ([400, 404, 409, 422].includes(status)) return 'invalid';
+    if ([408, 425].includes(status) || status >= 500) return 'transient';
+    if (status === 403) return 'forbidden';
+    return 'http';
+  },
+
+  responseHeaders(response) {
+    const headers = {};
+    const allowed = new RegExp(
+      '^(retry-after|x-(request|correlation|trace)-id|request-id|correlation-id|traceparent|ratelimit-|x-ratelimit-|rate-limit-)',
+      'i',
+    );
+    response?.headers?.forEach?.((value, name) => {
+      const key = `${name}`.toLowerCase();
+      if (allowed.test(key)) headers[key] = `${value}`;
+    });
+    return headers;
+  },
+
+  async buildHttpError(response) {
+    let body = '';
+    try {
+      const text = await response.text?.();
+      body = `${text ?? ''}`
+        .replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer [REDACTED]')
+        .replace(/("(?:access|refresh)_?token"\s*:\s*")[^"]+/gi, '$1[REDACTED]')
+        .slice(0, 2048);
+    } catch (error) {
+      console.warn('Failed to read stream HTTP error body:', this.endpointName(), error?.message ?? error);
+    }
+
+    const headers = this.responseHeaders(response);
+    const classification = this.classifyHttpError({ status: response.status, body, headers });
+    const error = new Error(`HTTP Error: ${response.status} ${response.statusText}`.trim());
+    error.status = response.status;
+    error.statusText = response.statusText ?? '';
+    error.body = body;
+    error.headers = headers;
+    error.classification = classification;
+    error.permanent = !['capacity', 'transient'].includes(classification);
+    error.retryable = classification === 'capacity' || classification === 'transient';
+    error.reconnectable = classification === 'transient';
+    return error;
+  },
+
   classifyPacketError(packet) {
     const internal = /Failed/i.test(packet.Error) && /Internal server error/i.test(packet.Message ?? '');
     const policy = internal ? this.retryPolicy?.packetErrors?.failedInternalServerError : null;
@@ -116,10 +180,21 @@
     this.packetRetryAttempt = 0;
   },
 
-  async initiateStream() {
+  async initiateStream({ reconnect = false, generation = null } = {}) {
+    if (reconnect && generation !== this.generation) {
+      console.debug('stream reconnect stale', { endpoint: this.endpointName(), generation, currentGeneration: this.generation });
+      return false;
+    }
+    if (!reconnect) {
+      this.generation += 1;
+      this.shouldReconnect = true;
+      this.stopReason = null;
+    }
+    const currentGeneration = this.generation;
     this.clearReconnectTimer();
     this.clearHeartbeatTimer();
     this.abortActiveStream('restart');
+    this.connected = false;
     const startedAt = Date.now();
     this.traceLog('stream.connect.start');
 
@@ -143,23 +218,76 @@
         signal,
       });
 
-      if (!response.ok) throw new Error(`HTTP Error: ${response.status} ${response.statusText}`);
-      if (signal.aborted || !this.shouldReconnect) return () => this.stopStream();
+      if (!response.ok) throw await this.buildHttpError(response);
+      if (signal.aborted || !this.shouldReconnect || currentGeneration !== this.generation) {
+        console.debug('stream connect stale', {
+          endpoint: this.endpointName(),
+          generation: currentGeneration,
+          currentGeneration: this.generation,
+        });
+        await response.body?.cancel?.();
+        return false;
+      }
 
       console.log('Connection established:', url);
+      this.connected = true;
       this.traceLog('stream.connect.done', { startedAt });
       this.reconnectDelay = 5000;
       this.checkTimeout();
       this.traceLog('stream.subscribe.done', { startedAt });
+      if (reconnect && this.packetRetryAttempt === 0) {
+        this.onStatus?.({
+          state: 'active',
+          reason: 'reconnected',
+          retryable: false,
+          terminal: false,
+          active: true,
+          resubscribeRequired: false,
+        });
+      }
       void this.processStream(response.body.getReader(), onData, onError, signal);
     } catch (err) {
       if (err.name === 'AbortError' || signal.aborted || !this.shouldReconnect) {
         console.warn('Stream aborted gracefully:', this.endpointName());
-        return () => this.stopStream();
+        return false;
       }
+      this.connected = false;
       console.error('Stream error:', this.endpointName(), err);
-      if (onError) onError(err);
-      void this.scheduleReconnect();
+      if (!reconnect) throw err;
+      if (err.classification === 'capacity') {
+        this.stopStream('upstream.capacity');
+        this.onStatus?.({
+          state: 'queued',
+          reason: 'upstream.capacity',
+          retryable: true,
+          terminal: false,
+          active: false,
+          resubscribeRequired: false,
+          error: err,
+        });
+        return false;
+      }
+      if (err.classification && err.classification !== 'transient') {
+        err.permanent = true;
+        err.terminal = true;
+        err.retryable = false;
+        err.reconnectable = false;
+        err.streamStopped = true;
+        this.stopStream('permanent-error');
+        onError?.(err);
+        return false;
+      }
+      this.onStatus?.({
+        state: 'recovering',
+        reason: `upstream.${err.classification ?? 'transport'}`,
+        retryable: true,
+        terminal: false,
+        active: false,
+        resubscribeRequired: false,
+        error: err,
+      });
+      void this.scheduleReconnect({ generation: currentGeneration });
+      return false;
     }
 
     return () => this.stopStream();
@@ -319,9 +447,10 @@
     }, 30000);
   },
 
-  async scheduleReconnect() {
-    if (!this.shouldReconnect || this.reconnectTimer) return;
+  async scheduleReconnect({ generation = this.generation } = {}) {
+    if (!this.shouldReconnect || this.reconnectTimer || generation !== this.generation) return;
 
+    this.connected = false;
     this.clearHeartbeatTimer();
     this.abortActiveStream('reconnect');
 
@@ -329,8 +458,11 @@
     console.log('Reconnecting in', delay / 1000, 'seconds...');
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
-      if (!this.shouldReconnect) return;
-      await this.initiateStream();
+      if (!this.shouldReconnect || generation !== this.generation) {
+        console.debug('stream reconnect cancelled', { endpoint: this.endpointName(), generation, currentGeneration: this.generation });
+        return;
+      }
+      await this.initiateStream({ reconnect: true, generation });
     }, delay);
 
     this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
@@ -339,6 +471,8 @@
   stopStream(reason = 'unknown') {
     this.shouldReconnect = false;
     this.stopReason = reason;
+    this.connected = false;
+    this.generation += 1;
     this.clearReconnectTimer();
     this.clearHeartbeatTimer();
     this.abortActiveStream(reason);
