@@ -1237,11 +1237,11 @@ test('matrix capacity queue is FIFO, single-flight, and skips cancelled entries'
   await Promise.resolve();
   await Promise.resolve();
   assert.equal(streams.getEntry({ kind: 'matrix', key: 'B' }).state, 'queued');
-  assert.equal(timers.filter((timer) => !timer.cleared && timer.delay < 120000).length, 1);
+  assert.equal(timers.filter((timer) => !timer.cleared && timer.delay < 30000).length, 1);
   assert.deepEqual(calls, ['B', 'C', 'D', 'B']);
 
   if (streams.matrixDrain) await streams.matrixDrain;
-  await timers.find((timer) => !timer.cleared && timer.delay < 120000).fn();
+  await timers.find((timer) => !timer.cleared && timer.delay < 30000).fn();
   if (streams.matrixDrain) await streams.matrixDrain;
   assert.equal(streams.getEntry({ kind: 'matrix', key: 'B' }).state, 'active');
   assert.deepEqual(
@@ -1331,7 +1331,7 @@ test('matrix reconnect capacity moves the active entry to the shared queue once'
     ['matrix-reconnect'],
   );
   assert.ok(streams.matrixProbe);
-  assert.equal(timers.filter((timer) => !timer.cleared && timer.delay < 120000).length, 1);
+  assert.equal(timers.filter((timer) => !timer.cleared && timer.delay < 30000).length, 1);
   assert.equal(
     events.some(({ eventName }) => eventName === 'stream/error'),
     false,
