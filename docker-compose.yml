@@ -3,8 +3,6 @@ services:
     build: .
     image: ts_connect:latest
     container_name: ts_connect
-    ports:
-      - '${port}:${port}'
     volumes:
       - ./log:/usr/server/log
     env_file:
