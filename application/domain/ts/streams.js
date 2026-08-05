@@ -64,7 +64,7 @@
   activeCapacityCount() {
     let count = 0;
     for (const kind of this.capacityKinds) {
-      count += Array.from(this.getBucket({ kind }).values()).filter((entry) => entry.state === 'active' && entry.upstreamReady).length;
+      count += Array.from(this.getBucket({ kind }).values()).filter((entry) => entry.capacityHeld).length;
     }
     return count;
   },
@@ -97,6 +97,7 @@
       activeCount: this.activeCapacityCount(),
       subscriberCount: entry?.subscribers.size ?? null,
       generation: entry?.generation ?? null,
+      capacityHeld: entry?.capacityHeld ?? null,
       ...extra,
     });
   },
@@ -368,6 +369,7 @@
   queueCapacity(entry, error, { front = false, from = 'starting' } = {}) {
     entry.state = 'queued';
     entry.upstreamReady = false;
+    entry.capacityHeld = false;
     entry.lastError = this.serializeError(error);
     if (!this.capacityQueue.includes(entry)) {
       if (front) this.capacityQueue.unshift(entry);
@@ -449,6 +451,7 @@
           const result = await this.startEntry(entry, { queued: true });
           if (result === 'active') {
             this.capacityLog('queue drain active', entry, { reason });
+            this.scheduleCapacityProbe('queue.remaining');
             return true;
           }
           if (result === 'queued') {
@@ -511,6 +514,7 @@
         entry.state = 'active';
         entry.lastError = null;
         if (this.usesCapacity(entry.kind)) {
+          entry.capacityHeld = true;
           this.dequeueCapacity(entry);
           this.capacityProbeDelay = 1000;
           this.capacityLog('starting -> active', entry, { generation });
@@ -548,7 +552,8 @@
 
     if (entry.stopPromise) return entry.stopPromise;
 
-    const wasActive = this.usesCapacity(kind) && entry.state === 'active' && entry.upstreamReady;
+    const freedCapacity = this.usesCapacity(kind) && entry.capacityHeld;
+    if (freedCapacity) entry.capacityHeld = false;
     entry.state = 'stopping';
     entry.generation += 1;
     if (this.usesCapacity(kind)) this.capacityLog('active -> stopping', entry, { reason });
@@ -575,7 +580,7 @@
       }
 
       entry.upstream = null;
-      if (wasActive && reason !== 'client.close') void this.drainCapacity({ reason });
+      if (freedCapacity && reason !== 'client.close') void this.drainCapacity({ reason });
       return true;
     })();
 
@@ -665,6 +670,7 @@
         subscribers: new Map(),
         upstream: null,
         upstreamReady: false,
+        capacityHeld: false,
         state: 'starting',
         startPromise: null,
         stopPromise: null,
