@@ -48,7 +48,11 @@ async ({ method, domain = null, live = false, ver = 'v3', endpoint, token, data 
       error.status = res.status;
       error.statusText = res.statusText;
       error.responseText = responseText;
-      if (res.status === 400 && values.some((value) => value.toLowerCase() === 'invalid symbol')) {
+      const invalidSymbol = values.some((value) => {
+        const message = value.trim().toLowerCase();
+        return message === 'invalid symbol' || message.startsWith('invalid symbol:');
+      });
+      if (res.status === 400 && invalidSymbol) {
         error.code = 'INVALID_SYMBOL';
         error.classification = 'invalid';
         error.permanent = true;
