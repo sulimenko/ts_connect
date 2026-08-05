@@ -8,11 +8,45 @@
 
   defaultIdleMs: 30 * 1000,
   clients: new Map(),
-  matrixQueue: [],
-  matrixDrain: null,
-  matrixProbe: null,
-  matrixProbeDelay: 1000,
-  maxMatrixProbeDelay: 30000,
+  capacityKinds: new Set(['chains', 'matrix']),
+  capacityQueue: [],
+  capacityDrain: null,
+  capacityProbe: null,
+  capacityProbeDelay: 1000,
+  maxCapacityProbeDelay: 30000,
+
+  // Legacy matrix diagnostics remain aliases of the shared capacity lifecycle.
+  get matrixQueue() {
+    return this.capacityQueue;
+  },
+
+  set matrixQueue(queue) {
+    this.capacityQueue = queue;
+  },
+
+  get matrixDrain() {
+    return this.capacityDrain;
+  },
+
+  set matrixDrain(drain) {
+    this.capacityDrain = drain;
+  },
+
+  get matrixProbe() {
+    return this.capacityProbe;
+  },
+
+  set matrixProbe(probe) {
+    this.capacityProbe = probe;
+  },
+
+  get matrixProbeDelay() {
+    return this.capacityProbeDelay;
+  },
+
+  set matrixProbeDelay(delay) {
+    this.capacityProbeDelay = delay;
+  },
 
   getBucket({ kind }) {
     if (!this.entries[kind]) this.entries[kind] = new Map();
@@ -23,24 +57,46 @@
     return this.getBucket({ kind }).get(key) ?? null;
   },
 
+  usesCapacity(kind) {
+    return this.capacityKinds.has(kind);
+  },
+
+  activeCapacityCount() {
+    let count = 0;
+    for (const kind of this.capacityKinds) {
+      count += Array.from(this.getBucket({ kind }).values()).filter((entry) => entry.state === 'active' && entry.upstreamReady).length;
+    }
+    return count;
+  },
+
   activeMatrixCount() {
     return Array.from(this.getBucket({ kind: 'matrix' }).values()).filter((entry) => entry.state === 'active' && entry.upstreamReady)
       .length;
   },
 
-  queuedMatrixCount() {
-    return this.matrixQueue.filter(
-      (entry) => this.getEntry({ kind: 'matrix', key: entry.key }) === entry && entry.state === 'queued' && entry.subscribers.size > 0,
+  queuedCapacityCount() {
+    return this.capacityQueue.filter(
+      (entry) => this.getEntry({ kind: entry.kind, key: entry.key }) === entry && entry.state === 'queued' && entry.subscribers.size > 0,
     ).length;
   },
 
-  matrixLog(event, entry = null, extra = {}) {
-    console.debug('matrix stream lifecycle', {
+  queuedMatrixCount() {
+    return this.capacityQueue.filter(
+      (entry) => entry.kind === 'matrix' && this.getEntry({ kind: 'matrix', key: entry.key }) === entry && entry.state === 'queued',
+    ).length;
+  },
+
+  capacityLog(event, entry = null, extra = {}) {
+    console.debug('managed capacity lifecycle', {
       event,
+      kind: entry?.kind ?? null,
       streamKey: entry?.key ?? null,
       state: entry?.state ?? null,
-      activeMatrixCount: this.activeMatrixCount(),
-      queuedMatrixCount: this.queuedMatrixCount(),
+      classification: entry?.lastError?.classification ?? null,
+      queueLength: this.queuedCapacityCount(),
+      activeCount: this.activeCapacityCount(),
+      subscriberCount: entry?.subscribers.size ?? null,
+      generation: entry?.generation ?? null,
       ...extra,
     });
   },
@@ -293,41 +349,42 @@
       idleMs: timeout,
       resubscribeRequired,
       recovering: entry.state === 'recovering',
+      retryable: entry.state === 'queued',
+      terminal: entry.state === 'failed',
       state: entry.state ?? 'active',
       upstreamReady: Boolean(entry.upstreamReady),
     };
   },
 
-  dequeueMatrix(entry) {
-    this.matrixQueue = this.matrixQueue.filter((queued) => queued !== entry);
-    if (this.matrixQueue.length === 0 && this.matrixProbe) {
-      clearTimeout(this.matrixProbe);
-      this.matrixProbe = null;
-      this.matrixProbeDelay = 1000;
+  dequeueCapacity(entry) {
+    this.capacityQueue = this.capacityQueue.filter((queued) => queued !== entry);
+    if (this.capacityQueue.length === 0 && this.capacityProbe) {
+      clearTimeout(this.capacityProbe);
+      this.capacityProbe = null;
+      this.capacityProbeDelay = 1000;
     }
   },
 
-  queueMatrix(entry, error, { front = false, from = 'starting' } = {}) {
+  queueCapacity(entry, error, { front = false, from = 'starting' } = {}) {
     entry.state = 'queued';
     entry.upstreamReady = false;
     entry.lastError = this.serializeError(error);
-    entry.startPromise = null;
-    if (!this.matrixQueue.includes(entry)) {
-      if (front) this.matrixQueue.unshift(entry);
-      else this.matrixQueue.push(entry);
+    if (!this.capacityQueue.includes(entry)) {
+      if (front) this.capacityQueue.unshift(entry);
+      else this.capacityQueue.push(entry);
     }
-    this.matrixLog(`${from} -> queued`, entry, {
+    this.capacityLog(`${from} -> queued`, entry, {
       classification: error.classification,
       status: error.status ?? null,
-      observedActive: this.activeMatrixCount(),
+      observedActive: this.activeCapacityCount(),
     });
   },
 
-  async queueMatrixReconnect(entry, status, generation) {
+  async queueCapacityStatus(entry, status, generation) {
     if (
-      this.getEntry({ kind: 'matrix', key: entry.key }) !== entry ||
+      this.getEntry({ kind: entry.kind, key: entry.key }) !== entry ||
       entry.generation !== generation ||
-      !['active', 'recovering'].includes(entry.state)
+      !['starting', 'active', 'recovering'].includes(entry.state)
     ) {
       return false;
     }
@@ -337,69 +394,69 @@
     entry.generation += 1;
     const queuedGeneration = entry.generation;
     entry.upstream = null;
-    this.queueMatrix(entry, status.error, { from });
+    this.queueCapacity(entry, status.error, { from });
     this.notifyStatus(entry, { ...status, state: 'queued', active: false, terminal: false, resubscribeRequired: false });
 
     if (upstream?.stop) {
       try {
         await upstream.stop({ reason: 'upstream.capacity' });
       } catch (error) {
-        console.error(`Failed to stop capacity stream matrix:${entry.key}:`, error);
+        console.error(`Failed to stop capacity stream ${entry.kind}:${entry.key}:`, error);
       }
     }
 
     if (
-      this.getEntry({ kind: 'matrix', key: entry.key }) !== entry ||
+      this.getEntry({ kind: entry.kind, key: entry.key }) !== entry ||
       entry.generation !== queuedGeneration ||
       entry.state !== 'queued' ||
       entry.subscribers.size === 0
     ) {
       return false;
     }
-    this.scheduleMatrixProbe('capacity');
+    this.scheduleCapacityProbe('capacity');
     return true;
   },
 
-  scheduleMatrixProbe(reason = 'capacity') {
-    if (this.matrixProbe || this.queuedMatrixCount() === 0) return;
-    const delay = this.matrixProbeDelay;
-    this.matrixProbe = setTimeout(() => {
-      this.matrixProbe = null;
-      void this.drainMatrix({ reason: 'probe' });
+  scheduleCapacityProbe(reason = 'capacity') {
+    if (this.capacityProbe || this.queuedCapacityCount() === 0) return;
+    const delay = this.capacityProbeDelay;
+    this.capacityProbe = setTimeout(() => {
+      this.capacityProbe = null;
+      void this.drainCapacity({ reason: 'probe' });
     }, delay);
-    this.matrixProbeDelay = Math.min(delay * 2, this.maxMatrixProbeDelay);
-    this.matrixLog('queue probe scheduled', null, { reason, delay });
+    this.capacityProbeDelay = Math.min(delay * 2, this.maxCapacityProbeDelay);
+    this.capacityLog('queue probe scheduled', null, { reason, delay });
   },
 
-  async drainMatrix({ reason = 'slot.freed' } = {}) {
-    if (this.matrixDrain) return this.matrixDrain;
-    if (this.matrixProbe && reason !== 'probe') {
-      clearTimeout(this.matrixProbe);
-      this.matrixProbe = null;
+  async drainCapacity({ reason = 'slot.freed' } = {}) {
+    if (this.capacityDrain) return this.capacityDrain;
+    if (this.capacityProbe && reason !== 'probe') {
+      clearTimeout(this.capacityProbe);
+      this.capacityProbe = null;
     }
 
-    this.matrixDrain = (async () => {
-      this.matrixLog('queue drain start', null, { reason });
-      while (this.matrixQueue.length > 0) {
-        const entry = this.matrixQueue.shift();
-        if (this.getEntry({ kind: 'matrix', key: entry.key }) !== entry || entry.state !== 'queued' || entry.subscribers.size === 0) {
-          this.matrixLog('queue stale skipped', entry, { reason });
+    this.capacityDrain = (async () => {
+      this.capacityLog('queue drain start', null, { reason });
+      while (this.capacityQueue.length > 0) {
+        const entry = this.capacityQueue.shift();
+        if (this.getEntry({ kind: entry.kind, key: entry.key }) !== entry || entry.state !== 'queued' || entry.subscribers.size === 0) {
+          this.capacityLog('queue stale skipped', entry, { reason });
           continue;
         }
 
-        this.matrixLog('queued -> starting', entry, { reason });
+        this.capacityLog('queued -> starting', entry, { reason });
         try {
           const result = await this.startEntry(entry, { queued: true });
           if (result === 'active') {
-            this.matrixLog('queue drain active', entry, { reason });
+            this.capacityLog('queue drain active', entry, { reason });
             return true;
           }
           if (result === 'queued') {
-            this.scheduleMatrixProbe('capacity');
+            this.scheduleCapacityProbe('capacity');
             return false;
           }
         } catch (error) {
-          this.matrixLog('queued -> failed', entry, {
+          this.capacityLog('queued -> failed', entry, {
             reason,
             classification: error.classification ?? 'unknown',
           });
@@ -409,9 +466,9 @@
     })();
 
     try {
-      return await this.matrixDrain;
+      return await this.capacityDrain;
     } finally {
-      this.matrixDrain = null;
+      this.capacityDrain = null;
     }
   },
 
@@ -435,8 +492,8 @@
           },
           notifyStatus: (status) => {
             if (!current()) return false;
-            if (entry.kind === 'matrix' && status.state === 'queued' && status.error?.classification === 'capacity') {
-              return this.queueMatrixReconnect(entry, status, generation);
+            if (this.usesCapacity(entry.kind) && status.error?.classification === 'capacity') {
+              return this.queueCapacityStatus(entry, status, generation);
             }
             return this.notifyStatus(entry, status);
           },
@@ -445,7 +502,7 @@
         if (!upstream || typeof upstream.stop !== 'function') throw new Error(`Managed stream "${entry.kind}" must provide stop()`);
         if (!current() || entry.subscribers.size === 0) {
           await upstream.stop({ reason: 'startup.stale' });
-          this.matrixLog('startup stale cancelled', entry, { generation });
+          if (this.usesCapacity(entry.kind)) this.capacityLog('startup stale cancelled', entry, { generation });
           return 'stale';
         }
 
@@ -453,19 +510,22 @@
         entry.upstreamReady = true;
         entry.state = 'active';
         entry.lastError = null;
-        this.dequeueMatrix(entry);
-        if (entry.kind === 'matrix') {
-          this.matrixProbeDelay = 1000;
-          this.matrixLog('starting -> active', entry, { generation });
+        if (this.usesCapacity(entry.kind)) {
+          this.dequeueCapacity(entry);
+          this.capacityProbeDelay = 1000;
+          this.capacityLog('starting -> active', entry, { generation });
         }
         return 'active';
       } catch (error) {
         if (!current()) {
-          this.matrixLog('startup error stale', entry, { generation, classification: error.classification ?? 'unknown' });
+          if (this.usesCapacity(entry.kind)) {
+            this.capacityLog('startup error stale', entry, { generation, classification: error.classification ?? 'unknown' });
+          }
           return 'stale';
         }
-        if (entry.kind === 'matrix' && error.classification === 'capacity' && (queued || this.activeMatrixCount() > 0)) {
-          this.queueMatrix(entry, error, { front: queued });
+        if (this.usesCapacity(entry.kind) && error.classification === 'capacity') {
+          this.queueCapacity(entry, error, { front: queued });
+          this.scheduleCapacityProbe('capacity');
           return 'queued';
         }
         entry.lastError = this.serializeError(error);
@@ -488,14 +548,14 @@
 
     if (entry.stopPromise) return entry.stopPromise;
 
-    const wasActive = kind === 'matrix' && entry.state === 'active' && entry.upstreamReady;
+    const wasActive = this.usesCapacity(kind) && entry.state === 'active' && entry.upstreamReady;
     entry.state = 'stopping';
     entry.generation += 1;
-    if (kind === 'matrix') this.matrixLog('active -> stopping', entry, { reason });
+    if (this.usesCapacity(kind)) this.capacityLog('active -> stopping', entry, { reason });
     console.debug('managed stream stop start', this.entryLog(entry, { reason }));
     entry.stopPromise = (async () => {
       bucket.delete(key);
-      if (kind === 'matrix') this.dequeueMatrix(entry);
+      if (this.usesCapacity(kind)) this.dequeueCapacity(entry);
       this.logStop({ kind, key, reason, clientCount: entry.subscribers.size });
 
       for (const subscription of entry.subscribers.values()) {
@@ -515,7 +575,7 @@
       }
 
       entry.upstream = null;
-      if (wasActive && reason !== 'client.close') void this.drainMatrix({ reason });
+      if (wasActive && reason !== 'client.close') void this.drainCapacity({ reason });
       return true;
     })();
 
@@ -579,7 +639,7 @@
       }
     }
 
-    if (reason === 'client.close') void this.drainMatrix({ reason });
+    if (reason === 'client.close') void this.drainCapacity({ reason });
 
     return removed;
   },
