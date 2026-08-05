@@ -15,7 +15,13 @@
   onSuccess: (res) => {
     // if (res.success?.[0]?.advice !== undefined) console.info(JSON.stringify(res.success[0].advice));
   },
-  onFailure: (err, res) => console.error('Order error:', res, err),
+  onFailure(err) {
+    console.error('downstream queue failure', {
+      error: err?.message ?? err,
+      queueCount: this.count,
+      queueLength: this.queue.length,
+    });
+  },
   onDone: null,
   onDrain() {
     console.warn('send drain. size:', this.size, 'sent:', this.sent);
@@ -53,7 +59,11 @@
         finish(err, task);
       }, this.processTimeout);
     }
-    this.send(task, finish);
+    try {
+      Promise.resolve(this.send(task, finish)).catch((error) => finish(error, task));
+    } catch (error) {
+      finish(error, task);
+    }
   },
   takeNext() {
     const item = this.queue.shift();
@@ -88,6 +98,8 @@
   async send({ endpoint, data }, finish) {
     this.sent++;
     // console.log('send sent:', this.sent, 'OrderID', data.data.OrderID)
-    finish(null, await lib.ptfin.send({ method: 'POST', endpoint, data }));
+    const result = await lib.ptfin.send({ method: 'POST', endpoint, data });
+    finish(null, result);
+    return result;
   },
 });

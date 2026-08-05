@@ -13,6 +13,7 @@
   stopReason: null,
   generation: 0,
   connected: false,
+  state: 'starting',
 
   endpointName() {
     return this.currentParams.endpoint.join('/');
@@ -190,6 +191,7 @@
       this.shouldReconnect = true;
       this.stopReason = null;
     }
+    this.state = reconnect ? 'recovering' : 'starting';
     const currentGeneration = this.generation;
     this.clearReconnectTimer();
     this.clearHeartbeatTimer();
@@ -231,6 +233,7 @@
 
       console.log('Connection established:', url);
       this.connected = true;
+      this.state = 'active';
       this.traceLog('stream.connect.done', { startedAt });
       this.reconnectDelay = 5000;
       this.checkTimeout();
@@ -256,6 +259,7 @@
       if (!reconnect) throw err;
       if (err.classification === 'capacity') {
         this.stopStream('upstream.capacity');
+        this.state = 'failed';
         this.onStatus?.({
           state: 'queued',
           reason: 'upstream.capacity',
@@ -274,6 +278,7 @@
         err.reconnectable = false;
         err.streamStopped = true;
         this.stopStream('permanent-error');
+        this.state = 'failed';
         onError?.(err);
         return false;
       }
@@ -286,7 +291,8 @@
         resubscribeRequired: false,
         error: err,
       });
-      void this.scheduleReconnect({ generation: currentGeneration });
+      this.state = 'recovering';
+      void this.scheduleReconnect({ generation: currentGeneration, notify: false });
       return false;
     }
 
@@ -310,7 +316,8 @@
         active: true,
         resubscribeRequired: false,
       });
-      void this.scheduleReconnect();
+      this.state = 'recovering';
+      void this.scheduleReconnect({ reason: 'upstream.GoAway', notify: false });
       return false;
     }
 
@@ -334,11 +341,13 @@
             resubscribeRequired: false,
             error,
           });
+          this.state = 'recovering';
           console.warn('Stream error classification:', this.endpointName(), 'RETRYABLE -> reconnect');
           void this.scheduleReconnect({
             reason: `upstream.${packet.Error}`,
             retryAttempt: this.packetRetryAttempt,
             maxRetries: classification.maxRetries,
+            notify: false,
           });
           return false;
         }
@@ -362,14 +371,16 @@
           resubscribeRequired: false,
           error,
         });
+        this.state = 'recovering';
         console.warn('Stream error classification:', this.endpointName(), 'TRANSIENT -> reconnect');
-        void this.scheduleReconnect({ reason: `upstream.${packet.Error}` });
+        void this.scheduleReconnect({ reason: `upstream.${packet.Error}`, notify: false });
         return false;
       }
 
       if (onError) onError(error);
       if (error.permanent || error.streamStopped) {
         this.stopStream('permanent-error');
+        this.state = 'failed';
         return false;
       }
       console.warn('Stream error classification:', this.endpointName(), 'TRANSIENT -> reconnect');
@@ -413,11 +424,11 @@
       }
       if (classification === 'transient-close') {
         console.warn('Transient stream close:', this.endpointName(), err);
-        void this.scheduleReconnect();
+        void this.scheduleReconnect({ reason: 'transport.close' });
         return;
       }
       console.error('Unexpected stream error:', this.endpointName(), err);
-      void this.scheduleReconnect();
+      void this.scheduleReconnect({ reason: 'transport.error' });
       return;
     }
 
@@ -434,7 +445,7 @@
 
     if (!this.shouldReconnect || signal.aborted) return;
     console.warn('Stream closed unexpectedly:', this.endpointName());
-    void this.scheduleReconnect();
+    void this.scheduleReconnect({ reason: 'transport.close' });
   },
 
   checkTimeout() {
@@ -443,16 +454,28 @@
     this.timeoutHeartbeat = setTimeout(() => {
       if (!this.shouldReconnect) return;
       console.log('timeoutHeartbeat:', this.endpointName());
-      void this.scheduleReconnect();
+      void this.scheduleReconnect({ reason: 'heartbeat.timeout' });
     }, 30000);
   },
 
-  async scheduleReconnect({ generation = this.generation } = {}) {
+  async scheduleReconnect({ generation = this.generation, reason = 'transport.close', notify = true } = {}) {
     if (!this.shouldReconnect || this.reconnectTimer || generation !== this.generation) return;
 
     this.connected = false;
+    this.state = 'recovering';
     this.clearHeartbeatTimer();
     this.abortActiveStream('reconnect');
+
+    if (notify) {
+      this.onStatus?.({
+        state: 'recovering',
+        reason,
+        retryable: true,
+        terminal: false,
+        active: false,
+        resubscribeRequired: false,
+      });
+    }
 
     const delay = this.reconnectDelay;
     console.log('Reconnecting in', delay / 1000, 'seconds...');
@@ -472,6 +495,7 @@
     this.shouldReconnect = false;
     this.stopReason = reason;
     this.connected = false;
+    this.state = 'stopped';
     this.generation += 1;
     this.clearReconnectTimer();
     this.clearHeartbeatTimer();

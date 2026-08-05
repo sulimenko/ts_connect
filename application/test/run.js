@@ -2878,6 +2878,7 @@ test('brokerage streams start once and update orders and positions', async () =>
   const positions = loadExpressionModule('application/domain/ts/positions.js', {
     lib: { utils },
   });
+  const orderState = loadExpressionModule('application/domain/ts/orders.js', {});
   const queued = [];
   const streams = [];
   const stopped = [];
@@ -2892,6 +2893,7 @@ test('brokerage streams start once and update orders and positions', async () =>
         addTask: (task) => queued.push(task),
       },
       ts: {
+        orders: orderState,
         positions,
       },
     },
@@ -2901,12 +2903,19 @@ test('brokerage streams start once and update orders and positions', async () =>
         getContract: async () => contracts,
       },
       ts: {
+        orders: async () => ({ errors: [], orders: [] }),
         stream: ({ endpoint, onData }) => {
           const stream = {
             endpoint,
             onData,
+            state: 'starting',
+            shouldReconnect: true,
             initiateStream: async () => {},
-            stopStream: async (reason) => stopped.push({ endpoint, reason }),
+            stopStream: async (reason) => {
+              stream.state = 'stopped';
+              stream.shouldReconnect = false;
+              stopped.push({ endpoint, reason });
+            },
           };
           streams.push(stream);
           return stream;
@@ -2930,7 +2939,8 @@ test('brokerage streams start once and update orders and positions', async () =>
 
   const orders = streams.find((stream) => stream.endpoint.at(-1) === 'orders');
   orders.onData({ StreamStatus: 'EndSnapshot' });
-  orders.onData({ OrderID: 'O1', AccountID: '11827414', Status: 'Filled' });
+  orders.onData({ OrderID: 'O1', AccountID: '11827414', Status: 'Filled', Legs: [{ Symbol: 'TSLA' }] });
+  for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
   assert.equal(queued.length, 1);
   assert.equal(queued[0].endpoint[0], 'response');
   assert.equal(queued[0].data.type, 'order');
@@ -2996,6 +3006,279 @@ test('deleteClient closes brokerage streams through client close', async () => {
   assert.equal(closeCalls.length, 1);
   assert.equal(closeCalls[0].reason, 'client.delete');
   assert.equal(clients.values.ptfin, undefined);
+});
+
+test('downstream queue releases rejected and synchronous failures', async () => {
+  let calls = 0;
+  const failures = [];
+  const delivered = [];
+  const queue = loadExpressionModule('application/domain/queue.js', {
+    lib: {
+      ptfin: {
+        send: ({ data }) => {
+          calls += 1;
+          if (calls <= 20) return Promise.reject(new Error(`rejected-${calls}`));
+          if (data.sync) throw new Error('sync');
+          delivered.push(data.id);
+          return Promise.resolve({ ok: true });
+        },
+      },
+    },
+  });
+  queue.onFailure = (error) => failures.push(error.message);
+  queue.onSuccess = () => {};
+  queue.onDrain = () => {};
+
+  for (let id = 1; id <= 20; id += 1) queue.addTask({ endpoint: ['response'], data: { id } });
+  queue.addTask({ endpoint: ['response'], data: { id: 21 } });
+  queue.addTask({ endpoint: ['response'], data: { id: 22, sync: true } });
+
+  for (let turn = 0; turn < 100 && queue.count + queue.queue.length > 0; turn += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  assert.equal(queue.count, 0);
+  assert.equal(queue.queue.length, 0);
+  assert.equal(failures.length, 21);
+  assert.deepEqual(delivered, [21]);
+});
+
+test('orders state merges partial packets, validates shape and suppresses duplicates', async () => {
+  const orders = loadExpressionModule('application/domain/ts/orders.js', {});
+  const full = {
+    AccountID: 'A1',
+    OrderID: 'O1',
+    Status: 'ACK',
+    Legs: [{ Symbol: 'TSLA', QuantityOrdered: '1' }],
+  };
+
+  assert.deepEqual(Array.from(orders.missing({ OrderID: 'O1' })), ['AccountID', 'Legs']);
+  assert.equal(orders.commit({ live: true, account: 'A1', order: full }), true);
+  assert.equal(orders.commit({ live: true, account: 'A1', order: { ...full } }), false);
+
+  const merged = orders.merge({
+    live: true,
+    account: 'A1',
+    order: { OrderID: 'O1', Status: 'FLL', Legs: [{ QuantityOrdered: '2' }] },
+  });
+  assert.equal(merged.AccountID, 'A1');
+  assert.equal(merged.Status, 'FLL');
+  assert.equal(merged.Legs[0].Symbol, 'TSLA');
+  assert.equal(merged.Legs[0].QuantityOrdered, '2');
+  assert.deepEqual(Array.from(orders.missing(merged)), []);
+
+  assert.equal(orders.commit({ live: true, account: 'A1', order: merged }), true);
+  orders.clearAccount({ live: true, account: 'A1' });
+  assert.equal(orders.get({ live: true, account: 'A1', orderId: 'O1' }), null);
+});
+
+test('orders REST helper normalizes empty nullable fields and rejects malformed shapes', async () => {
+  const responses = [
+    {},
+    { Errors: null, Orders: null },
+    { Errors: [], Orders: [{ AccountID: 'A1', OrderID: 'O1', Legs: [{ Symbol: 'TSLA' }] }] },
+    { Errors: [], Orders: {} },
+  ];
+  const calls = [];
+  const helper = loadExpressionModule('application/lib/ts/orders.js', {
+    lib: {
+      ts: {
+        send: async (payload) => {
+          calls.push(payload);
+          return responses.shift();
+        },
+      },
+    },
+  });
+
+  assert.deepEqual(JSON.parse(JSON.stringify(await helper({ account: 'A1', live: true, token: 'token' }))), {
+    errors: [],
+    orders: [],
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(await helper({ account: 'A1', live: true, token: 'token', historical: true, start: '2026-07-01' }))),
+    { errors: [], orders: [] },
+  );
+  const found = await helper({ account: 'A1', live: true, token: 'token', orderIds: ['O1'], limit: 10 });
+  assert.equal(found.orders[0].OrderID, 'O1');
+  assert.equal(calls[1].endpoint.at(-1), 'historicalorders');
+  assert.equal(calls[1].data.since, '2026-07-01');
+  assert.equal(calls[2].endpoint.at(-1), 'O1');
+  await assert.rejects(helper({ account: 'A1', live: true, token: 'token' }), /Orders/);
+});
+
+test('orders APIs expose runtime contracts and tolerate empty upstream fields', async () => {
+  for (const file of ['application/api/account/orders.js', 'application/api/account/historicalorders.js']) {
+    const calls = [];
+    const api = loadExpressionModule(file, {
+      domain: { ts: { clients: { getClient: async () => ({ tokens: { access: 'token' } }) } } },
+      lib: {
+        ts: {
+          orders: async (payload) => {
+            calls.push(payload);
+            return { errors: [], orders: [] };
+          },
+        },
+      },
+    });
+    assert.equal(api.access, 'public');
+    assert.equal(api.parameters, 'json');
+    assert.equal(api.returns, 'json');
+    assert.equal(typeof api.errors, 'object');
+    assert.equal(typeof api.validate, 'function');
+    assert.equal((await api.method({ contracts: [{ account: 'A1', live: true }] })).length, 0);
+    assert.equal(calls.length, 1);
+  }
+});
+
+test('brokerage order stream replaces stale entries, reconciles and hydrates packets', async () => {
+  const orderState = loadExpressionModule('application/domain/ts/orders.js', {});
+  const queued = [];
+  const streams = [];
+  let snapshots = 0;
+  const factory = loadExpressionModule('application/domain/ts/client.js', {
+    domain: {
+      queue: { addTask: (task) => queued.push(task) },
+      ts: {
+        orders: orderState,
+        positions: {
+          setPosition: () => null,
+          clearPosition: () => {},
+        },
+      },
+    },
+    lib: {
+      utils: { makeSymbol: (symbol) => ({ symbol }), readPositionQuantity: () => 0 },
+      ptfin: { getContract: async () => [{ account: 'A1', live: true }] },
+      ts: {
+        orders: async ({ historical }) => {
+          snapshots += 1;
+          return historical
+            ? { errors: [], orders: [] }
+            : { errors: [], orders: [{ AccountID: 'A1', OrderID: 'O1', Status: 'ACK', Legs: [{ Symbol: 'TSLA' }] }] };
+        },
+        refresh: async () => {},
+        stream: ({ endpoint, onData, onError, onStatus }) => {
+          const stream = {
+            endpoint,
+            onData,
+            onError,
+            onStatus,
+            state: 'starting',
+            shouldReconnect: true,
+            connected: false,
+            initiateStream: async () => {
+              stream.state = 'active';
+              stream.connected = true;
+            },
+            stopStream: async () => {
+              stream.state = 'stopped';
+              stream.shouldReconnect = false;
+              stream.connected = false;
+            },
+          };
+          streams.push(stream);
+          return stream;
+        },
+      },
+    },
+  });
+  const client = await factory();
+  client.tokens.access = 'token';
+  await client.syncBrokerageStreams({ name: 'ptfin' });
+  for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+
+  const first = streams.find((stream) => stream.endpoint.at(-1) === 'orders');
+  assert.equal(snapshots, 2);
+  assert.equal(queued.length, 1);
+
+  first.onData({ OrderID: 'O1', Status: 'FLL' });
+  for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+  assert.equal(queued.length, 2);
+  assert.equal(queued[1].data.data.AccountID, 'A1');
+  assert.equal(queued[1].data.data.Legs[0].Symbol, 'TSLA');
+
+  first.onData({ OrderID: 'O2' });
+  for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+  assert.equal(
+    queued.some((task) => task.data.data.OrderID === 'O2'),
+    false,
+  );
+  assert.ok(snapshots >= 4);
+
+  first.state = 'failed';
+  first.shouldReconnect = false;
+  first.connected = false;
+  client.brokerage.ready = true;
+  await client.syncBrokerageStreams({ name: 'ptfin' });
+  assert.notEqual(client.streams.orders.A1, first);
+  assert.ok(streams.filter((stream) => stream.endpoint.at(-1) === 'orders').length >= 2);
+});
+
+test('order stream lifecycle reconciles transient recovery and single-flights authorization refresh', async () => {
+  const orderState = loadExpressionModule('application/domain/ts/orders.js', {});
+  const streams = [];
+  let refreshes = 0;
+  let snapshots = 0;
+  const factory = loadExpressionModule('application/domain/ts/client.js', {
+    domain: {
+      queue: { addTask: () => {} },
+      ts: {
+        orders: orderState,
+        positions: { setPosition: () => null, clearPosition: () => {} },
+      },
+    },
+    lib: {
+      utils: { makeSymbol: (symbol) => ({ symbol }), readPositionQuantity: () => 0 },
+      ptfin: { getContract: async () => [{ account: 'A1', live: true }] },
+      ts: {
+        orders: async () => {
+          snapshots += 1;
+          return { errors: [], orders: [] };
+        },
+        refresh: async () => {
+          refreshes += 1;
+        },
+        stream: ({ endpoint, onStatus }) => {
+          const stream = {
+            endpoint,
+            onStatus,
+            state: 'starting',
+            shouldReconnect: true,
+            connected: false,
+            initiateStream: async () => {
+              stream.state = 'active';
+              stream.connected = true;
+            },
+            stopStream: async () => {
+              stream.state = 'stopped';
+              stream.shouldReconnect = false;
+            },
+          };
+          streams.push(stream);
+          return stream;
+        },
+      },
+    },
+  });
+  const client = await factory();
+  client.tokens.access = 'token';
+  await client.syncBrokerageStreams({ name: 'ptfin' });
+  for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+  const orderStream = streams.find((stream) => stream.endpoint.at(-1) === 'orders');
+  const initialSnapshots = snapshots;
+
+  orderStream.onStatus({ state: 'recovering', reason: 'heartbeat.timeout', terminal: false });
+  orderStream.onStatus({ state: 'active', reason: 'reconnected', terminal: false });
+  for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+  assert.ok(snapshots > initialSnapshots);
+
+  const auth = { state: 'failed', reason: 'upstream.authorization', terminal: true, error: { classification: 'authorization' } };
+  orderStream.onStatus(auth);
+  orderStream.onStatus(auth);
+  for (let turn = 0; turn < 30; turn += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(refreshes, 1);
+  assert.ok(streams.filter((stream) => stream.endpoint.at(-1) === 'orders').length >= 2);
 });
 
 (async () => {
