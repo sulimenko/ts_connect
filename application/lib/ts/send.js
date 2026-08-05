@@ -28,8 +28,39 @@ async ({ method, domain = null, live = false, ver = 'v3', endpoint, token, data 
       return await res.json();
     } else {
       const errorText = await res.text();
-      console.error('Request failed:', res.status, res.statusText, errorText);
-      throw new Error(`HTTP Error: ${res.status} ${res.statusText}`);
+      const responseText = errorText.trim();
+      const values = [responseText];
+      if (responseText) {
+        try {
+          const pending = [JSON.parse(responseText)];
+          while (pending.length > 0) {
+            const value = pending.pop();
+            if (typeof value === 'string') values.push(value.trim());
+            else if (Array.isArray(value)) pending.push(...value);
+            else if (value && typeof value === 'object') pending.push(...Object.values(value));
+          }
+        } catch {
+          // Plain text upstream errors are valid response bodies.
+        }
+      }
+
+      const error = new Error(`HTTP Error: ${res.status} ${res.statusText}`);
+      error.status = res.status;
+      error.statusText = res.statusText;
+      error.responseText = responseText;
+      if (res.status === 400 && values.some((value) => value.toLowerCase() === 'invalid symbol')) {
+        error.code = 'INVALID_SYMBOL';
+        error.classification = 'invalid';
+        error.permanent = true;
+        error.retryable = false;
+      }
+      console.error('Request failed:', {
+        status: error.status,
+        statusText: error.statusText,
+        code: error.code,
+        responseText: error.responseText,
+      });
+      throw error;
     }
   } catch (error) {
     console.error('Error in send function:', error);

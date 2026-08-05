@@ -3,6 +3,7 @@
   parameters: 'json',
   returns: 'json',
   errors: {
+    EINVALIDSYMBOL: 'TradeStation rejected the underlying symbol',
     ESYMBOL: 'Underlying symbol is required',
     ESTRIKEPRICE: 'Strike price must be numeric',
   },
@@ -21,7 +22,13 @@
 
     const client = await domain.ts.clients.getClient({});
     const endpoint = ['marketdata', 'options', 'expirations', expirationsSymbol];
-    const response = await lib.ts.send({ method: 'GET', live: true, endpoint, token: client.tokens.access, data });
+    let response;
+    try {
+      response = await lib.ts.send({ method: 'GET', live: true, endpoint, token: client.tokens.access, data });
+    } catch (error) {
+      if (error?.code === 'INVALID_SYMBOL') return new DomainError('EINVALIDSYMBOL');
+      throw error;
+    }
 
     if (Array.isArray(response?.Expirations)) return response.Expirations;
     if (Array.isArray(response?.expirations)) return response.expirations;

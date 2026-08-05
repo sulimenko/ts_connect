@@ -1,6 +1,7 @@
 async () => ({
   key: { pkey: null, secret: null },
   tokens: { id: null, access: null, expires: null, refresh: null },
+  tokenRefresh: null,
   timers: { rtoken: null },
   brokerage: { setup: null, recovery: null, recoveryAuth: false, ready: false, accounts: new Map(), reconciling: {} },
   closed: false,
@@ -183,7 +184,7 @@ async () => ({
   },
 
   recoverBrokerage({ name = 'ptfin', reason = 'unknown', authorization = false } = {}) {
-    if (authorization) this.brokerage.recoveryAuth = true;
+    if (authorization && !(this.brokerage.recovery && this.tokenRefresh)) this.brokerage.recoveryAuth = true;
     if (this.brokerage.recovery) return this.brokerage.recovery;
     this.brokerage.ready = false;
     const recovery = (async () => {
@@ -198,7 +199,7 @@ async () => ({
           }
           const refresh = this.brokerage.recoveryAuth;
           this.brokerage.recoveryAuth = false;
-          if (refresh) await lib.ts.refresh({ client: this });
+          if (refresh) await this.refreshAccessToken({ reason: 'brokerage' });
           result = await this.syncBrokerageStreams({ name });
           if (!this.brokerage.recoveryAuth) return result;
         }
@@ -213,6 +214,48 @@ async () => ({
     })();
     this.brokerage.recovery = recovery;
     return recovery;
+  },
+
+  refreshAccessToken({ reason = 'unknown' } = {}) {
+    if (this.closed) {
+      console.debug('OAuth refresh', { event: 'oauth.refresh', reason, state: 'skipped', shared: false, closed: true });
+      return Promise.resolve(false);
+    }
+    if (this.tokenRefresh) {
+      console.debug('OAuth refresh', { event: 'oauth.refresh', reason, state: 'shared', shared: true, closed: false });
+      return this.tokenRefresh;
+    }
+
+    const refresh = (async () => {
+      console.debug('OAuth refresh', { event: 'oauth.refresh', reason, state: 'started', shared: false, closed: false });
+      try {
+        const result = await lib.ts.refresh({ client: this });
+        console.debug('OAuth refresh', {
+          event: 'oauth.refresh',
+          reason,
+          state: 'completed',
+          shared: false,
+          closed: this.closed,
+        });
+        return result;
+      } catch (error) {
+        console.warn('OAuth refresh', {
+          event: 'oauth.refresh',
+          reason,
+          state: 'failed',
+          shared: false,
+          closed: this.closed,
+          errorName: error?.name,
+          errorCode: error?.code,
+        });
+        throw error;
+      } finally {
+        if (this.tokenRefresh === refresh) this.tokenRefresh = null;
+      }
+    })();
+
+    this.tokenRefresh = refresh;
+    return refresh;
   },
 
   async stopAllStreams({ reason = 'client.close' } = {}) {
@@ -297,15 +340,30 @@ async () => ({
 
   lifetime() {
     clearTimeout(this.timers.rtoken);
+    this.timers.rtoken = null;
+    if (this.closed) return;
     this.timers.rtoken = setTimeout(() => {
-      try {
-        // console.log(this.tokens.expires, new Date(new Date().getTime() + 2 * 60 * 1000));
-        // if (this.tokens.expires < new Date(new Date().getTime() + 19 * 60 * 1000)) lib.ts.refresh({ client: this });
-        if (this.tokens.expires < new Date(new Date().getTime() + 2 * 60 * 1000)) lib.ts.refresh({ client: this });
-      } catch (error) {
-        console.error('Error in lifetime management:', error);
-      }
-      this.lifetime();
+      this.timers.rtoken = null;
+      if (this.closed) return;
+      void (async () => {
+        try {
+          if (this.tokens.expires < new Date(new Date().getTime() + 2 * 60 * 1000)) {
+            await this.refreshAccessToken({ reason: 'lifetime' });
+          }
+        } catch (error) {
+          console.warn('OAuth refresh handled', {
+            event: 'oauth.refresh',
+            reason: 'lifetime',
+            state: 'handled',
+            shared: false,
+            closed: this.closed,
+            errorName: error?.name,
+            errorCode: error?.code,
+          });
+        } finally {
+          if (!this.closed) this.lifetime();
+        }
+      })();
     }, 60 * 1000);
   },
 

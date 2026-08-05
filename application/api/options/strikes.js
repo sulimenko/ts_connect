@@ -4,6 +4,7 @@
   returns: 'json',
   errors: {
     EINTERVAL: 'Strike interval must be a positive number',
+    EINVALIDSYMBOL: 'TradeStation rejected the underlying symbol',
     ESYMBOL: 'Underlying symbol is required',
   },
   method: async ({
@@ -39,6 +40,11 @@
     const client = await domain.ts.clients.getClient({});
     const endpoint = ['marketdata', 'options', 'strikes', strikesSymbol];
 
-    return lib.ts.send({ method: 'GET', live: true, endpoint, token: client.tokens.access, data });
+    try {
+      return await lib.ts.send({ method: 'GET', live: true, endpoint, token: client.tokens.access, data });
+    } catch (error) {
+      if (error?.code === 'INVALID_SYMBOL') return new DomainError('EINVALIDSYMBOL');
+      throw error;
+    }
   },
 });
