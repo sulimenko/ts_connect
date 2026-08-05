@@ -2,7 +2,7 @@ async () => ({
   key: { pkey: null, secret: null },
   tokens: { id: null, access: null, expires: null, refresh: null },
   timers: { rtoken: null },
-  brokerage: { setup: null, recovery: null, ready: false, accounts: new Map(), reconciling: {} },
+  brokerage: { setup: null, recovery: null, recoveryAuth: false, ready: false, accounts: new Map(), reconciling: {} },
   closed: false,
   streams: {
     charts: {},
@@ -80,12 +80,18 @@ async () => ({
     return true;
   },
 
-  sendOrder({ live, account, order, source }) {
-    const merged = domain.ts.orders.merge({ live, account, order });
-    if (domain.ts.orders.missing(merged).length > 0) return false;
-    if (!domain.ts.orders.commit({ live, account, order: merged })) return false;
+  sendOrder({ live, account, order, source, generation = null }) {
+    const pending = domain.ts.orders.pending({ live, account, order, generation });
+    if (!pending) return false;
+    const { order: merged, fingerprint } = pending;
+    const delivery = { live, account: merged.AccountID, orderId: merged.OrderID, fingerprint };
     console.debug('brokerage order ready', { account, OrderID: merged.OrderID, hydrationSource: source });
-    domain.queue.addTask({ endpoint: ['response'], data: { type: 'order', data: merged } });
+    domain.queue.addTask({
+      endpoint: ['response'],
+      data: { type: 'order', data: merged },
+      onSuccess: () => domain.ts.orders.delivered(delivery),
+      onFailure: () => domain.ts.orders.failed(delivery),
+    });
     return true;
   },
 
@@ -106,12 +112,7 @@ async () => ({
       if (!found) continue;
       const restored = { ...found, ...merged };
       if (Array.isArray(found.Legs)) {
-        restored.Legs = Array.isArray(merged.Legs)
-          ? merged.Legs.map((leg, index) => {
-              const snapshot = found.Legs[index] ?? {};
-              return { ...snapshot, ...leg };
-            })
-          : found.Legs;
+        restored.Legs = Array.isArray(merged.Legs) ? domain.ts.orders.mergeLegs(found.Legs, merged.Legs) : found.Legs;
       }
       merged = domain.ts.orders.merge({ live, account, order: restored });
       if (domain.ts.orders.missing(merged).length === 0) {
@@ -121,12 +122,14 @@ async () => ({
     return { order: merged, source: null };
   },
 
-  async handleOrder({ live, account, order }) {
+  async handleOrder({ live, account, order, generation = null }) {
     if (!order?.OrderID) return false;
     try {
       const hydrated = await this.hydrateOrder({ live, account, order: { ...order, AccountID: order.AccountID ?? account } });
       const missingFields = domain.ts.orders.missing(hydrated.order);
-      if (missingFields.length === 0) return this.sendOrder({ live, account, order: hydrated.order, source: hydrated.source });
+      if (missingFields.length === 0) {
+        return this.sendOrder({ live, account, order: hydrated.order, source: hydrated.source, generation });
+      }
       console.warn('brokerage order hydration failed', {
         account,
         OrderID: order.OrderID,
@@ -151,19 +154,22 @@ async () => ({
     const key = `${live === true}|${account}`;
     if (this.brokerage.reconciling[key]) return this.brokerage.reconciling[key];
     const task = (async () => {
+      const generation = domain.ts.orders.generation({ live, account });
       try {
         const [current, historical] = await Promise.all([
           lib.ts.orders({ account, live, token: this.tokens.access }),
           lib.ts.orders({ account, live, token: this.tokens.access, historical: true }),
         ]);
         const snapshot = new Map();
-        for (const order of [...current.orders, ...historical.orders]) {
+        for (const order of [...historical.orders, ...current.orders]) {
           const accountId = `${order?.AccountID ?? account}`.trim();
           const orderId = `${order?.OrderID ?? ''}`.trim();
           if (!accountId || !orderId) continue;
           snapshot.set(`${accountId}|${orderId}`, { ...order, AccountID: accountId });
         }
-        for (const order of snapshot.values()) this.sendOrder({ live, account, order, source: `reconcile:${reason}` });
+        for (const order of snapshot.values()) {
+          this.sendOrder({ live, account, order, source: `reconcile:${reason}`, generation });
+        }
         return true;
       } catch (error) {
         console.warn('brokerage order reconciliation failed', { account, reason, error: error?.message ?? error });
@@ -177,20 +183,32 @@ async () => ({
   },
 
   recoverBrokerage({ name = 'ptfin', reason = 'unknown', authorization = false } = {}) {
+    if (authorization) this.brokerage.recoveryAuth = true;
     if (this.brokerage.recovery) return this.brokerage.recovery;
     this.brokerage.ready = false;
     const recovery = (async () => {
       try {
-        if (authorization) await lib.ts.refresh({ client: this });
-        for (const key of Object.keys(this.streams.orders)) {
-          if (!this.streamUsable(this.streams.orders[key])) await this.stopStoredStream({ group: 'orders', key, reason });
+        if (this.brokerage.setup) await this.brokerage.setup;
+        let result = false;
+        for (let cycle = 0; cycle < 2; cycle++) {
+          for (const group of ['orders', 'positions']) {
+            for (const key of Object.keys(this.getStreamBucket(group))) {
+              await this.stopStoredStream({ group, key, reason });
+            }
+          }
+          const refresh = this.brokerage.recoveryAuth;
+          this.brokerage.recoveryAuth = false;
+          if (refresh) await lib.ts.refresh({ client: this });
+          result = await this.syncBrokerageStreams({ name });
+          if (!this.brokerage.recoveryAuth) return result;
         }
-        return this.syncBrokerageStreams({ name });
+        return result;
       } catch (error) {
         console.warn('Brokerage stream recovery failed:', { reason, error: error?.message ?? error });
         return false;
       } finally {
         this.brokerage.recovery = null;
+        this.brokerage.recoveryAuth = false;
       }
     })();
     this.brokerage.recovery = recovery;
@@ -309,17 +327,21 @@ async () => ({
       const onData = (message) => {
         if (message?.StreamStatus === 'EndSnapshot') return;
         if (message?.StreamStatus && !message.OrderID) return;
-        void this.handleOrder({ live: contract.live, account, order: message });
+        const observed = domain.ts.orders.observe({ live: contract.live, account, order: message, stream: true });
+        if (observed) {
+          void this.handleOrder({ live: contract.live, account, order: observed.order, generation: observed.generation });
+        }
       };
 
       let stream = null;
       const onError = (err) => {
         console.error('Stream orders error:', account, endpoint.join('/'), err);
+        const authorization = err?.classification === 'authorization';
         if (err?.permanent || err?.terminal || err?.streamStopped) {
           this.brokerage.ready = false;
-          if (bucket[key] === stream) delete bucket[key];
+          if (!authorization && bucket[key] === stream) delete bucket[key];
         }
-        if (err?.classification === 'authorization') {
+        if (authorization) {
           void this.recoverBrokerage({ reason: 'upstream.authorization', authorization: true });
         }
       };
@@ -340,8 +362,8 @@ async () => ({
         }
         if (status.terminal || ['failed', 'stopped'].includes(status.state)) {
           this.brokerage.ready = false;
-          if (bucket[key] === stream) delete bucket[key];
           const authorization = status.error?.classification === 'authorization' || status.reason === 'upstream.authorization';
+          if (!authorization && bucket[key] === stream) delete bucket[key];
           if (authorization) void this.recoverBrokerage({ reason: status.reason, authorization: true });
         }
       };
@@ -396,9 +418,13 @@ async () => ({
       let stream = null;
       const onError = (err) => {
         console.error('Stream positions error:', account, endpoint.join('/'), err);
+        const authorization = err?.classification === 'authorization';
         if (err?.permanent || err?.terminal || err?.streamStopped) {
           this.brokerage.ready = false;
-          if (bucket[key] === stream) delete bucket[key];
+          if (!authorization && bucket[key] === stream) delete bucket[key];
+        }
+        if (authorization) {
+          void this.recoverBrokerage({ reason: 'upstream.authorization', authorization: true });
         }
       };
       const onStatus = (status) => {
@@ -406,7 +432,9 @@ async () => ({
         stream.state = status.state;
         if (status.terminal || ['failed', 'stopped'].includes(status.state)) {
           this.brokerage.ready = false;
-          if (bucket[key] === stream) delete bucket[key];
+          const authorization = status.error?.classification === 'authorization' || status.reason === 'upstream.authorization';
+          if (!authorization && bucket[key] === stream) delete bucket[key];
+          if (authorization) void this.recoverBrokerage({ reason: status.reason, authorization: true });
         }
       };
 
@@ -421,6 +449,10 @@ async () => ({
       return key;
     } catch (error) {
       console.error('Error in streamPositions:', contract?.account, error);
+      this.brokerage.ready = false;
+      if (error?.classification === 'authorization') {
+        setTimeout(() => void this.recoverBrokerage({ reason: 'upstream.authorization', authorization: true }), 0);
+      }
       return false;
     }
   },
