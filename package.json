@@ -38,7 +38,7 @@
     "start": "node server.js"
   },
   "engines": {
-    "node": "22"
+    "node": ">=24 <25"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
