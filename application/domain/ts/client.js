@@ -349,6 +349,9 @@ async () => ({
         try {
           if (this.tokens.expires < new Date(new Date().getTime() + 2 * 60 * 1000)) {
             await this.refreshAccessToken({ reason: 'lifetime' });
+            if (!this.closed && this.brokerage.accounts.size > 0 && !this.brokerageHealthy()) {
+              await this.recoverBrokerage({ reason: 'oauth.recovered', authorization: false });
+            }
           }
         } catch (error) {
           console.warn('OAuth refresh handled', {
