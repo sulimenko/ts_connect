@@ -46,7 +46,7 @@
       client.key.pkey = config.ts[name].pkey;
       client.key.secret = config.ts[name].secret;
 
-      await lib.ts.refresh({ client });
+      await client.refreshAccessToken({ reason: 'setup' });
       await client.syncBrokerageStreams({ name });
       client.lifetime();
       return client;
