@@ -11,13 +11,52 @@ Repo: `sulimenko/ts_connect`.
 - `doc/blueprint.md` — архитектурные правила, слои, контракт процедур, stream lifecycle.
 - `doc/openapi_20260411.md` — компактный индекс и дополнение по snapshot TradeStation OpenAPI от 2026-04-11.
 - `doc/ai/chatgpt/project-settings.md` — правила AI Pipeline v8 для проекта.
+- `doc/ai/chatgpt/architect.instructions.md` — обязательные role-specific правила Architect для анализа, task draft и архитектурных решений.
+- `doc/ai/chatgpt/reviewer.instructions.md` — обязательные role-specific правила Reviewer.
 - `doc/ai/chatgpt/task-template.md` — шаблон task contract.
+- `doc/ai/chatgpt/followup-template.md` — шаблон follow-up к открытому PR.
 - `doc/ai/chatgpt/review-checklist.md` — review-checklist для PR.
+- `doc/ai/project-checks.sh` — project-specific validation wrapper.
 - `doc/tasks/ready/*.md` — активные задачи для runner.
 - `doc/tasks/done/*.md` — закрытые/перенесённые task files.
 - `doc/task.md` — legacy task history после миграции.
 - `doc/review.md` — legacy review history после миграции.
 - `doc/changelog.md` — архив закрытых задач и заключений.
+
+## Instruction precedence
+
+Правила читаются и применяются в следующем порядке:
+
+1. Явная текущая инструкция пользователя для конкретной работы.
+2. Активный `ai-task-contract` — источник истины для scope, routing, validation и PR behavior уже созданной runner-задачи.
+3. `AGENTS.md` — общие обязательные инварианты проекта и эта таблица precedence.
+4. Role-specific instructions:
+   - `doc/ai/chatgpt/architect.instructions.md` для Architect/task preparation;
+   - `doc/ai/chatgpt/reviewer.instructions.md` для review.
+5. `doc/ai/chatgpt/project-settings.md` — shared AI Pipeline v8 rules.
+6. `doc/blueprint.md` — архитектурные и runtime-инварианты сервиса.
+7. `task-template.md`, `followup-template.md`, `review-checklist.md` — templates/checklists; они не могут переопределять документы выше.
+8. `doc/task.md` и `doc/review.md` — только legacy/history и никогда не являются источником активных правил или задач.
+
+Если документы одного уровня конфликтуют, действует более узкое правило для текущей роли/области, но оно не может отменить правило более высокого уровня.
+
+Если новая инструкция пользователя меняет уже созданный `ai-task-contract`, Architect не должен молча выполнять задачу вне contract: сначала нужно явно обновить/создать подходящую task/follow-up.
+
+### Impress optional metadata
+
+Metarhia/Impress допускает simple API function и extended declaration.
+
+Поля extended declaration `access`, `parameters`, `returns`, `errors`, `validate` являются optional по framework contract. Их отсутствие само по себе не является defect или review blocker.
+
+Конкретное optional поле становится обязательным только если:
+
+- пользователь явно потребовал его в текущей работе;
+- `ai-task-contract` явно требует его;
+- существующее поведение уже зависит от этого поля и изменение/удаление изменит runtime semantics.
+
+Если пользователь явно просит не добавлять или не проверять descriptive/optional Impress metadata в текущей задаче, отсутствие этих полей не должно блокировать task или PR.
+
+При этом существующие `access`, schemas, validation и error mappings нельзя молча удалять или ослаблять: если они уже влияют на runtime behavior, review проверяет сохранение их семантики.
 
 ## Repo access
 
@@ -197,6 +236,13 @@ No silent fallback: если routing follow-up невалидный, задач�
 
 ## Impress
 
+- Impress допускает simple API function `async ({ ... }) => ...` и extended declaration `({ ... })`.
+- Для extended declaration `method` является точкой выполнения.
+- `access`, `parameters`, `returns`, `errors`, `validate` optional по framework contract.
+- Не требовать эти optional поля только потому, что public API файл был создан или затронут.
+- Если optional поле уже существует, его runtime semantics должны быть сохранены.
+- Если behavior зависит от `DomainError`, access policy, schema validation или result validation, соответствующий contract должен оставаться согласованным.
+- Явное требование пользователя или `ai-task-contract` имеет приоритет и может сделать конкретные optional fields обязательными для данной задачи.
 - Файлы экспортируют единственную функцию или объект: `({...}) => { ... }` или `({ ... })`.
 - Глобальные пространства: `lib.*`, `domain.*`, `config.*`, `application.*`.
 - Нельзя делать import-time side effects в файлах, которые загружает общий aggregator.

@@ -2,6 +2,14 @@
 
 Ты работаешь как ChatGPT Architect + Reviewer для `sulimenko/ts_connect`.
 
+## Precedence
+
+`AGENTS.md` задаёт общий instruction precedence проекта.
+
+Для Architect этот файл обязателен и уточняет `AGENTS.md`, но не переопределяет явную инструкцию пользователя или активный `ai-task-contract`.
+
+Если текущая просьба пользователя меняет scope уже созданной runner-задачи, сначала оформить изменение contract/task, а не молча расширять execution scope.
+
 ## Источники истины
 
 Решения по разработке принимаются только на основании:
@@ -31,11 +39,29 @@
 
 ## Impress
 
-Public RPC procedure сохраняет project runtime contract:
-`access`, `parameters`, `returns`, `errors`, `validate` при необходимости, `method`.
+Impress поддерживает два допустимых API patterns:
+
+- simple API function;
+- extended declaration с `method`.
+
+Для extended declaration `access`, `parameters`, `returns`, `errors`, `validate` являются optional по framework contract.
+
+Architect не должен добавлять или требовать optional metadata только потому, что public procedure новая или затронута задачей.
+
+Optional field становится required для конкретной работы только если:
+
+- пользователь явно этого требует;
+- `ai-task-contract` явно этого требует;
+- существующее runtime behavior уже зависит от него.
+
+Если пользователь явно просит не добавлять/не проверять optional descriptive metadata, это указание нужно сохранить в task scope/criteria и не делать отсутствие полей blocker-ом.
+
+Существующие runtime-relevant поля нельзя удалять или ослаблять без явного изменения behavior. Например, explicit `access`, schema validation, result validation и error mapping проверяются как часть совместимости, если они уже присутствуют.
 
 `DomainError` — только predictable public/business contract errors.
 `Error` — bugs, transport failures, malformed upstream state и unexpected integration failures.
+
+Если код использует `DomainError` как публичный код ошибки, соответствующий error mapping должен оставаться согласованным с фактическим runtime behavior.
 
 Не вводить import-time side effects в autoloaded modules.
 Не менять namespace/layout convention без проверки текущего loader behavior.
