@@ -10,36 +10,37 @@
       const data = {};
       // if (symbols.length > 0) data.symbol = symbols.map((each) => each.toUpperCase()).join(',');
 
-      const responce = await lib.ts.send({ method: 'GET', live: contract.live, endpoint, token: client.tokens.access, data });
-      if (responce.Errors.length === 0) {
-        const exist = domain.ts.positions.getAccount({ account }) ?? new Map();
-        for (const symbol of exist.keys()) {
-          const internal = exist.get(symbol);
-          const internalSymbol = lib.utils.makeSymbol(internal.get('Symbol') ?? symbol)?.symbol ?? null;
-          const external =
-            responce.Positions?.find(
-              (each) =>
-                domain.ts.positions.normalizeAccountKey(each.AccountID) === account &&
-                lib.utils.makeSymbol(each.Symbol)?.symbol === internalSymbol,
-            ) || {};
-          try {
-            // console.info('positions', symbol, 'internal', internal.get('Quantity'), '=', external.Quantity ?? 'empty', 'external');
-            if (parseFloat(internal.get('Quantity') ?? 0) !== parseFloat(external.Quantity ?? 0)) {
-              console.error('positions', symbol, 'internal', internal.get('Quantity'), '=', external.Quantity ?? 'empty', 'external');
-            }
-          } catch (e) {
-            console.error(symbol, internal, external, e);
+      const response = await lib.ts.send({ method: 'GET', live: contract.live, endpoint, token: client.tokens.access, data });
+      const errors = Array.isArray(response?.Errors) ? response.Errors : [];
+      if (errors.length > 0) throw new Error('Positions refresh failed');
+      if (!Array.isArray(response?.Positions)) throw new Error('Invalid positions response');
+      const exist = domain.ts.positions.getAccount({ account }) ?? new Map();
+      for (const symbol of exist.keys()) {
+        const internal = exist.get(symbol);
+        const internalSymbol = lib.utils.makeSymbol(internal.get('Symbol') ?? symbol)?.symbol ?? null;
+        const external =
+          response.Positions.find(
+            (each) =>
+              domain.ts.positions.normalizeAccountKey(each.AccountID) === account &&
+              lib.utils.makeSymbol(each.Symbol)?.symbol === internalSymbol,
+          ) || {};
+        try {
+          // console.info('positions', symbol, 'internal', internal.get('Quantity'), '=', external.Quantity ?? 'empty', 'external');
+          if (parseFloat(internal.get('Quantity') ?? 0) !== parseFloat(external.Quantity ?? 0)) {
+            console.error('positions', symbol, 'internal', internal.get('Quantity'), '=', external.Quantity ?? 'empty', 'external');
           }
+        } catch (e) {
+          console.error(symbol, internal, external, e);
         }
+      }
 
-        domain.ts.positions.clearAccount(account);
-        if (responce.Positions.length > 0) {
-          for (const position of responce.Positions) {
-            domain.ts.positions.setPosition({ account, symbol: position.Symbol, data: position });
-            result.push(position);
-          }
-          // result.push(...responce.Positions);
+      domain.ts.positions.clearAccount(account);
+      if (response.Positions.length > 0) {
+        for (const position of response.Positions) {
+          domain.ts.positions.setPosition({ account, symbol: position.Symbol, data: position });
+          result.push(position);
         }
+        // result.push(...response.Positions);
       }
     }
     return result;
