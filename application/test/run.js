@@ -1478,6 +1478,36 @@ test('readOptionChain and positions share the same canonical option symbol contr
   assert.equal(positions.getPosition({ account: 'A1', symbol: 'CRWV 280121C80' }), null);
 });
 
+test('positions refresh clears state only after an authoritative snapshot', async () => {
+  const utils = loadUtils();
+  const positions = loadExpressionModule('application/domain/ts/positions.js', {
+    lib: { utils },
+  });
+  const position = { AccountID: 'A1', Symbol: 'MSFT', Quantity: '2' };
+  positions.setPosition({ account: 'A1', symbol: 'MSFT', data: position });
+  let response = { Errors: [] };
+  const api = loadExpressionModule('application/api/account/positions.js', {
+    domain: {
+      ts: {
+        clients: { getClient: async () => ({ tokens: { access: 'token' } }) },
+        positions,
+      },
+    },
+    lib: { utils, ts: { send: async () => response } },
+  });
+
+  await assert.rejects(api.method({ contracts: [{ account: 'A1', live: true }] }), /Invalid positions response/);
+  assert.equal(positions.getPosition({ account: 'A1', symbol: 'MSFT' }).get('Quantity'), '2');
+
+  response = { Errors: [{ Message: 'Unavailable' }], Positions: [] };
+  await assert.rejects(api.method({ contracts: [{ account: 'A1', live: true }] }), /Positions refresh failed/);
+  assert.equal(positions.getPosition({ account: 'A1', symbol: 'MSFT' }).get('Quantity'), '2');
+
+  response = { Errors: [], Positions: [] };
+  assert.equal((await api.method({ contracts: [{ account: 'A1', live: true }] })).length, 0);
+  assert.equal(positions.getPosition({ account: 'A1', symbol: 'MSFT' }), null);
+});
+
 test('readOptionChain keeps structurally valid rows with missing quotes and greeks', async () => {
   const utils = loadUtils();
   const readOptionChain = loadExpressionModule('application/lib/ts/readOptionChain.js', {
@@ -1511,6 +1541,7 @@ test('readOptionChain keeps structurally valid rows with missing quotes and gree
 
 test('marketdata quotes and order execution use the shared symbol formatter', async () => {
   const utils = loadUtils();
+  const limitKey = 'limit_price';
   const readQuote = loadExpressionModule('application/lib/ts/readQuote.js', {
     lib: { utils },
   });
@@ -1611,6 +1642,7 @@ test('marketdata quotes and order execution use the shared symbol formatter', as
     qty: 1,
     type: 'Limit',
     tif: 'GTC',
+    [limitKey]: '1.25',
   });
 
   assert.equal(orderCalls.length, 1);
@@ -1667,6 +1699,218 @@ test('placeorder normalizes instrument type before getAction for option closes',
 
   assert.equal(sendCalls.length, 1);
   assert.equal(sendCalls[0].data.TradeAction, 'SELLTOCLOSE');
+});
+
+test('order refreshes positions once and recalculates stock and option close actions', async () => {
+  const utils = loadUtils();
+  const cases = [
+    { instrument: { symbol: 'MSFT', type: 'STK' }, qty: -1, position: 2, actions: ['SELLSHORT', 'Sell'] },
+    { instrument: { symbol: 'MSFT', type: 'STK' }, qty: 1, position: -2, actions: ['Buy', 'BUYTOCOVER'] },
+    {
+      instrument: { symbol: 'CRWV280121C00080000', type: 'OPT' },
+      qty: 1,
+      position: -2,
+      actions: ['BUYTOOPEN', 'BUYTOCLOSE'],
+      topLevel: true,
+    },
+    { instrument: { symbol: 'CRWV280121C00080000', type: 'OPT' }, qty: -1, position: 2, actions: ['SELLTOOPEN', 'SELLTOCLOSE'] },
+  ];
+
+  for (const item of cases) {
+    let current = null;
+    let refreshes = 0;
+    const actions = [];
+    const positions = {
+      getPosition: () => current,
+      clearPosition: () => {},
+    };
+    const placeorder = loadExpressionModule('application/lib/ts/placeorder.js', {
+      domain: {
+        ts: {
+          positions,
+          clients: { getClient: async () => ({ tokens: { access: 'token' } }) },
+        },
+      },
+      lib: {
+        utils,
+        ts: {
+          send: async ({ data }) => {
+            actions.push(data.TradeAction);
+            if (actions.length === 1) {
+              const failure = { Message: 'Order failed. Reason: You are long this position.' };
+              return item.topLevel ? { Errors: [failure] } : { Orders: [{ Error: 'FAILED', ...failure }] };
+            }
+            return { Orders: [{ Status: 'OK' }] };
+          },
+        },
+      },
+    });
+    const order = loadExpressionModule('application/api/orderexecution/order.js', {
+      DomainError: class DomainError extends Error {},
+      lib: { utils, ts: { placeorder } },
+      api: {
+        account: {
+          positions: async () => {
+            refreshes++;
+            current = new Map([['Quantity', String(item.position)]]);
+            return [];
+          },
+        },
+      },
+    });
+
+    await order.method({
+      contract: { account: 'A1', live: true },
+      instrument: item.instrument,
+      qty: item.qty,
+      type: 'Market',
+    });
+
+    assert.deepEqual(actions, item.actions);
+    assert.equal(refreshes, 1);
+  }
+});
+
+test('order recovery is bounded and excludes broker capacity, locate, and tick restrictions', async () => {
+  const utils = loadUtils();
+  const messages = [
+    'Order failed. Reason: Existing working orders use all available closing capacity.',
+    'SL0350 Security not easy to borrow. Short Locate is required.',
+    'Order failed. Reason: Invalid price increment.',
+  ];
+
+  for (const message of messages) {
+    let calls = 0;
+    let refreshes = 0;
+    const order = loadExpressionModule('application/api/orderexecution/order.js', {
+      DomainError: class DomainError extends Error {},
+      lib: {
+        utils,
+        ts: {
+          placeorder: async () => {
+            calls++;
+            return { Orders: [{ Error: 'FAILED', Message: message }] };
+          },
+        },
+      },
+      api: { account: { positions: async () => refreshes++ } },
+    });
+
+    await order.method({
+      contract: { account: 'A1', live: true },
+      instrument: { symbol: 'MSFT', type: 'STK' },
+      qty: -1,
+      type: 'Market',
+    });
+
+    assert.equal(calls, 1);
+    assert.equal(refreshes, 0);
+  }
+
+  let calls = 0;
+  let refreshes = 0;
+  const order = loadExpressionModule('application/api/orderexecution/order.js', {
+    DomainError: class DomainError extends Error {},
+    lib: {
+      utils,
+      ts: {
+        placeorder: async () => {
+          calls++;
+          return { Orders: [{ Error: 'FAILED', Message: 'Order failed. Reason: You are long this position.' }] };
+        },
+      },
+    },
+    api: { account: { positions: async () => refreshes++ } },
+  });
+
+  await order.method({
+    contract: { account: 'A1', live: true },
+    instrument: { symbol: 'MSFT', type: 'STK' },
+    qty: -1,
+    type: 'Market',
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(refreshes, 1);
+});
+
+test('order defensively reads TradeStation response collections', async () => {
+  const utils = loadUtils();
+  for (const response of [null, {}, { Orders: null, Errors: null }, { Errors: [{ Message: 'transport detail' }] }]) {
+    let refreshes = 0;
+    const order = loadExpressionModule('application/api/orderexecution/order.js', {
+      DomainError: class DomainError extends Error {},
+      lib: { utils, ts: { placeorder: async () => response } },
+      api: { account: { positions: async () => refreshes++ } },
+    });
+
+    assert.equal(
+      await order.method({
+        contract: { account: 'A1', live: true },
+        instrument: { symbol: 'MSFT', type: 'STK' },
+        qty: 1,
+        type: 'Market',
+      }),
+      response,
+    );
+    assert.equal(refreshes, 0);
+  }
+});
+
+test('order validates required prices and preserves finite numeric strings', async () => {
+  class DomainError extends Error {
+    constructor(code) {
+      super(code);
+      this.code = code;
+    }
+  }
+  const utils = loadUtils();
+  const limitKey = 'limit_price';
+  const stopKey = 'stop_price';
+  const calls = [];
+  const order = loadExpressionModule('application/api/orderexecution/order.js', {
+    DomainError,
+    lib: {
+      utils,
+      ts: {
+        placeorder: async (payload) => {
+          calls.push(payload);
+          return { Orders: [{ Status: 'OK' }] };
+        },
+      },
+    },
+    api: { account: { positions: async () => [] } },
+  });
+  const base = {
+    contract: { account: 'A1', live: true },
+    instrument: { symbol: 'MSFT', type: 'STK' },
+    qty: 1,
+  };
+  const invalid = [
+    { type: 'Limit', code: 'ELIMITPRICE' },
+    { type: 'StopMarket', code: 'ESTOPPRICE' },
+    { type: 'StopLimit', [stopKey]: '10.5', code: 'ELIMITPRICE' },
+    { type: 'StopLimit', [limitKey]: '10.25', code: 'ESTOPPRICE' },
+    { type: 'Limit', [limitKey]: 'not-a-number', code: 'ELIMITPRICE' },
+  ];
+
+  for (const item of invalid) {
+    const result = await order.method({ ...base, ...item });
+    assert(result instanceof DomainError);
+    assert.equal(result.code, item.code);
+  }
+  assert.equal(calls.length, 0);
+
+  await order.method({ ...base, type: 'Limit', [limitKey]: '10.25' });
+  await order.method({ ...base, type: 'StopMarket', [stopKey]: '10.50' });
+  await order.method({ ...base, type: 'StopLimit', [limitKey]: '10.25', [stopKey]: '10.50' });
+  await order.method({ ...base, type: 'Market' });
+
+  assert.equal(calls[0].data.LimitPrice, '10.25');
+  assert.equal(calls[1].data.StopPrice, '10.50');
+  assert.equal(calls[2].data.LimitPrice, '10.25');
+  assert.equal(calls[2].data.StopPrice, '10.50');
+  assert.equal(calls.length, 4);
 });
 
 test('stream matrix rejects empty or malformed instruments and uses the first valid instrument', async () => {
