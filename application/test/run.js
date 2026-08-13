@@ -1701,6 +1701,47 @@ test('placeorder normalizes instrument type before getAction for option closes',
   assert.equal(sendCalls[0].data.TradeAction, 'SELLTOCLOSE');
 });
 
+test('placeorder keeps broker position after accepted and rejected full-close submissions', async () => {
+  const utils = loadUtils();
+  const responses = [{ Orders: [{ Status: 'OK' }] }, { Orders: [{ Error: 'FAILED', Message: 'Order rejected.' }] }];
+
+  for (const response of responses) {
+    let clears = 0;
+    const placeorder = loadExpressionModule('application/lib/ts/placeorder.js', {
+      domain: {
+        ts: {
+          positions: {
+            getPosition: () => new Map([['Quantity', '2']]),
+            clearPosition: () => clears++,
+          },
+          clients: { getClient: async () => ({ tokens: { access: 'token' } }) },
+        },
+      },
+      lib: {
+        utils,
+        ts: { send: async () => response },
+      },
+    });
+
+    assert.equal(
+      await placeorder({
+        data: {
+          AccountID: 'A1',
+          Symbol: 'MSFT',
+          OrderType: response.Orders[0].Status === 'OK' ? 'Limit' : 'StopMarket',
+          TimeInForce: { Duration: 'GTC' },
+          Route: 'Intelligent',
+        },
+        qty: -2,
+        instrument: { symbol: 'MSFT', type: 'STK' },
+        live: true,
+      }),
+      response,
+    );
+    assert.equal(clears, 0);
+  }
+});
+
 test('order refreshes positions once and recalculates stock and option close actions', async () => {
   const utils = loadUtils();
   const cases = [
@@ -1773,13 +1814,15 @@ test('order refreshes positions once and recalculates stock and option close act
 
 test('order recovery is bounded and excludes broker capacity, locate, and tick restrictions', async () => {
   const utils = loadUtils();
-  const messages = [
-    'Order failed. Reason: Existing working orders use all available closing capacity.',
-    'SL0350 Security not easy to borrow. Short Locate is required.',
-    'Order failed. Reason: Invalid price increment.',
+  const responses = [
+    { Orders: [{ Error: 'FAILED', Message: 'Order failed. Reason: Existing working orders use all available closing capacity.' }] },
+    { Orders: [{ Error: 'FAILED', Message: 'Order failed. Reason: You are long 200 shares with 200 remaining on sell orders!' }] },
+    { Errors: [{ Message: 'Order failed. Reason: You are short 200 shares with 200 remaining on buy orders!' }] },
+    { Orders: [{ Error: 'FAILED', Message: 'SL0350 Security not easy to borrow. Short Locate is required.' }] },
+    { Orders: [{ Error: 'FAILED', Message: 'Order failed. Reason: Invalid price increment.' }] },
   ];
 
-  for (const message of messages) {
+  for (const response of responses) {
     let calls = 0;
     let refreshes = 0;
     const order = loadExpressionModule('application/api/orderexecution/order.js', {
@@ -1789,7 +1832,7 @@ test('order recovery is bounded and excludes broker capacity, locate, and tick r
         ts: {
           placeorder: async () => {
             calls++;
-            return { Orders: [{ Error: 'FAILED', Message: message }] };
+            return response;
           },
         },
       },

@@ -48,6 +48,7 @@
     const isConflict = (message) => {
       if (typeof message !== 'string') return false;
       const value = message.toLowerCase();
+      if (/remaining on (?:buy|sell) orders?/.test(value)) return false;
       if (/working orders?|closing capacity|short locate|easy to borrow|sl0350|price increment/.test(value)) return false;
       return /boxed position|to close (?:a )?(?:long|short) position|order failed\. reason: you are (?:already )?(?:long|short)\b/.test(
         value,
