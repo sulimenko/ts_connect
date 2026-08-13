@@ -93,7 +93,7 @@ Opening fence должен быть строго ` ```ai-task-contract `.
 
 ## Task ID and branch naming
 
-- Перед draft новой задачи ChatGPT должен найти максимальный существующий `T-NNN` в `doc/changelog.md`, `doc/task.md` и `doc/tasks/done/*.md`.
+- Перед draft новой задачи ChatGPT должен найти максимальный завершённый `T-NNN` в `doc/changelog.md`, `doc/task.md` и `doc/tasks/done/*.md`.
 - Следующий task ID получает `T-NNN`, где `NNN = max existing + 1`.
 - Если создаётся несколько primary tasks одновременно, номера идут последовательно.
 - Название задачи в markdown: `# Task T-NNN: <short title>`.

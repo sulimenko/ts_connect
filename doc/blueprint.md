@@ -287,6 +287,13 @@ Workflow и task routing определяются `AGENTS.md`, role-specific ins
 - `setPosition()` может хранить raw `Symbol` внутри payload для диагностики и сравнения с upstream response;
 - `Quantity` читается как signed value из TradeStation payload и используется без дополнительного изменения знака.
 
+### Order recovery и broker position truth
+
+- Recovery при stale или отсутствующей локальной broker position ограничен максимум одним authoritative positions refresh и одним повтором отправки ордера.
+- Конфликт с working orders или доступной closing capacity, включая quantity, уже зарезервированную открытыми buy/sell orders, не является stale-position mismatch и не запускает positions refresh или retry.
+- Успешная или отклонённая отправка ордера не является подтверждением fill и не должна optimistically очищать `domain.ts.positions`.
+- Источником broker position truth остаются position stream и authoritative reconciliation.
+
 ### Ограничения должны фиксироваться в документации
 
 Если сервис чего-то не поддерживает, это нужно фиксировать явно. Для текущего состояния `ts_connect` это особенно важно для:
@@ -316,5 +323,5 @@ Workflow и task routing определяются `AGENTS.md`, role-specific ins
 
 - проверить типы, линт и локальные smoke-сценарии;
 - провести отдельный review по постоянному checklist;
-- architect обновляет все `doc/*`, если появилось новое устойчивое правило сервиса или новая категория риска;
+- architect обновляет релевантные canonical docs, если появилось новое устойчивое правило сервиса или новая категория риска;
 - зафиксировать ограничения, которые должны знать сопровождающие.

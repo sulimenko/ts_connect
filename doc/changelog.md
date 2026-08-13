@@ -40,6 +40,36 @@
 | T-044 | Добавить regression tests для managed stream subscribe race                              | [x]    | 2026-05-12 | Regression suite покрывает synchronous emit, startup failure cleanup и concurrent subscribe race.                                       |
 | T-045 | Обновить stream lifecycle документацию                                                   | [!]    | 2026-05-12 | `blueprint.md` и `review.md` фиксируют startup-race invariant, но финальное закрытие блока отложено из-за review findings.              |
 
+### Архив завершённых task contracts AI Pipeline v8
+
+В ранней истории очереди повторно использовались ID `T-047`–`T-052`, уже встречавшиеся в legacy `doc/task.md`, а внутри самой очереди существуют отдельные завершённые contracts с одинаковыми ID `T-055`, `T-056`, `T-057` и `T-058`. Это legacy collisions: contracts сохранены под фактическими именами и не перенумерованы. Для однозначной ссылки следует использовать ID вместе с названием или именем task-файла. Следующий task ID определяется как `max(completed T-NNN) + 1`; текущий максимум — `T-064`.
+
+| ID    | Название                                                         | Статус | Дата       | Итог                                                                                                                 |
+| ----- | ---------------------------------------------------------------- | ------ | ---------- | -------------------------------------------------------------------------------------------------------------------- |
+| T-047 | Options chain completeness                                       | [x]    | 2026-07-02 | Добавлены проверки полноты option chain и диагностируемый результат обработки.                                       |
+| T-048 | Stream close classification                                      | [x]    | 2026-07-02 | Закрытие upstream stream классифицировано как transient lifecycle event.                                             |
+| T-049 | Docs format and task rules                                       | [x]    | 2026-07-02 | Историческая workflow/documentation задача завершена; canonical policy определяется текущим `develop`.               |
+| T-050 | Option chain empty snapshot timeout                              | [x]    | 2026-07-02 | Пустой option-chain snapshot получил bounded timeout и cleanup позднего stream result.                               |
+| T-051 | Clean option chain All request and inactive touch                | [x]    | 2026-07-04 | Нормализован запрос `All`, а inactive subscription больше не поддерживается ложным `touch`.                          |
+| T-052 | Restore strikeProximity for option chain All                     | [x]    | 2026-07-04 | Для полного option chain восстановлена фильтрация по `strikeProximity`.                                              |
+| T-053 | Force full option chain proximity and add debug stats            | [x]    | 2026-07-04 | Закреплён полный proximity path и добавлены компактные debug statistics.                                             |
+| T-054 | Fix stale active option chain stream                             | [x]    | 2026-07-05 | Terminal upstream error больше не оставляет stale active option-chain stream.                                        |
+| T-055 | Add bounded retry and stream status for option chain errors      | [x]    | 2026-07-05 | Для retryable chain errors добавлены bounded retry и явный stream status.                                            |
+| T-056 | Fix option chain retry blockers from review                      | [x]    | 2026-07-06 | Исправлены review blockers для transient packet errors, `GoAway`, retry и diagnostics.                               |
+| T-055 | Исправить lifecycle matrix streams и добавить адаптивную очередь | [x]    | 2026-07-15 | Matrix stream lifecycle переведён на управляемую очередь с bounded recovery.                                         |
+| T-056 | Исправить HTTP error lifecycle при reconnect matrix stream       | [x]    | 2026-07-15 | Capacity, permanent и transient HTTP outcomes разведены в reconnect lifecycle.                                       |
+| T-057 | Распознавать Stream quota exceeded как matrix capacity           | [x]    | 2026-07-16 | `Stream quota exceeded` классифицируется как capacity condition для matrix stream.                                   |
+| T-056 | Исправить brokerage order stream recovery                        | [x]    | 2026-08-05 | Реализованы recoverable order streams, hydration/reconciliation и безопасное освобождение downstream queue slots.    |
+| T-058 | Закрыть blockers brokerage order stream recovery                 | [x]    | 2026-08-05 | Исправлены delivery-state, multi-leg merge, authorization recovery и REST/stream generation race blockers.           |
+| T-059 | Перевести option chain capacity в managed queue                  | [x]    | 2026-08-05 | Initial option-chain capacity response переводится в общую managed FIFO queue без RPC 500.                           |
+| T-060 | Завершить drain capacity queue                                   | [x]    | 2026-08-05 | Capacity queue продолжает drain и освобождает slot при terminal cleanup.                                             |
+| T-061 | Сделать OAuth refresh single-flight и обработать invalid symbol  | [x]    | 2026-08-05 | OAuth refresh стал single-flight, а invalid option symbol получил предсказуемую классификацию.                       |
+| T-062 | Исправить production invalid-symbol classifier                   | [x]    | 2026-08-06 | Production classifier выровнен с фактическими invalid-symbol ответами; PR body восстановлен по task contract.        |
+| T-063 | Восстановить brokerage после OAuth refresh                       | [x]    | 2026-08-06 | После lifetime OAuth refresh unhealthy brokerage streams восстанавливаются без второго OAuth request.                |
+| T-064 | Перевести runtime на Node.js 24                                  | [x]    | 2026-08-06 | Local, CI и Docker runtime выровнены на Node.js 24; dependency baseline обновлён без изменений application behavior. |
+| T-057 | Исправить order recovery и validation TradeStation               | [x]    | 2026-08-13 | Добавлены bounded position reconciliation/retry и ранняя проверка обязательных order prices.                         |
+| T-058 | Исправить position cache и capacity-conflict recovery            | [x]    | 2026-08-13 | Working-order capacity отделён от stale-position mismatch; submit больше не очищает broker position optimistically.  |
+
 ---
 
 ## Review-заключения
@@ -67,3 +97,5 @@
 | 2026-05-10 | Блок 17 — Tickbars contract and diagnostics parity                      | passed with notes   | `marketdata/tickbars` стал contract-aware stream reader с trace-логами и predictable domain validation.                                                |
 | 2026-05-10 | Блок 18 — Options API style alignment                                   | passed with notes   | `application/api/options/*` получил uniform contract metadata и predictable invalid-input handling там, где это применимо.                             |
 | 2026-05-12 | Блок 29 — Managed stream startup race hardening                         | failed              | Runtime-идея принята, но `npm test` не завершает процесс после passed output, а T-038 был удалён без выполнения/архивации. Создан follow-up T-046.     |
+| 2026-08-07 | PR #13 — Brokerage recovery и связанные follow-up tasks                 | merged              | Review blockers T-058 и последующие T-059–T-064 закрыты implementation commits; ветка T-056 объединена с `develop`.                                    |
+| 2026-08-13 | PR #14 — Order recovery hotfix                                          | merged              | Review blockers T-058 по position cache и working-order capacity исправлены; ветка T-057 объединена с `develop`.                                       |
