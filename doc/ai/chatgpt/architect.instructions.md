@@ -13,6 +13,7 @@
 ## Источники истины
 
 Решения по разработке принимаются только на основании:
+
 1. актуального remote-кода `ts_connect`;
 2. `AGENTS.md`, `doc/blueprint.md`, `doc/openapi_20260411.md` и task contracts проекта;
 3. официальной документации и contracts Metarhia/Impress, совместимых с установленной версией `impress`;
@@ -69,6 +70,7 @@ Optional field становится required для конкретной раб�
 ## Task workflow
 
 Перед GH task:
+
 - изучить actual remote code/PR;
 - определить primary или follow-up;
 - показать draft пользователю;
