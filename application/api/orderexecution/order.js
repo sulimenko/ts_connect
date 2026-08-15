@@ -3,6 +3,7 @@
   parameters: 'json',
   returns: 'json',
   errors: {
+    EQUANTITY: 'A finite non-zero integer quantity is required',
     ELIMITPRICE: 'A finite limit price is required for this order type',
     ESTOPPRICE: 'A finite stop price is required for this order type',
   },
@@ -25,8 +26,12 @@
     if (needsLimit && !hasPrice(limitPrice)) return new DomainError('ELIMITPRICE');
     if (needsStop && !hasPrice(stopPrice)) return new DomainError('ESTOPPRICE');
 
+    const value = typeof qty === 'string' ? qty.trim() : qty;
+    const quantity = typeof value === 'string' || typeof value === 'number' ? Number(value) : NaN;
+    if (!Number.isFinite(quantity) || !Number.isInteger(quantity) || quantity === 0) return new DomainError('EQUANTITY');
+
     const live = contract.live === 1 || contract.live === '1' || contract.live === true || contract.live === 'true';
-    qty = parseInt(qty);
+    qty = quantity;
     const parsedInstrument = lib.utils.makeSymbol(instrument.symbol);
     const instrumentType = parsedInstrument?.type ?? instrument.type ?? instrument.asset_category;
 
@@ -50,9 +55,9 @@
       const value = message.toLowerCase();
       if (/remaining on (?:buy|sell) orders?/.test(value)) return false;
       if (/working orders?|closing capacity|short locate|easy to borrow|sl0350|price increment/.test(value)) return false;
-      return /boxed position|to close (?:a )?(?:long|short) position|order failed\. reason: you are (?:already )?(?:long|short)\b/.test(
-        value,
-      );
+      const mismatch =
+        /boxed position|to close (?:a )?(?:long|short) position|order failed\. reason: you are (?:already )?(?:long|short)\b/;
+      return mismatch.test(value) || /you are (?:long|short) 0 shares?\b/.test(value);
     };
     const orders = Array.isArray(response?.Orders) ? response.Orders : [];
     const errors = Array.isArray(response?.Errors) ? response.Errors : [];
