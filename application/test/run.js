@@ -1745,6 +1745,23 @@ test('placeorder keeps broker position after accepted and rejected full-close su
 test('order refreshes positions once and recalculates stock and option close actions', async () => {
   const utils = loadUtils();
   const cases = [
+    {
+      instrument: { symbol: 'MSFT', type: 'STK' },
+      qty: 1,
+      initial: -2,
+      position: null,
+      message: 'You are short 0 shares!',
+      actions: ['BUYTOCOVER', 'Buy'],
+    },
+    {
+      instrument: { symbol: 'MSFT', type: 'STK' },
+      qty: -1,
+      initial: 2,
+      position: null,
+      message: 'You are long 0 shares!',
+      actions: ['Sell', 'SELLSHORT'],
+      topLevel: true,
+    },
     { instrument: { symbol: 'MSFT', type: 'STK' }, qty: -1, position: 2, actions: ['SELLSHORT', 'Sell'] },
     { instrument: { symbol: 'MSFT', type: 'STK' }, qty: 1, position: -2, actions: ['Buy', 'BUYTOCOVER'] },
     {
@@ -1758,7 +1775,7 @@ test('order refreshes positions once and recalculates stock and option close act
   ];
 
   for (const item of cases) {
-    let current = null;
+    let current = item.initial ? new Map([['Quantity', String(item.initial)]]) : null;
     let refreshes = 0;
     const actions = [];
     const positions = {
@@ -1778,7 +1795,7 @@ test('order refreshes positions once and recalculates stock and option close act
           send: async ({ data }) => {
             actions.push(data.TradeAction);
             if (actions.length === 1) {
-              const failure = { Message: 'Order failed. Reason: You are long this position.' };
+              const failure = { Message: item.message || 'Order failed. Reason: You are long this position.' };
               return item.topLevel ? { Errors: [failure] } : { Orders: [{ Error: 'FAILED', ...failure }] };
             }
             return { Orders: [{ Status: 'OK' }] };
@@ -1793,7 +1810,7 @@ test('order refreshes positions once and recalculates stock and option close act
         account: {
           positions: async () => {
             refreshes++;
-            current = new Map([['Quantity', String(item.position)]]);
+            current = item.position === null ? null : new Map([['Quantity', String(item.position)]]);
             return [];
           },
         },
@@ -1859,7 +1876,7 @@ test('order recovery is bounded and excludes broker capacity, locate, and tick r
       ts: {
         placeorder: async () => {
           calls++;
-          return { Orders: [{ Error: 'FAILED', Message: 'Order failed. Reason: You are long this position.' }] };
+          return { Orders: [{ Error: 'FAILED', Message: 'You are long 0 shares!' }] };
         },
       },
     },
@@ -1954,6 +1971,50 @@ test('order validates required prices and preserves finite numeric strings', asy
   assert.equal(calls[2].data.LimitPrice, '10.25');
   assert.equal(calls[2].data.StopPrice, '10.50');
   assert.equal(calls.length, 4);
+});
+
+test('order rejects invalid quantities before submission and preserves signed integer strings', async () => {
+  class DomainError extends Error {
+    constructor(code) {
+      super(code);
+      this.code = code;
+    }
+  }
+  const calls = [];
+  const order = loadExpressionModule('application/api/orderexecution/order.js', {
+    DomainError,
+    lib: {
+      utils: loadUtils(),
+      ts: {
+        placeorder: async (payload) => {
+          calls.push(payload);
+          return { Orders: [{ Status: 'OK' }] };
+        },
+      },
+    },
+    api: { account: { positions: async () => [] } },
+  });
+  const base = {
+    contract: { account: 'A1', live: true },
+    instrument: { symbol: 'MSFT', type: 'STK' },
+    type: 'Market',
+  };
+
+  assert.equal(order.errors.EQUANTITY, 'A finite non-zero integer quantity is required');
+  for (const qty of [0, -0, '', ' ', 'invalid', Infinity, -Infinity, NaN, 1.5, '1.5', null, undefined]) {
+    const result = await order.method({ ...base, qty });
+    assert(result instanceof DomainError);
+    assert.equal(result.code, 'EQUANTITY');
+  }
+  assert.equal(calls.length, 0);
+
+  await order.method({ ...base, qty: '2' });
+  await order.method({ ...base, qty: '-3' });
+
+  assert.deepEqual(
+    calls.map(({ qty }) => qty),
+    [2, -3],
+  );
 });
 
 test('stream matrix rejects empty or malformed instruments and uses the first valid instrument', async () => {
