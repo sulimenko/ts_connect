@@ -1,19 +1,26 @@
 ({
   access: 'public',
+  parameters: 'json',
+  returns: 'json',
+  errors: {
+    EACCOUNT: 'At least one brokerage account contract is required',
+  },
+  validate: ({ contracts }) => Array.isArray(contracts) && contracts.length > 0,
   method: async ({ contracts, orders = [], start = null, limit = null }) => {
     const client = await domain.ts.clients.getClient({});
     const result = [];
     for (const contract of contracts) {
       contract.live = contract.live === 1 || contract.live === '1' || contract.live === true || contract.live === 'true';
-      const endpoint = ['brokerage', 'accounts', contract.account, 'historicalorders'];
-      if (orders.length > 0) endpoint.push(orders.join(','));
-      const since = start || new Date(new Date().setMonth(new Date().getMonth() - 1)).toISOString().split('T')[0];
-      const data = { since };
-      if (limit !== null) data.pageSize = limit;
-
-      const responce = await lib.ts.send({ method: 'GET', live: contract.live, endpoint, token: client.tokens.access, data });
-      // console.log('orders:', responce);
-      if (responce.Errors.length === 0 && responce.Orders.length > 0) result.push(...responce.Orders);
+      const response = await lib.ts.orders({
+        account: contract.account,
+        live: contract.live,
+        token: client.tokens.access,
+        orderIds: orders,
+        start,
+        limit,
+        historical: true,
+      });
+      if (response.errors.length === 0) result.push(...response.orders);
     }
 
     return result;

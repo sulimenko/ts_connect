@@ -16,7 +16,11 @@
 
 ## Required ts_connect architecture checks
 
-- [ ] Public Impress procedures keep explicit runtime contract: `access`, `parameters`, `returns`, `errors`, `validate` when needed, `method`.
+- [ ] Public Impress API uses a framework-compatible simple function or extended declaration.
+- [ ] Optional extended fields `access`, `parameters`, `returns`, `errors`, `validate` are not required merely because a public procedure was touched.
+- [ ] If user/task explicitly requires optional metadata, the required fields are present and correct.
+- [ ] If user explicitly excluded optional metadata from current scope, its absence is not treated as a blocker.
+- [ ] Existing runtime-relevant access/schema/validation/error mapping semantics are preserved unless the task explicitly changes them.
 - [ ] API layer does not store domain/server-side state.
 - [ ] Domain layer owns lifecycle, registries, cleanup and multiplex subscriptions.
 - [ ] Lib layer owns TradeStation HTTP/stream adapters, parsing and normalization helpers.

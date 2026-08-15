@@ -1478,6 +1478,36 @@ test('readOptionChain and positions share the same canonical option symbol contr
   assert.equal(positions.getPosition({ account: 'A1', symbol: 'CRWV 280121C80' }), null);
 });
 
+test('positions refresh clears state only after an authoritative snapshot', async () => {
+  const utils = loadUtils();
+  const positions = loadExpressionModule('application/domain/ts/positions.js', {
+    lib: { utils },
+  });
+  const position = { AccountID: 'A1', Symbol: 'MSFT', Quantity: '2' };
+  positions.setPosition({ account: 'A1', symbol: 'MSFT', data: position });
+  let response = { Errors: [] };
+  const api = loadExpressionModule('application/api/account/positions.js', {
+    domain: {
+      ts: {
+        clients: { getClient: async () => ({ tokens: { access: 'token' } }) },
+        positions,
+      },
+    },
+    lib: { utils, ts: { send: async () => response } },
+  });
+
+  await assert.rejects(api.method({ contracts: [{ account: 'A1', live: true }] }), /Invalid positions response/);
+  assert.equal(positions.getPosition({ account: 'A1', symbol: 'MSFT' }).get('Quantity'), '2');
+
+  response = { Errors: [{ Message: 'Unavailable' }], Positions: [] };
+  await assert.rejects(api.method({ contracts: [{ account: 'A1', live: true }] }), /Positions refresh failed/);
+  assert.equal(positions.getPosition({ account: 'A1', symbol: 'MSFT' }).get('Quantity'), '2');
+
+  response = { Errors: [], Positions: [] };
+  assert.equal((await api.method({ contracts: [{ account: 'A1', live: true }] })).length, 0);
+  assert.equal(positions.getPosition({ account: 'A1', symbol: 'MSFT' }), null);
+});
+
 test('readOptionChain keeps structurally valid rows with missing quotes and greeks', async () => {
   const utils = loadUtils();
   const readOptionChain = loadExpressionModule('application/lib/ts/readOptionChain.js', {
@@ -1511,6 +1541,7 @@ test('readOptionChain keeps structurally valid rows with missing quotes and gree
 
 test('marketdata quotes and order execution use the shared symbol formatter', async () => {
   const utils = loadUtils();
+  const limitKey = 'limit_price';
   const readQuote = loadExpressionModule('application/lib/ts/readQuote.js', {
     lib: { utils },
   });
@@ -1611,6 +1642,7 @@ test('marketdata quotes and order execution use the shared symbol formatter', as
     qty: 1,
     type: 'Limit',
     tif: 'GTC',
+    [limitKey]: '1.25',
   });
 
   assert.equal(orderCalls.length, 1);
@@ -1667,6 +1699,322 @@ test('placeorder normalizes instrument type before getAction for option closes',
 
   assert.equal(sendCalls.length, 1);
   assert.equal(sendCalls[0].data.TradeAction, 'SELLTOCLOSE');
+});
+
+test('placeorder keeps broker position after accepted and rejected full-close submissions', async () => {
+  const utils = loadUtils();
+  const responses = [{ Orders: [{ Status: 'OK' }] }, { Orders: [{ Error: 'FAILED', Message: 'Order rejected.' }] }];
+
+  for (const response of responses) {
+    let clears = 0;
+    const placeorder = loadExpressionModule('application/lib/ts/placeorder.js', {
+      domain: {
+        ts: {
+          positions: {
+            getPosition: () => new Map([['Quantity', '2']]),
+            clearPosition: () => clears++,
+          },
+          clients: { getClient: async () => ({ tokens: { access: 'token' } }) },
+        },
+      },
+      lib: {
+        utils,
+        ts: { send: async () => response },
+      },
+    });
+
+    assert.equal(
+      await placeorder({
+        data: {
+          AccountID: 'A1',
+          Symbol: 'MSFT',
+          OrderType: response.Orders[0].Status === 'OK' ? 'Limit' : 'StopMarket',
+          TimeInForce: { Duration: 'GTC' },
+          Route: 'Intelligent',
+        },
+        qty: -2,
+        instrument: { symbol: 'MSFT', type: 'STK' },
+        live: true,
+      }),
+      response,
+    );
+    assert.equal(clears, 0);
+  }
+});
+
+test('order refreshes positions once and recalculates stock and option close actions', async () => {
+  const utils = loadUtils();
+  const cases = [
+    {
+      instrument: { symbol: 'MSFT', type: 'STK' },
+      qty: 1,
+      initial: -2,
+      position: null,
+      message: 'You are short 0 shares!',
+      actions: ['BUYTOCOVER', 'Buy'],
+    },
+    {
+      instrument: { symbol: 'MSFT', type: 'STK' },
+      qty: -1,
+      initial: 2,
+      position: null,
+      message: 'You are long 0 shares!',
+      actions: ['Sell', 'SELLSHORT'],
+      topLevel: true,
+    },
+    { instrument: { symbol: 'MSFT', type: 'STK' }, qty: -1, position: 2, actions: ['SELLSHORT', 'Sell'] },
+    { instrument: { symbol: 'MSFT', type: 'STK' }, qty: 1, position: -2, actions: ['Buy', 'BUYTOCOVER'] },
+    {
+      instrument: { symbol: 'CRWV280121C00080000', type: 'OPT' },
+      qty: 1,
+      position: -2,
+      actions: ['BUYTOOPEN', 'BUYTOCLOSE'],
+      topLevel: true,
+    },
+    { instrument: { symbol: 'CRWV280121C00080000', type: 'OPT' }, qty: -1, position: 2, actions: ['SELLTOOPEN', 'SELLTOCLOSE'] },
+  ];
+
+  for (const item of cases) {
+    let current = item.initial ? new Map([['Quantity', String(item.initial)]]) : null;
+    let refreshes = 0;
+    const actions = [];
+    const positions = {
+      getPosition: () => current,
+      clearPosition: () => {},
+    };
+    const placeorder = loadExpressionModule('application/lib/ts/placeorder.js', {
+      domain: {
+        ts: {
+          positions,
+          clients: { getClient: async () => ({ tokens: { access: 'token' } }) },
+        },
+      },
+      lib: {
+        utils,
+        ts: {
+          send: async ({ data }) => {
+            actions.push(data.TradeAction);
+            if (actions.length === 1) {
+              const failure = { Message: item.message || 'Order failed. Reason: You are long this position.' };
+              return item.topLevel ? { Errors: [failure] } : { Orders: [{ Error: 'FAILED', ...failure }] };
+            }
+            return { Orders: [{ Status: 'OK' }] };
+          },
+        },
+      },
+    });
+    const order = loadExpressionModule('application/api/orderexecution/order.js', {
+      DomainError: class DomainError extends Error {},
+      lib: { utils, ts: { placeorder } },
+      api: {
+        account: {
+          positions: async () => {
+            refreshes++;
+            current = item.position === null ? null : new Map([['Quantity', String(item.position)]]);
+            return [];
+          },
+        },
+      },
+    });
+
+    await order.method({
+      contract: { account: 'A1', live: true },
+      instrument: item.instrument,
+      qty: item.qty,
+      type: 'Market',
+    });
+
+    assert.deepEqual(actions, item.actions);
+    assert.equal(refreshes, 1);
+  }
+});
+
+test('order recovery is bounded and excludes broker capacity, locate, and tick restrictions', async () => {
+  const utils = loadUtils();
+  const responses = [
+    { Orders: [{ Error: 'FAILED', Message: 'Order failed. Reason: Existing working orders use all available closing capacity.' }] },
+    { Orders: [{ Error: 'FAILED', Message: 'Order failed. Reason: You are long 200 shares with 200 remaining on sell orders!' }] },
+    { Errors: [{ Message: 'Order failed. Reason: You are short 200 shares with 200 remaining on buy orders!' }] },
+    { Orders: [{ Error: 'FAILED', Message: 'SL0350 Security not easy to borrow. Short Locate is required.' }] },
+    { Orders: [{ Error: 'FAILED', Message: 'Order failed. Reason: Invalid price increment.' }] },
+  ];
+
+  for (const response of responses) {
+    let calls = 0;
+    let refreshes = 0;
+    const order = loadExpressionModule('application/api/orderexecution/order.js', {
+      DomainError: class DomainError extends Error {},
+      lib: {
+        utils,
+        ts: {
+          placeorder: async () => {
+            calls++;
+            return response;
+          },
+        },
+      },
+      api: { account: { positions: async () => refreshes++ } },
+    });
+
+    await order.method({
+      contract: { account: 'A1', live: true },
+      instrument: { symbol: 'MSFT', type: 'STK' },
+      qty: -1,
+      type: 'Market',
+    });
+
+    assert.equal(calls, 1);
+    assert.equal(refreshes, 0);
+  }
+
+  let calls = 0;
+  let refreshes = 0;
+  const order = loadExpressionModule('application/api/orderexecution/order.js', {
+    DomainError: class DomainError extends Error {},
+    lib: {
+      utils,
+      ts: {
+        placeorder: async () => {
+          calls++;
+          return { Orders: [{ Error: 'FAILED', Message: 'You are long 0 shares!' }] };
+        },
+      },
+    },
+    api: { account: { positions: async () => refreshes++ } },
+  });
+
+  await order.method({
+    contract: { account: 'A1', live: true },
+    instrument: { symbol: 'MSFT', type: 'STK' },
+    qty: -1,
+    type: 'Market',
+  });
+
+  assert.equal(calls, 2);
+  assert.equal(refreshes, 1);
+});
+
+test('order defensively reads TradeStation response collections', async () => {
+  const utils = loadUtils();
+  for (const response of [null, {}, { Orders: null, Errors: null }, { Errors: [{ Message: 'transport detail' }] }]) {
+    let refreshes = 0;
+    const order = loadExpressionModule('application/api/orderexecution/order.js', {
+      DomainError: class DomainError extends Error {},
+      lib: { utils, ts: { placeorder: async () => response } },
+      api: { account: { positions: async () => refreshes++ } },
+    });
+
+    assert.equal(
+      await order.method({
+        contract: { account: 'A1', live: true },
+        instrument: { symbol: 'MSFT', type: 'STK' },
+        qty: 1,
+        type: 'Market',
+      }),
+      response,
+    );
+    assert.equal(refreshes, 0);
+  }
+});
+
+test('order validates required prices and preserves finite numeric strings', async () => {
+  class DomainError extends Error {
+    constructor(code) {
+      super(code);
+      this.code = code;
+    }
+  }
+  const utils = loadUtils();
+  const limitKey = 'limit_price';
+  const stopKey = 'stop_price';
+  const calls = [];
+  const order = loadExpressionModule('application/api/orderexecution/order.js', {
+    DomainError,
+    lib: {
+      utils,
+      ts: {
+        placeorder: async (payload) => {
+          calls.push(payload);
+          return { Orders: [{ Status: 'OK' }] };
+        },
+      },
+    },
+    api: { account: { positions: async () => [] } },
+  });
+  const base = {
+    contract: { account: 'A1', live: true },
+    instrument: { symbol: 'MSFT', type: 'STK' },
+    qty: 1,
+  };
+  const invalid = [
+    { type: 'Limit', code: 'ELIMITPRICE' },
+    { type: 'StopMarket', code: 'ESTOPPRICE' },
+    { type: 'StopLimit', [stopKey]: '10.5', code: 'ELIMITPRICE' },
+    { type: 'StopLimit', [limitKey]: '10.25', code: 'ESTOPPRICE' },
+    { type: 'Limit', [limitKey]: 'not-a-number', code: 'ELIMITPRICE' },
+  ];
+
+  for (const item of invalid) {
+    const result = await order.method({ ...base, ...item });
+    assert(result instanceof DomainError);
+    assert.equal(result.code, item.code);
+  }
+  assert.equal(calls.length, 0);
+
+  await order.method({ ...base, type: 'Limit', [limitKey]: '10.25' });
+  await order.method({ ...base, type: 'StopMarket', [stopKey]: '10.50' });
+  await order.method({ ...base, type: 'StopLimit', [limitKey]: '10.25', [stopKey]: '10.50' });
+  await order.method({ ...base, type: 'Market' });
+
+  assert.equal(calls[0].data.LimitPrice, '10.25');
+  assert.equal(calls[1].data.StopPrice, '10.50');
+  assert.equal(calls[2].data.LimitPrice, '10.25');
+  assert.equal(calls[2].data.StopPrice, '10.50');
+  assert.equal(calls.length, 4);
+});
+
+test('order rejects invalid quantities before submission and preserves signed integer strings', async () => {
+  class DomainError extends Error {
+    constructor(code) {
+      super(code);
+      this.code = code;
+    }
+  }
+  const calls = [];
+  const order = loadExpressionModule('application/api/orderexecution/order.js', {
+    DomainError,
+    lib: {
+      utils: loadUtils(),
+      ts: {
+        placeorder: async (payload) => {
+          calls.push(payload);
+          return { Orders: [{ Status: 'OK' }] };
+        },
+      },
+    },
+    api: { account: { positions: async () => [] } },
+  });
+  const base = {
+    contract: { account: 'A1', live: true },
+    instrument: { symbol: 'MSFT', type: 'STK' },
+    type: 'Market',
+  };
+
+  assert.equal(order.errors.EQUANTITY, 'A finite non-zero integer quantity is required');
+  for (const qty of [0, -0, '', ' ', 'invalid', Infinity, -Infinity, NaN, 1.5, '1.5', null, undefined]) {
+    const result = await order.method({ ...base, qty });
+    assert(result instanceof DomainError);
+    assert.equal(result.code, 'EQUANTITY');
+  }
+  assert.equal(calls.length, 0);
+
+  await order.method({ ...base, qty: '2' });
+  await order.method({ ...base, qty: '-3' });
+
+  assert.deepEqual(
+    calls.map(({ qty }) => qty),
+    [2, -3],
+  );
 });
 
 test('stream matrix rejects empty or malformed instruments and uses the first valid instrument', async () => {
@@ -2878,6 +3226,7 @@ test('brokerage streams start once and update orders and positions', async () =>
   const positions = loadExpressionModule('application/domain/ts/positions.js', {
     lib: { utils },
   });
+  const orderState = loadExpressionModule('application/domain/ts/orders.js', {});
   const queued = [];
   const streams = [];
   const stopped = [];
@@ -2892,6 +3241,7 @@ test('brokerage streams start once and update orders and positions', async () =>
         addTask: (task) => queued.push(task),
       },
       ts: {
+        orders: orderState,
         positions,
       },
     },
@@ -2901,12 +3251,19 @@ test('brokerage streams start once and update orders and positions', async () =>
         getContract: async () => contracts,
       },
       ts: {
+        orders: async () => ({ errors: [], orders: [] }),
         stream: ({ endpoint, onData }) => {
           const stream = {
             endpoint,
             onData,
+            state: 'starting',
+            shouldReconnect: true,
             initiateStream: async () => {},
-            stopStream: async (reason) => stopped.push({ endpoint, reason }),
+            stopStream: async (reason) => {
+              stream.state = 'stopped';
+              stream.shouldReconnect = false;
+              stopped.push({ endpoint, reason });
+            },
           };
           streams.push(stream);
           return stream;
@@ -2930,7 +3287,8 @@ test('brokerage streams start once and update orders and positions', async () =>
 
   const orders = streams.find((stream) => stream.endpoint.at(-1) === 'orders');
   orders.onData({ StreamStatus: 'EndSnapshot' });
-  orders.onData({ OrderID: 'O1', AccountID: '11827414', Status: 'Filled' });
+  orders.onData({ OrderID: 'O1', AccountID: '11827414', Status: 'Filled', Legs: [{ Symbol: 'TSLA' }] });
+  for (let turn = 0; turn < 5; turn += 1) await Promise.resolve();
   assert.equal(queued.length, 1);
   assert.equal(queued[0].endpoint[0], 'response');
   assert.equal(queued[0].data.type, 'order');
@@ -2996,6 +3354,279 @@ test('deleteClient closes brokerage streams through client close', async () => {
   assert.equal(closeCalls.length, 1);
   assert.equal(closeCalls[0].reason, 'client.delete');
   assert.equal(clients.values.ptfin, undefined);
+});
+
+test('downstream queue releases rejected and synchronous failures', async () => {
+  let calls = 0;
+  const failures = [];
+  const delivered = [];
+  const queue = loadExpressionModule('application/domain/queue.js', {
+    lib: {
+      ptfin: {
+        send: ({ data }) => {
+          calls += 1;
+          if (calls <= 20) return Promise.reject(new Error(`rejected-${calls}`));
+          if (data.sync) throw new Error('sync');
+          delivered.push(data.id);
+          return Promise.resolve({ ok: true });
+        },
+      },
+    },
+  });
+  queue.onFailure = (error) => failures.push(error.message);
+  queue.onSuccess = () => {};
+  queue.onDrain = () => {};
+
+  for (let id = 1; id <= 20; id += 1) queue.addTask({ endpoint: ['response'], data: { id } });
+  queue.addTask({ endpoint: ['response'], data: { id: 21 } });
+  queue.addTask({ endpoint: ['response'], data: { id: 22, sync: true } });
+
+  for (let turn = 0; turn < 100 && queue.count + queue.queue.length > 0; turn += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  assert.equal(queue.count, 0);
+  assert.equal(queue.queue.length, 0);
+  assert.equal(failures.length, 21);
+  assert.deepEqual(delivered, [21]);
+});
+
+test('orders state merges partial packets, validates shape and suppresses duplicates', async () => {
+  const orders = loadExpressionModule('application/domain/ts/orders.js', {});
+  const full = {
+    AccountID: 'A1',
+    OrderID: 'O1',
+    Status: 'ACK',
+    Legs: [{ Symbol: 'TSLA', QuantityOrdered: '1' }],
+  };
+
+  assert.deepEqual(Array.from(orders.missing({ OrderID: 'O1' })), ['AccountID', 'Legs']);
+  assert.equal(orders.commit({ live: true, account: 'A1', order: full }), true);
+  assert.equal(orders.commit({ live: true, account: 'A1', order: { ...full } }), false);
+
+  const merged = orders.merge({
+    live: true,
+    account: 'A1',
+    order: { OrderID: 'O1', Status: 'FLL', Legs: [{ QuantityOrdered: '2' }] },
+  });
+  assert.equal(merged.AccountID, 'A1');
+  assert.equal(merged.Status, 'FLL');
+  assert.equal(merged.Legs[0].Symbol, 'TSLA');
+  assert.equal(merged.Legs[0].QuantityOrdered, '2');
+  assert.deepEqual(Array.from(orders.missing(merged)), []);
+
+  assert.equal(orders.commit({ live: true, account: 'A1', order: merged }), true);
+  orders.clearAccount({ live: true, account: 'A1' });
+  assert.equal(orders.get({ live: true, account: 'A1', orderId: 'O1' }), null);
+});
+
+test('orders REST helper normalizes empty nullable fields and rejects malformed shapes', async () => {
+  const responses = [
+    {},
+    { Errors: null, Orders: null },
+    { Errors: [], Orders: [{ AccountID: 'A1', OrderID: 'O1', Legs: [{ Symbol: 'TSLA' }] }] },
+    { Errors: [], Orders: {} },
+  ];
+  const calls = [];
+  const helper = loadExpressionModule('application/lib/ts/orders.js', {
+    lib: {
+      ts: {
+        send: async (payload) => {
+          calls.push(payload);
+          return responses.shift();
+        },
+      },
+    },
+  });
+
+  assert.deepEqual(JSON.parse(JSON.stringify(await helper({ account: 'A1', live: true, token: 'token' }))), {
+    errors: [],
+    orders: [],
+  });
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(await helper({ account: 'A1', live: true, token: 'token', historical: true, start: '2026-07-01' }))),
+    { errors: [], orders: [] },
+  );
+  const found = await helper({ account: 'A1', live: true, token: 'token', orderIds: ['O1'], limit: 10 });
+  assert.equal(found.orders[0].OrderID, 'O1');
+  assert.equal(calls[1].endpoint.at(-1), 'historicalorders');
+  assert.equal(calls[1].data.since, '2026-07-01');
+  assert.equal(calls[2].endpoint.at(-1), 'O1');
+  await assert.rejects(helper({ account: 'A1', live: true, token: 'token' }), /Orders/);
+});
+
+test('orders APIs expose runtime contracts and tolerate empty upstream fields', async () => {
+  for (const file of ['application/api/account/orders.js', 'application/api/account/historicalorders.js']) {
+    const calls = [];
+    const api = loadExpressionModule(file, {
+      domain: { ts: { clients: { getClient: async () => ({ tokens: { access: 'token' } }) } } },
+      lib: {
+        ts: {
+          orders: async (payload) => {
+            calls.push(payload);
+            return { errors: [], orders: [] };
+          },
+        },
+      },
+    });
+    assert.equal(api.access, 'public');
+    assert.equal(api.parameters, 'json');
+    assert.equal(api.returns, 'json');
+    assert.equal(typeof api.errors, 'object');
+    assert.equal(typeof api.validate, 'function');
+    assert.equal((await api.method({ contracts: [{ account: 'A1', live: true }] })).length, 0);
+    assert.equal(calls.length, 1);
+  }
+});
+
+test('brokerage order stream replaces stale entries, reconciles and hydrates packets', async () => {
+  const orderState = loadExpressionModule('application/domain/ts/orders.js', {});
+  const queued = [];
+  const streams = [];
+  let snapshots = 0;
+  const factory = loadExpressionModule('application/domain/ts/client.js', {
+    domain: {
+      queue: { addTask: (task) => queued.push(task) },
+      ts: {
+        orders: orderState,
+        positions: {
+          setPosition: () => null,
+          clearPosition: () => {},
+        },
+      },
+    },
+    lib: {
+      utils: { makeSymbol: (symbol) => ({ symbol }), readPositionQuantity: () => 0 },
+      ptfin: { getContract: async () => [{ account: 'A1', live: true }] },
+      ts: {
+        orders: async ({ historical }) => {
+          snapshots += 1;
+          return historical
+            ? { errors: [], orders: [] }
+            : { errors: [], orders: [{ AccountID: 'A1', OrderID: 'O1', Status: 'ACK', Legs: [{ Symbol: 'TSLA' }] }] };
+        },
+        refresh: async () => {},
+        stream: ({ endpoint, onData, onError, onStatus }) => {
+          const stream = {
+            endpoint,
+            onData,
+            onError,
+            onStatus,
+            state: 'starting',
+            shouldReconnect: true,
+            connected: false,
+            initiateStream: async () => {
+              stream.state = 'active';
+              stream.connected = true;
+            },
+            stopStream: async () => {
+              stream.state = 'stopped';
+              stream.shouldReconnect = false;
+              stream.connected = false;
+            },
+          };
+          streams.push(stream);
+          return stream;
+        },
+      },
+    },
+  });
+  const client = await factory();
+  client.tokens.access = 'token';
+  await client.syncBrokerageStreams({ name: 'ptfin' });
+  for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+
+  const first = streams.find((stream) => stream.endpoint.at(-1) === 'orders');
+  assert.equal(snapshots, 2);
+  assert.equal(queued.length, 1);
+
+  first.onData({ OrderID: 'O1', Status: 'FLL' });
+  for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+  assert.equal(queued.length, 2);
+  assert.equal(queued[1].data.data.AccountID, 'A1');
+  assert.equal(queued[1].data.data.Legs[0].Symbol, 'TSLA');
+
+  first.onData({ OrderID: 'O2' });
+  for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+  assert.equal(
+    queued.some((task) => task.data.data.OrderID === 'O2'),
+    false,
+  );
+  assert.ok(snapshots >= 4);
+
+  first.state = 'failed';
+  first.shouldReconnect = false;
+  first.connected = false;
+  client.brokerage.ready = true;
+  await client.syncBrokerageStreams({ name: 'ptfin' });
+  assert.notEqual(client.streams.orders.A1, first);
+  assert.ok(streams.filter((stream) => stream.endpoint.at(-1) === 'orders').length >= 2);
+});
+
+test('order stream lifecycle reconciles transient recovery and single-flights authorization refresh', async () => {
+  const orderState = loadExpressionModule('application/domain/ts/orders.js', {});
+  const streams = [];
+  let refreshes = 0;
+  let snapshots = 0;
+  const factory = loadExpressionModule('application/domain/ts/client.js', {
+    domain: {
+      queue: { addTask: () => {} },
+      ts: {
+        orders: orderState,
+        positions: { setPosition: () => null, clearPosition: () => {} },
+      },
+    },
+    lib: {
+      utils: { makeSymbol: (symbol) => ({ symbol }), readPositionQuantity: () => 0 },
+      ptfin: { getContract: async () => [{ account: 'A1', live: true }] },
+      ts: {
+        orders: async () => {
+          snapshots += 1;
+          return { errors: [], orders: [] };
+        },
+        refresh: async () => {
+          refreshes += 1;
+        },
+        stream: ({ endpoint, onStatus }) => {
+          const stream = {
+            endpoint,
+            onStatus,
+            state: 'starting',
+            shouldReconnect: true,
+            connected: false,
+            initiateStream: async () => {
+              stream.state = 'active';
+              stream.connected = true;
+            },
+            stopStream: async () => {
+              stream.state = 'stopped';
+              stream.shouldReconnect = false;
+            },
+          };
+          streams.push(stream);
+          return stream;
+        },
+      },
+    },
+  });
+  const client = await factory();
+  client.tokens.access = 'token';
+  await client.syncBrokerageStreams({ name: 'ptfin' });
+  for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+  const orderStream = streams.find((stream) => stream.endpoint.at(-1) === 'orders');
+  const initialSnapshots = snapshots;
+
+  orderStream.onStatus({ state: 'recovering', reason: 'heartbeat.timeout', terminal: false });
+  orderStream.onStatus({ state: 'active', reason: 'reconnected', terminal: false });
+  for (let turn = 0; turn < 10; turn += 1) await Promise.resolve();
+  assert.ok(snapshots > initialSnapshots);
+
+  const auth = { state: 'failed', reason: 'upstream.authorization', terminal: true, error: { classification: 'authorization' } };
+  orderStream.onStatus(auth);
+  orderStream.onStatus(auth);
+  for (let turn = 0; turn < 30; turn += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(refreshes, 1);
+  assert.ok(streams.filter((stream) => stream.endpoint.at(-1) === 'orders').length >= 2);
 });
 
 (async () => {

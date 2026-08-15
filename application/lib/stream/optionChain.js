@@ -153,13 +153,27 @@ async ({
         const onError = (error) => {
           clearStats();
           writeStats('error');
+          const classification = error?.classification ?? 'unknown';
           const permanent = Boolean(error?.permanent || error?.streamStopped);
           debug('stream/chains upstream error', {
             code: error?.code ?? null,
             message: error?.message ?? String(error),
+            classification,
             permanent,
             reconnectable: error?.reconnectable ?? null,
           });
+          if (classification === 'capacity') {
+            notifyStatus({
+              state: 'queued',
+              reason: 'upstream.capacity',
+              active: false,
+              retryable: true,
+              terminal: false,
+              resubscribeRequired: false,
+              error,
+            });
+            return;
+          }
           console.error('stream chain error:', error);
           if (!permanent) return;
           notifyError(error);
@@ -196,6 +210,7 @@ async ({
             maxRetries: status?.maxRetries ?? null,
             active: status?.active ?? true,
             resubscribeRequired: status?.resubscribeRequired ?? false,
+            classification: status?.error?.classification ?? null,
             observedStrikes: observedStrikes.size,
             observedLegs: [...observedLegs.values()].reduce((sum, legs) => sum + legs.size, 0),
           });

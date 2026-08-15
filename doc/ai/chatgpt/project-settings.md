@@ -2,6 +2,23 @@
 
 Repo: `sulimenko/ts_connect`.
 
+## Instruction hierarchy
+
+Общий precedence определён в `AGENTS.md` и обязателен для этого документа.
+
+Role-specific rules:
+
+- Architect: `doc/ai/chatgpt/architect.instructions.md`;
+- Reviewer: `doc/ai/chatgpt/reviewer.instructions.md`.
+
+Templates:
+
+- primary: `doc/ai/chatgpt/task-template.md`;
+- follow-up: `doc/ai/chatgpt/followup-template.md`;
+- review helper: `doc/ai/chatgpt/review-checklist.md`.
+
+Templates/checklists не переопределяют `AGENTS.md`, active `ai-task-contract` или role-specific instructions.
+
 ChatGPT работает с проектом только через GitHub connector или через файлы, приложенные пользователем.
 
 Не предлагать `git clone`.
@@ -76,7 +93,7 @@ Opening fence должен быть строго ` ```ai-task-contract `.
 
 ## Task ID and branch naming
 
-- Перед draft новой задачи ChatGPT должен найти максимальный существующий `T-NNN` в `doc/changelog.md`, `doc/task.md` и `doc/tasks/done/*.md`.
+- Перед draft новой задачи ChatGPT должен найти максимальный завершённый `T-NNN` в `doc/changelog.md`, `doc/task.md` и `doc/tasks/done/*.md`.
 - Следующий task ID получает `T-NNN`, где `NNN = max existing + 1`.
 - Если создаётся несколько primary tasks одновременно, номера идут последовательно.
 - Название задачи в markdown: `# Task T-NNN: <short title>`.
@@ -218,7 +235,26 @@ tests:
 - `config/` — только env -> config;
 - `types/` — typing.
 
-Публичная процедура должна иметь runtime contract: `access`, `parameters`, `returns`, `errors`, `validate` при необходимости, `method`.
+## Impress API contract
+
+Impress допускает:
+
+- simple API function;
+- extended declaration с `method`.
+
+Поля extended declaration `access`, `parameters`, `returns`, `errors`, `validate` optional по framework contract.
+
+Их отсутствие само по себе не является defect и не должно автоматически блокировать review.
+
+Optional field требуется только если:
+
+- пользователь явно просит его добавить/сохранить;
+- task contract явно делает его частью scope/acceptance;
+- существующее runtime behavior уже зависит от поля.
+
+Если пользователь явно просит не добавлять/не проверять optional Impress metadata в текущей задаче, отсутствие этих полей игнорируется как styling/documentation concern.
+
+Существующие runtime-relevant fields нельзя удалять или менять без проверки compatibility. Особенно это относится к explicit access policy, parameter/result schemas, custom validation и error mappings.
 
 `DomainError` используется только для предсказуемых business/API contract errors.
 
@@ -258,13 +294,14 @@ Review PR должен проверить:
 6. Нет workflow artifacts.
 7. Validation commands passed.
 8. Tests соответствуют `tests.cover_behavior`, если required.
-9. Impress procedure contract сохранён.
-10. API/domain/lib boundaries сохранены.
-11. TradeStation response guards есть там, где читается external shape.
-12. Stream lifecycle не сломан.
-13. Symbol contract не размыт.
-14. DomainError/Error semantics корректны.
-15. Нет behavioral gaps.
+9. Фактически используемый Impress procedure contract сохранён; отсутствие optional metadata само по себе не blocker.
+10. Если пользователь/task явно требует конкретные optional metadata, они реализованы и согласованы с runtime behavior.
+11. API/domain/lib boundaries сохранены.
+12. TradeStation response guards есть там, где читается external shape.
+13. Stream lifecycle не сломан.
+14. Symbol contract не размыт.
+15. DomainError/Error semantics корректны.
+16. Нет behavioral gaps.
 
 Итог:
 

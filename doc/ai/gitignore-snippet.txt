@@ -1,15 +1,3 @@
-node_modules
-/log/
-/application/tasks
-*.log
-*.done
-*.pem
-.DS_Store
-data/
-.idea/
-.env
-.vscode/launch.json
-
 doc/ai/runs/
 doc/ai/context/
 doc/ai/logs/

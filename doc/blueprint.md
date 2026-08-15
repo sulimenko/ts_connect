@@ -67,7 +67,7 @@ API-слой не должен:
 
 Локальные `.d.ts` рядом с `application/api/*` не являются стандартным требованием. В этом сервисе runtime `.js`-контракт остается источником истины; отдельный `.d.ts` имеет смысл только если есть конкретный TypeScript-consumer или явная польза от compile-time namespace-контракта.
 
-## Обязательный контракт API-процедуры
+## Контракт API-процедуры
 
 ### Именование и плотность кода
 
@@ -81,22 +81,33 @@ API-слой не должен:
 
 ### Что должно быть в `.js`
 
-Новая публичная процедура должна стремиться к следующему набору полей:
+Impress допускает два framework-compatible варианта:
 
-- `access` для явного уровня доступа;
-- `parameters` для schema validation входа;
-- `returns` для schema validation результата;
-- `errors` для словаря доменных кодов ошибок;
-- `validate`, если нужно дополнительное правило поверх схемы;
-- `method` как единственная точка выполнения бизнес-операции.
+- simple API function;
+- extended declaration, где `method` является точкой выполнения.
 
-Минимальный runtime-паттерн:
+Для extended declaration поля `access`, `parameters`, `returns`, `errors`, `validate` optional по Metarhia/Impress contract.
 
-1. `parameters` проверяет форму входа.
-2. `validate` проверяет бизнес-ограничения, которые не выражаются схемой.
-3. `method` вызывает `domain` и `lib`.
-4. `returns` проверяет shape результата.
-5. `DomainError` используется только для ожидаемых бизнес-ошибок, перечисленных в `errors`.
+`ts_connect` не требует добавлять эти поля в каждую public procedure только ради полноты описания.
+
+Optional поле становится обязательным для конкретного endpoint/change только когда:
+
+- пользователь явно требует его;
+- active task contract явно включает его в requirements/acceptance;
+- существующий runtime contract уже использует поле и его удаление/изменение повлияет на behavior.
+
+Если пользователь явно просит не добавлять или не проверять optional metadata в текущей задаче, отсутствие этих полей не является blocker.
+
+При наличии полей их назначение остаётся стандартным:
+
+- `access` задаёт явную access policy, когда default framework behavior недостаточен или проект уже закрепил explicit policy;
+- `parameters` включает declarative validation входа;
+- `returns` включает declarative validation результата;
+- `errors` описывает публичные error mappings;
+- `validate` добавляет imperative validation;
+- `method` выполняет operation в extended declaration.
+
+Нельзя молча удалять уже существующие runtime-relevant contract fields. Optional означает «не обязателен по умолчанию», а не «можно игнорировать существующую семантику».
 
 ### Когда возвращать `DomainError`
 
@@ -143,7 +154,7 @@ API-слой не должен:
 Что `.d.ts` не делает:
 
 - не валидирует runtime-параметры;
-- не заменяет `parameters`, `returns` и `errors` в `.js`;
+- не заменяет `parameters`, `returns` и `errors`, когда эти optional runtime contracts фактически используются в `.js`;
 - не генерируется автоматически текущим сервисом;
 - не влияет на `impress/lib/procedure.js`, пока не используется TypeScript-инструментами.
 
@@ -204,32 +215,37 @@ Stream-методы сервиса должны выглядеть как упр
 
 ### Политика размера task и закрытия работы
 
-- если пользователь не ограничил задачу явно одним узким изменением, task нужно собирать крупно и закрывать совместимый набор связанных доработок за один проход;
-- после выполнения любого task обязателен отдельный review-этап;
-- после review architect обновляет все файлы в `doc/`, а не только один затронутый документ;
-- task считается закрытым только в последовательности `implement -> review -> architect updates doc/*`.
+Workflow и task routing определяются `AGENTS.md`, role-specific instructions, `project-settings.md` и active `ai-task-contract`.
+
+`doc/blueprint.md` фиксирует архитектурные/runtime-инварианты и не переопределяет AI Pipeline routing.
+
+После implementation выполняется review. Устойчивая архитектурная документация обновляется только когда изменение действительно меняет инварианты проекта; не требуется механически менять все `doc/*` после каждой production-задачи.
 
 ### Роли при работе с документацией
 
-- Architect формирует `doc/task.md`, проводит review, меняет статусы задач, пишет заключения в `doc/review.md`, архивирует закрытые блоки в `doc/changelog.md` и обновляет устойчивые правила в `doc/blueprint.md`.
-- Worker выполняет только кодовые/тестовые задачи из текущего блока и не меняет `doc/*`.
-- Если worker обнаружил, что документация устарела или требует архивирования, он фиксирует это в итоговом отчёте; правку документации делает architect после review.
+- ChatGPT = Architect + Reviewer.
+- Runner выполняет git/scope/validation/commit/PR routing по `ai-task-contract`.
+- Codex = bounded code editor и не управляет branch/commit/push/PR.
+- Активные задачи находятся только в `doc/tasks/ready/*.md`.
+- `doc/task.md` и `doc/review.md` являются legacy/history и не используются как active task/review source.
+- Production task не меняет `doc/**`, если documentation/workflow явно не входит в scope.
 
 ### Правила ведения doc/\*
 
 - `blueprint.md` — текущее состояние продукта, целевой контракт, обязательные правила. Историю и закрытые фазы не хранит — для этого есть git history.
-- `task.md` — рабочий журнал задач блоками; архивируется при накоплении >30 завершённых задач или закрытии крупного цикла.
-- `review.md` — постоянный checklist + заключения по блокам; архивируется вместе с task.md.
-- `changelog.md` — архив закрытых задач и review-заключений; загружается вручную.
+- `tasks/ready/*.md` — единственный active task queue.
+- `tasks/done/*.md` — завершённые task contracts.
+- `task.md` и `review.md` — legacy/history.
+- `changelog.md` — архив закрытых задач и заключений.
 
 ### Добавление нового API-метода
 
 1. Сначала определить публичный контракт: вход, выход, доменные ошибки, ограничения.
 2. Зафиксировать, где должна жить логика: `api`, `domain` или `lib`.
-3. Описать `parameters`, `returns`, `errors`.
+3. Решить, нужны ли optional Impress metadata (`access`, `parameters`, `returns`, `errors`, `validate`) для реального runtime behavior, явного требования пользователя или task contract. Не добавлять их только ради формальной полноты.
 4. При необходимости добавить `.d.ts` как compile-time контракт, но только если у него есть явная польза для потребителя.
 5. Проверить, не ломает ли изменение уже существующие клиенты.
-6. Smoke-проверка: happy path, минимум одна доменная ошибка, минимум один invalid input, shape результата соответствует `returns`.
+6. Smoke/tests должны проверять фактический behavior. Если `returns`/`parameters`/`errors` реально используются, проверить и их runtime semantics.
 
 ### Изменение stream endpoint
 
@@ -271,6 +287,13 @@ Stream-методы сервиса должны выглядеть как упр
 - `setPosition()` может хранить raw `Symbol` внутри payload для диагностики и сравнения с upstream response;
 - `Quantity` читается как signed value из TradeStation payload и используется без дополнительного изменения знака.
 
+### Order recovery и broker position truth
+
+- Recovery при stale или отсутствующей локальной broker position ограничен максимум одним authoritative positions refresh и одним повтором отправки ордера.
+- Конфликт с working orders или доступной closing capacity, включая quantity, уже зарезервированную открытыми buy/sell orders, не является stale-position mismatch и не запускает positions refresh или retry.
+- Успешная или отклонённая отправка ордера не является подтверждением fill и не должна optimistically очищать `domain.ts.positions`.
+- Источником broker position truth остаются position stream и authoritative reconciliation.
+
 ### Ограничения должны фиксироваться в документации
 
 Если сервис чего-то не поддерживает, это нужно фиксировать явно. Для текущего состояния `ts_connect` это особенно важно для:
@@ -292,7 +315,7 @@ Stream-методы сервиса должны выглядеть как упр
 **Во время изменения:**
 
 - не переносить domain state в `application/api/*`;
-- не расширять публичный контракт без явного описания `parameters`, `returns`, `errors`;
+- не расширять публичный runtime behavior без явного определения совместимости; optional Impress metadata добавлять только когда это требуется behavior/user/task contract;
 - не добавлять неподдержанный режим без явного ограничения или ошибки;
 - не скрывать технический долг под универсальными `try/catch`.
 
@@ -300,5 +323,5 @@ Stream-методы сервиса должны выглядеть как упр
 
 - проверить типы, линт и локальные smoke-сценарии;
 - провести отдельный review по постоянному checklist;
-- architect обновляет все `doc/*`, если появилось новое устойчивое правило сервиса или новая категория риска;
+- architect обновляет релевантные canonical docs, если появилось новое устойчивое правило сервиса или новая категория риска;
 - зафиксировать ограничения, которые должны знать сопровождающие.
