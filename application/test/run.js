@@ -3455,16 +3455,333 @@ test('orders REST helper normalizes empty nullable fields and rejects malformed 
   await assert.rejects(helper({ account: 'A1', live: true, token: 'token' }), /Orders/);
 });
 
-test('orders APIs expose runtime contracts and tolerate empty upstream fields', async () => {
-  for (const file of ['application/api/account/orders.js', 'application/api/account/historicalorders.js']) {
-    const calls = [];
-    const api = loadExpressionModule(file, {
-      domain: { ts: { clients: { getClient: async () => ({ tokens: { access: 'token' } }) } } },
+test('orders REST helper retries only transient reads and keeps request semantics', async () => {
+  for (const status of [408, 429, 502, 503, 504]) {
+    let attempts = 0;
+    const helper = loadExpressionModule('application/lib/ts/orders.js', {
+      setTimeout: (fn, delay) => {
+        const timer = { cleared: false };
+        if (delay < 7000) Promise.resolve().then(() => !timer.cleared && fn());
+        return timer;
+      },
+      clearTimeout: (timer) => {
+        timer.cleared = true;
+      },
       lib: {
         ts: {
-          orders: async (payload) => {
-            calls.push(payload);
-            return { errors: [], orders: [] };
+          send: async (payload) => {
+            attempts += 1;
+            assert.equal(payload.method, 'GET');
+            assert.ok(payload.signal);
+            if (attempts === 1) throw Object.assign(new Error(`HTTP ${status}`), { status });
+            return { Errors: [], Orders: [{ AccountID: 'A1', OrderID: `O${status}` }] };
+          },
+        },
+      },
+    });
+
+    const response = await helper({
+      account: 'A1',
+      live: '1',
+      token: 'token',
+      orderIds: [],
+      limit: 25,
+      historical: true,
+      start: '2026-07-01',
+    });
+    assert.equal(attempts, 2);
+    assert.equal(response.orders[0].OrderID, `O${status}`);
+  }
+
+  for (const status of [400, 401, 403, 404]) {
+    let attempts = 0;
+    const helper = loadExpressionModule('application/lib/ts/orders.js', {
+      lib: {
+        ts: {
+          send: async () => {
+            attempts += 1;
+            throw Object.assign(new Error(`HTTP ${status}`), { status });
+          },
+        },
+      },
+    });
+    await assert.rejects(helper({ account: 'A1', token: 'token' }), (error) => error.status === status);
+    assert.equal(attempts, 1);
+  }
+
+  for (const error of [
+    Object.assign(new Error('invalid symbol'), { code: 'INVALID_SYMBOL', status: 400 }),
+    Object.assign(new Error('malformed'), { code: 'ERESPONSE' }),
+  ]) {
+    let attempts = 0;
+    const helper = loadExpressionModule('application/lib/ts/orders.js', {
+      lib: {
+        ts: {
+          send: async () => {
+            attempts += 1;
+            throw error;
+          },
+        },
+      },
+    });
+    await assert.rejects(helper({ account: 'A1', token: 'token' }));
+    assert.equal(attempts, 1);
+  }
+});
+
+test('orders REST helper bounds network and read timeouts to two attempts', async () => {
+  let networkAttempts = 0;
+  const network = loadExpressionModule('application/lib/ts/orders.js', {
+    setTimeout: (fn, delay) => {
+      const timer = { cleared: false };
+      if (delay < 7000) Promise.resolve().then(() => !timer.cleared && fn());
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      timer.cleared = true;
+    },
+    lib: {
+      ts: {
+        send: async () => {
+          networkAttempts += 1;
+          if (networkAttempts === 1) throw new TypeError('fetch failed');
+          return { Errors: [], Orders: [{ OrderID: 'O1' }] };
+        },
+      },
+    },
+  });
+  assert.equal((await network({ account: 'A1', token: 'token' })).orders.length, 1);
+  assert.equal(networkAttempts, 2);
+
+  let timeoutAttempts = 0;
+  const timeout = loadExpressionModule('application/lib/ts/orders.js', {
+    setTimeout: (fn) => {
+      const timer = { cleared: false };
+      Promise.resolve().then(() => !timer.cleared && fn());
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      timer.cleared = true;
+    },
+    lib: {
+      ts: {
+        send: ({ signal }) => {
+          timeoutAttempts += 1;
+          return new Promise((resolve, reject) => {
+            signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), {
+              once: true,
+            });
+          });
+        },
+      },
+    },
+  });
+  await assert.rejects(timeout({ account: 'A1', token: 'token' }), (error) => error.code === 'ETIMEOUT');
+  assert.equal(timeoutAttempts, 2);
+});
+
+test('orders REST helper does not retry parent abort or malformed success', async () => {
+  const controller = new AbortController();
+  let abortAttempts = 0;
+  const aborted = loadExpressionModule('application/lib/ts/orders.js', {
+    lib: {
+      ts: {
+        send: async () => {
+          abortAttempts += 1;
+          controller.abort(new Error('batch failed'));
+          throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+        },
+      },
+    },
+  });
+  await assert.rejects(aborted({ account: 'A1', token: 'token', signal: controller.signal }), /batch failed|aborted/);
+  assert.equal(abortAttempts, 1);
+
+  let malformedAttempts = 0;
+  const malformed = loadExpressionModule('application/lib/ts/orders.js', {
+    lib: {
+      ts: {
+        send: async () => {
+          malformedAttempts += 1;
+          return { Errors: [], Orders: {} };
+        },
+      },
+    },
+  });
+  await assert.rejects(malformed({ account: 'A1', token: 'token' }), /Orders/);
+  assert.equal(malformedAttempts, 1);
+});
+
+test('orders diagnostics include bounded metadata without credentials or payloads', async () => {
+  const entries = [];
+  const helper = loadExpressionModule('application/lib/ts/orders.js', {
+    console: {
+      error: (...args) => entries.push(args),
+      log: (...args) => entries.push(args),
+    },
+    lib: {
+      ts: {
+        send: async ({ meta }) => {
+          meta.status = 200;
+          return { Errors: [], Orders: [{ AccountID: 'A1', OrderID: 'O1', Secret: 'payload-secret' }] };
+        },
+      },
+    },
+  });
+
+  await helper({ account: 'A1', token: 'access-secret' });
+  const logs = entries.map((entry) => entry[1]);
+  assert.equal(logs.length, 2);
+  for (const log of logs) {
+    for (const key of [
+      'endpoint',
+      'account',
+      'mode',
+      'attempt',
+      'state',
+      'durationMs',
+      'httpStatus',
+      'ordersCount',
+      'retryable',
+      'retryAttempt',
+    ]) {
+      assert.equal(Object.hasOwn(log, key), true, key);
+    }
+  }
+  const serialized = JSON.stringify(entries);
+  assert.equal(serialized.includes('access-secret'), false);
+  assert.equal(serialized.includes('payload-secret'), false);
+});
+
+test('orders batch overlaps at most three accounts and preserves result order', async () => {
+  const active = { count: 0, max: 0 };
+  const started = [];
+  const completed = [];
+  const delays = { A1: 40, A2: 5, A3: 15, A4: 5, A5: 5, A6: 5 };
+  const calls = [];
+  const batch = loadExpressionModule('application/lib/ts/ordersBatch.js', {
+    lib: {
+      ts: {
+        orders: async (payload) => {
+          calls.push(payload);
+          started.push(payload.account);
+          active.count += 1;
+          active.max = Math.max(active.max, active.count);
+          await new Promise((resolve) => setTimeout(resolve, delays[payload.account]));
+          active.count -= 1;
+          completed.push(payload.account);
+          return { errors: [], orders: [{ AccountID: payload.account, OrderID: `O-${payload.account}` }] };
+        },
+      },
+    },
+  });
+  const contracts = Object.keys(delays).map((account, index) => ({ account, live: index % 2 }));
+  const result = await batch({
+    contracts,
+    token: 'token',
+    orderIds: [],
+    limit: 25,
+    historical: true,
+    start: '2026-07-01',
+  });
+
+  assert.equal(active.max, 3);
+  assert.equal(started.slice(0, 3).join(','), 'A1,A2,A3');
+  assert.equal(completed.indexOf('A2') < completed.indexOf('A1'), true);
+  assert.equal(started.indexOf('A4') < completed.indexOf('A1'), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.map((order) => order.AccountID))), Object.keys(delays));
+  assert.equal(calls.length, contracts.length);
+  assert.ok(calls.every((call) => call.orderIds.length === 0));
+  assert.ok(calls.every((call) => call.limit === 25 && call.historical === true && call.start === '2026-07-01'));
+});
+
+test('orders batch aborts active reads and never returns a partial snapshot', async () => {
+  const started = [];
+  const aborted = [];
+  const batch = loadExpressionModule('application/lib/ts/ordersBatch.js', {
+    lib: {
+      ts: {
+        orders: ({ account, signal }) => {
+          started.push(account);
+          if (account === 'A1') {
+            return Promise.resolve({ errors: [{ Message: 'account unavailable' }], orders: [] });
+          }
+          return new Promise((resolve, reject) => {
+            signal.addEventListener(
+              'abort',
+              () => {
+                aborted.push(account);
+                reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+              },
+              { once: true },
+            );
+          });
+        },
+      },
+    },
+  });
+
+  await assert.rejects(
+    batch({
+      contracts: ['A1', 'A2', 'A3', 'A4', 'A5', 'A6'].map((account) => ({ account, live: true })),
+      token: 'token',
+    }),
+    /A1|account/i,
+  );
+  assert.deepEqual(started, ['A1', 'A2', 'A3']);
+  assert.deepEqual(aborted.sort(), ['A2', 'A3']);
+});
+
+test('orders batch deadline aborts active reads with ETIMEOUT', async () => {
+  const signals = [];
+  const batch = loadExpressionModule('application/lib/ts/ordersBatch.js', {
+    setTimeout: (fn, delay) => {
+      const timer = { cleared: false };
+      if (delay === 18000) Promise.resolve().then(() => !timer.cleared && fn());
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      timer.cleared = true;
+    },
+    lib: {
+      ts: {
+        orders: ({ signal }) => {
+          signals.push(signal);
+          return new Promise((resolve, reject) => {
+            signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), {
+              once: true,
+            });
+          });
+        },
+      },
+    },
+  });
+
+  await assert.rejects(batch({ contracts: [{ account: 'A1', live: true }], token: 'token' }), (error) => error.code === 'ETIMEOUT');
+  assert.equal(signals.length, 1);
+  assert.equal(signals[0].aborted, true);
+});
+
+test('orders APIs use token-ready clients and the shared batch policy', async () => {
+  for (const file of ['application/api/account/orders.js', 'application/api/account/historicalorders.js']) {
+    const clientCalls = [];
+    const batchCalls = [];
+    const api = loadExpressionModule(file, {
+      domain: {
+        ts: {
+          clients: {
+            getClient: async (payload) => {
+              clientCalls.push(payload);
+              return { tokens: { access: 'token' } };
+            },
+          },
+        },
+      },
+      lib: {
+        ts: {
+          ordersBatch: async (payload) => {
+            batchCalls.push(payload);
+            return [{ OrderID: 'O1' }];
           },
         },
       },
@@ -3474,9 +3791,116 @@ test('orders APIs expose runtime contracts and tolerate empty upstream fields', 
     assert.equal(api.returns, 'json');
     assert.equal(typeof api.errors, 'object');
     assert.equal(typeof api.validate, 'function');
-    assert.equal((await api.method({ contracts: [{ account: 'A1', live: true }] })).length, 0);
-    assert.equal(calls.length, 1);
+    const result = await api.method({
+      contracts: [{ account: 'A1', live: true }],
+      orders: ['O1'],
+      limit: 25,
+      start: '2026-07-01',
+    });
+    assert.equal(result[0].OrderID, 'O1');
+    assert.deepEqual(JSON.parse(JSON.stringify(clientCalls)), [{ sync: false }]);
+    assert.equal(batchCalls.length, 1);
+    assert.equal(batchCalls[0].token, 'token');
+    assert.deepEqual(batchCalls[0].orderIds, ['O1']);
+    assert.equal(batchCalls[0].limit, 25);
+    assert.equal(Boolean(batchCalls[0].historical), file.includes('historicalorders'));
+    assert.equal(batchCalls[0].start, file.includes('historicalorders') ? '2026-07-01' : undefined);
   }
+});
+
+test('clients keep cold setup single-flight while token-ready mode skips brokerage sync', async () => {
+  let factories = 0;
+  let refreshes = 0;
+  let syncs = 0;
+  let lifetimes = 0;
+  const client = {
+    tokens: {},
+    key: {},
+    refreshAccessToken: async () => {
+      refreshes += 1;
+      await Promise.resolve();
+    },
+    syncBrokerageStreams: async () => {
+      syncs += 1;
+    },
+    lifetime: () => {
+      lifetimes += 1;
+    },
+  };
+  const clients = loadExpressionModule('application/domain/ts/clients.js', {
+    domain: {
+      ts: {
+        client: async () => {
+          factories += 1;
+          return client;
+        },
+      },
+    },
+    config: { ts: { ptfin: { rtoken: 'refresh', pkey: 'key', secret: 'secret' } } },
+  });
+
+  const [first, second] = await Promise.all([clients.getClient({ sync: false }), clients.getClient({ sync: false })]);
+  assert.equal(first, client);
+  assert.equal(second, client);
+  assert.equal(factories, 1);
+  assert.equal(refreshes, 1);
+  assert.equal(lifetimes, 1);
+  assert.equal(syncs, 0);
+
+  assert.equal(await clients.getClient({}), client);
+  assert.equal(syncs, 1);
+});
+
+test('generic TradeStation send forwards abort signal and never retries POST', async () => {
+  const controller = new AbortController();
+  const calls = [];
+  const send = loadExpressionModule('application/lib/ts/send.js', {
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      throw new TypeError('fetch failed');
+    },
+    lib: {
+      utils: {
+        constructDomain: () => 'https://sim.example',
+        constructURL: () => 'https://sim.example/v3/orders',
+      },
+    },
+  });
+
+  await assert.rejects(
+    send({ method: 'POST', endpoint: ['orders'], token: 'token', data: { Symbol: 'TSLA' }, signal: controller.signal }),
+    /fetch failed/,
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.signal, controller.signal);
+  assert.equal(calls[0].options.method, 'POST');
+});
+
+test('generic TradeStation send logs error metadata without response bodies', async () => {
+  const logs = [];
+  const send = loadExpressionModule('application/lib/ts/send.js', {
+    console: {
+      error: (...args) => logs.push(args),
+    },
+    fetch: async () => ({
+      ok: false,
+      status: 503,
+      statusText: 'Unavailable',
+      headers: new Map(),
+      text: async () => 'orders-payload-secret',
+    }),
+    lib: {
+      utils: {
+        constructDomain: () => 'https://sim.example',
+        constructURL: () => 'https://sim.example/v3/orders',
+      },
+    },
+  });
+
+  await assert.rejects(send({ method: 'GET', endpoint: ['orders'], token: 'access-secret' }), (error) => error.status === 503);
+  const serialized = JSON.stringify(logs);
+  assert.equal(serialized.includes('orders-payload-secret'), false);
+  assert.equal(serialized.includes('access-secret'), false);
 });
 
 test('brokerage order stream replaces stale entries, reconciles and hydrates packets', async () => {
