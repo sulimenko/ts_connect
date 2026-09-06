@@ -3319,7 +3319,7 @@ test('brokerage streams start once and update orders and positions', async () =>
   positionStream.onData({
     AccountID: '11827414',
     Symbol: 'CRWV 280121C80',
-    Quantity: '0',
+    Quantity: 0,
     AssetType: 'OPT',
   });
   assert.equal(
@@ -3454,6 +3454,13 @@ test('positions stream publishes broker snapshots and quantity truth across reco
   stream.onData({ AccountID: '11957784', Symbol: 'PINS 260904P22', Quantity: '-80', AssetType: 'OPT', PositionID: 'P1' });
   assert.equal(queued.length, 2);
 
+  for (const quantity of ['broken', '', ' ']) {
+    stream.onData({ AccountID: '11957784', Symbol: 'PINS 260904P22', Quantity: quantity, AssetType: 'OPT', PositionID: 'P1' });
+  }
+  stream.onData({ AccountID: '11957784', Symbol: 'PINS 260904P22', AssetType: 'OPT', PositionID: 'P1' });
+  assert.equal(queued.length, 2);
+  assert.equal(positions.getPosition({ account: '11957784', symbol: 'PINS260904P00022000' }).get('Quantity'), '-80');
+
   stream.onData({ AccountID: '11957784', Symbol: 'ZERO', Quantity: '0', AssetType: 'STOCK', PositionID: 'P3' });
   assert.equal(queued.length, 3);
   assert.equal(queued[2].data.data.previousQuantity, -80);
@@ -3462,12 +3469,32 @@ test('positions stream publishes broker snapshots and quantity truth across reco
   assert.equal(zeroVisible, true);
   assert.equal(positions.getPosition({ account: '11957784', symbol: 'ZERO' }), null);
 
+  stream.onStatus({ state: 'active', reason: 'reconnected', terminal: false });
+  stream.onData({ AccountID: '11957784', Symbol: 'LI', Quantity: '100', AssetType: 'STOCK', PositionID: 'P2' });
+  stream.onData({ AccountID: '11957784', Symbol: 'PINS 260904P22', Quantity: 'broken', AssetType: 'OPT', PositionID: 'P1' });
+  stream.onData({ Symbol: 'PINS 260904PXX', AssetType: 'OPT', Quantity: '1', PositionID: 'BAD' });
+  stream.onData({ AccountID: 'OTHER', Symbol: 'LI', Quantity: '200', AssetType: 'STOCK', PositionID: 'WRONG' });
+  stream.onData({ StreamStatus: 'EndSnapshot' });
+  assert.equal(queued.length, 3);
+  assert.equal(positions.getPosition({ account: '11957784', symbol: 'PINS260904P00022000' }).get('Quantity'), '-80');
+  assert.equal(positions.getPosition({ account: '11957784', symbol: 'LI' }).get('Quantity'), '100');
+  assert.equal(positions.getPosition({ account: 'OTHER', symbol: 'LI' }), null);
+  assert.ok(logs.some((entry) => entry[1] === 'brokerage position invalid' && entry[2].reason === 'invalid_quantity'));
+  assert.ok(logs.some((entry) => entry[1] === 'brokerage position invalid' && entry[2].reason === 'invalid_symbol'));
+  assert.ok(logs.some((entry) => entry[1] === 'brokerage position invalid' && entry[2].reason === 'account_mismatch'));
+  const invalidSnapshot = logs.find((entry) => entry[1] === 'brokerage position snapshot' && entry[2].state === 'invalid')[2];
+  assert.deepEqual(
+    {
+      account: invalidSnapshot.account,
+      generation: invalidSnapshot.generation,
+      reason: invalidSnapshot.reason,
+      count: invalidSnapshot.invalidPacketCount,
+    },
+    { account: '11957784', generation: 2, reason: 'reconnected', count: 3 },
+  );
+
   stream.onData({ StreamStatus: 'GoAway' });
   stream.onData({ StreamStatus: 'Heartbeat' });
-  stream.onData({ Symbol: 'PINS 260904PXX', AssetType: 'OPT', Quantity: '1', PositionID: 'BAD' });
-  assert.equal(queued.length, 3);
-  assert.equal(positions.getPosition({ account: '11957784', symbol: 'PINS 260904PXX' }), null);
-
   stream.onStatus({ state: 'active', reason: 'reconnected', terminal: false });
   stream.onData({ AccountID: '11957784', Symbol: 'LI', Quantity: '100', AssetType: 'STOCK', PositionID: 'P2' });
   failDelivery = true;
@@ -3476,13 +3503,12 @@ test('positions stream publishes broker snapshots and quantity truth across reco
   const reconnected = queued[3].data.data;
   assert.equal(reconnected.event, 'snapshot');
   assert.equal(reconnected.reason, 'reconnected');
-  assert.equal(reconnected.streamGeneration, 2);
+  assert.equal(reconnected.streamGeneration, 3);
   assert.deepEqual(JSON.parse(JSON.stringify(reconnected.positions.map((item) => item.symbol))), ['LI']);
   assert.equal(positions.getPosition({ account: '11957784', symbol: 'PINS260904P00022000' }), null);
   assert.equal(stream.state, 'active');
   assert.equal(streams.length, 2);
   assert.equal(refreshes, 0);
-  assert.ok(logs.some((entry) => entry[1] === 'brokerage position symbol invalid' && entry[2].positionId === 'BAD'));
   assert.ok(
     logs.some((entry) => entry[1] === 'brokerage position downstream' && entry[2].state === 'failed' && entry[2].kind === 'snapshot'),
   );

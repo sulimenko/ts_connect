@@ -493,11 +493,44 @@ async () => ({
       let snapshot = new Map();
       let snapshotActive = true;
       let snapshotReason = 'initial';
+      let snapshotValid = true;
+      let invalidPacketCount = 0;
+
+      const rejectPosition = (message, reason) => {
+        if (snapshotActive) {
+          snapshotValid = false;
+          invalidPacketCount += 1;
+        }
+        console.warn('brokerage position invalid', {
+          event: 'brokerage.position.invalid',
+          account,
+          streamKey: key,
+          generation,
+          reason,
+          upstreamSymbol: message?.Symbol,
+          positionId: message?.PositionID,
+          snapshotActive,
+        });
+      };
 
       const onData = (message) => {
         try {
           if (message?.StreamStatus) {
             if (message.StreamStatus !== 'EndSnapshot' || !snapshotActive) return;
+            if (!snapshotValid) {
+              console.warn('brokerage position snapshot', {
+                event: 'brokerage.position.snapshot',
+                account,
+                streamKey: key,
+                generation,
+                reason: snapshotReason,
+                invalidPacketCount,
+                state: 'invalid',
+              });
+              snapshotActive = false;
+              snapshot.clear();
+              return;
+            }
             const completed = domain.ts.positions.replaceAccount({ account, items: [...snapshot.values()] });
             if (!completed) return;
             const position = {
@@ -526,23 +559,32 @@ async () => ({
             snapshot.clear();
             return;
           }
+          const packetAccount = message?.AccountID;
+          const accountId = packetAccount === undefined || packetAccount === null ? account : `${packetAccount}`.trim();
+          if (accountId !== account) {
+            rejectPosition(message, 'account_mismatch');
+            return;
+          }
           const upstreamSymbol = message?.Symbol;
           const parsed = lib.utils.makeSymbol(upstreamSymbol);
           const symbol = parsed && (message?.AssetType !== 'OPT' || parsed.type === 'OPT') ? parsed.symbol : null;
           if (!symbol) {
-            console.warn('brokerage position symbol invalid', {
-              account,
-              upstreamSymbol,
-              positionId: message?.PositionID,
-              streamKey: key,
-            });
+            rejectPosition(message, 'invalid_symbol');
             return;
           }
-          const accountId = message.AccountID ?? account;
+          const rawQuantity = message?.Quantity;
+          const quantity = Number(rawQuantity);
+          if (
+            !['number', 'string'].includes(typeof rawQuantity) ||
+            (typeof rawQuantity === 'string' && rawQuantity.trim() === '') ||
+            !Number.isFinite(quantity)
+          ) {
+            rejectPosition(message, 'invalid_quantity');
+            return;
+          }
           const previous = domain.ts.positions.getPosition({ account: accountId, symbol });
           const previousQuantity = lib.utils.readPositionQuantity(previous);
           const position = domain.ts.positions.setPosition({ account: accountId, symbol, data: message });
-          const quantity = lib.utils.readPositionQuantity(position);
           if (snapshotActive) {
             if (quantity === 0) snapshot.delete(symbol);
             else snapshot.set(symbol, { symbol, data: { ...message, AccountID: accountId } });
@@ -606,6 +648,8 @@ async () => ({
           snapshot = new Map();
           snapshotActive = true;
           snapshotReason = 'reconnected';
+          snapshotValid = true;
+          invalidPacketCount = 0;
         }
         console.debug('brokerage position stream', {
           account,
