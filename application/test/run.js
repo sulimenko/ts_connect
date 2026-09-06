@@ -3493,6 +3493,32 @@ test('orders REST helper retries only transient reads and keeps request semantic
     assert.equal(response.orders[0].OrderID, `O${status}`);
   }
 
+  for (const status of [408, 429, 502, 503, 504]) {
+    let attempts = 0;
+    const helper = loadExpressionModule('application/lib/ts/orders.js', {
+      setTimeout: (fn, delay) => {
+        const timer = { cleared: false };
+        if (delay < 7000) Promise.resolve().then(() => !timer.cleared && fn());
+        return timer;
+      },
+      clearTimeout: (timer) => {
+        timer.cleared = true;
+      },
+      lib: {
+        ts: {
+          send: async () => {
+            attempts += 1;
+            throw Object.assign(new Error(`HTTP ${status}`), { status });
+          },
+        },
+      },
+    });
+    const error = await helper({ account: 'A1', token: 'token' }).catch((caught) => caught);
+    assert.equal(attempts, 2);
+    assert.equal(error.status, status);
+    assert.equal(error.code === 'ETIMEOUT', status === 408);
+  }
+
   for (const status of [400, 401, 403, 404]) {
     let attempts = 0;
     const helper = loadExpressionModule('application/lib/ts/orders.js', {
@@ -3544,7 +3570,9 @@ test('orders REST helper bounds network and read timeouts to two attempts', asyn
       ts: {
         send: async () => {
           networkAttempts += 1;
-          if (networkAttempts === 1) throw new TypeError('fetch failed');
+          if (networkAttempts === 1) {
+            throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNRESET' } });
+          }
           return { Errors: [], Orders: [{ OrderID: 'O1' }] };
         },
       },
@@ -3578,6 +3606,45 @@ test('orders REST helper bounds network and read timeouts to two attempts', asyn
   });
   await assert.rejects(timeout({ account: 'A1', token: 'token' }), (error) => error.code === 'ETIMEOUT');
   assert.equal(timeoutAttempts, 2);
+});
+
+test('orders REST helper rejects application TypeError without retry', async () => {
+  let attempts = 0;
+  const helper = loadExpressionModule('application/lib/ts/orders.js', {
+    lib: {
+      ts: {
+        send: async () => {
+          attempts += 1;
+          throw new TypeError('Cannot read properties of undefined');
+        },
+      },
+    },
+  });
+
+  await assert.rejects(helper({ account: 'A1', token: 'token' }), TypeError);
+  assert.equal(attempts, 1);
+});
+
+test('orders REST helper stops timeout retry when deadline cannot fit backoff', async () => {
+  let attempts = 0;
+  const helper = loadExpressionModule('application/lib/ts/orders.js', {
+    Date: { now: () => 1000 },
+    setTimeout: () => ({ cleared: false }),
+    clearTimeout: (timer) => {
+      timer.cleared = true;
+    },
+    lib: {
+      ts: {
+        send: async () => {
+          attempts += 1;
+          throw Object.assign(new Error('HTTP 408'), { status: 408 });
+        },
+      },
+    },
+  });
+
+  await assert.rejects(helper({ account: 'A1', token: 'token', deadline: 1050 }), (error) => error.code === 'ETIMEOUT');
+  assert.equal(attempts, 1);
 });
 
 test('orders REST helper does not retry parent abort or malformed success', async () => {

@@ -42,7 +42,9 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
       }, delay);
       signal?.addEventListener('abort', abort, { once: true });
     });
-  const transient = new Set([408, 429, 502, 503, 504]);
+  const timeoutCodes = new Set(['ETIMEDOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT']);
+  const networkCodes = new Set(['ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_SOCKET']);
+  const transient = new Set([429, 502, 503, 504]);
   let response = null;
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -104,10 +106,12 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
       let error = caught;
       if (signal?.aborted) error = abortError();
       else if (timedOut) error = timeoutError();
-      const timeout = error.code === 'ETIMEOUT' || ['ETIMEDOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT'].includes(error.code);
-      const network =
-        error.name === 'TypeError' || ['ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_SOCKET'].includes(error.code);
-      const retryable = !signal?.aborted && error.code !== 'ERESPONSE' && (timeout || network || transient.has(error.status));
+      const codes = [error.code, error.cause?.code];
+      const malformed = error.code === 'ERESPONSE';
+      const timeout = error.status === 408 || error.code === 'ETIMEOUT' || codes.some((code) => timeoutCodes.has(code));
+      const network = codes.some((code) => networkCodes.has(code));
+      if (timeout && !malformed) error.code = 'ETIMEOUT';
+      const retryable = !signal?.aborted && !malformed && (timeout || network || transient.has(error.status));
       console.error('TradeStation orders read:', {
         endpoint: endpointName,
         account: accountId,
@@ -121,7 +125,6 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
         retryAttempt: attempt - 1,
       });
       if (!retryable || attempt === 2) {
-        if (timeout) error.code = 'ETIMEOUT';
         throw error;
       }
       const delay = 100 * attempt;
