@@ -47,7 +47,6 @@
       client.key.secret = config.ts[name].secret;
 
       await client.refreshAccessToken({ reason: 'setup' });
-      await client.syncBrokerageStreams({ name });
       client.lifetime();
       return client;
     })();
@@ -67,14 +66,12 @@
     }
   },
 
-  async getClient({ name = 'ptfin', update = false }) {
+  async getClient({ name = 'ptfin', update = false, sync = true }) {
     if (update) await this.deleteClient({ name });
     let client = this.values[name];
-    if (client) {
-      await client.syncBrokerageStreams({ name });
-      return client;
-    }
-    client = await this.setClient({ name });
+    if (!client) client = await this.setClient({ name });
+    if (client && sync) await client.syncBrokerageStreams({ name });
+    if (client && !sync) console.log('getClient:', { name, syncBrokerageStreams: false });
     return client;
   },
 });

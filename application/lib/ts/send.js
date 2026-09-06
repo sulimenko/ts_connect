@@ -1,10 +1,22 @@
-async ({ method, domain = null, live = false, ver = 'v3', endpoint, token, data = {}, type = 'application/json' }) => {
+async ({
+  method,
+  domain = null,
+  live = false,
+  ver = 'v3',
+  endpoint,
+  token,
+  data = {},
+  type = 'application/json',
+  signal = null,
+  meta = null,
+}) => {
   try {
     if (domain === null) domain = lib.utils.constructDomain(live);
     const ep = [ver, ...endpoint];
     const url = lib.utils.constructURL(method, domain, ep, data);
 
     const options = { method, headers: {} };
+    if (signal) options.signal = signal;
 
     if (token !== null) options.headers.Authorization = `Bearer ${token}`;
     const urlEncodedData = new URLSearchParams(data).toString();
@@ -23,9 +35,20 @@ async ({ method, domain = null, live = false, ver = 'v3', endpoint, token, data 
     // console.debug('Request Options:', options);
 
     const res = await fetch(url, options);
+    const retryAfter = res.headers?.get?.('retry-after') ?? null;
+    if (meta && typeof meta === 'object') {
+      meta.status = res.status;
+      meta.retryAfter = retryAfter;
+    }
     if (res.ok) {
       // return res.status === 200 ? res.json() : res.text();
-      return await res.json();
+      try {
+        return await res.json();
+      } catch (error) {
+        error.code = 'ERESPONSE';
+        error.retryable = false;
+        throw error;
+      }
     } else {
       const errorText = await res.text();
       const responseText = errorText.trim();
@@ -48,6 +71,7 @@ async ({ method, domain = null, live = false, ver = 'v3', endpoint, token, data 
       error.status = res.status;
       error.statusText = res.statusText;
       error.responseText = responseText;
+      error.retryAfter = retryAfter;
       const invalidSymbol = values.some((value) => {
         const message = value.trim().toLowerCase();
         return message === 'invalid symbol' || message.startsWith('invalid symbol:');
@@ -62,12 +86,16 @@ async ({ method, domain = null, live = false, ver = 'v3', endpoint, token, data 
         status: error.status,
         statusText: error.statusText,
         code: error.code,
-        responseText: error.responseText,
       });
       throw error;
     }
   } catch (error) {
-    console.error('Error in send function:', error);
+    console.error('Error in send function:', {
+      name: error.name,
+      status: error.status,
+      statusText: error.statusText,
+      code: error.code,
+    });
     throw error;
   }
 };
