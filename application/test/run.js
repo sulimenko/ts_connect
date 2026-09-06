@@ -3297,13 +3297,18 @@ test('brokerage streams start once and update orders and positions', async () =>
   assert.equal(queued[0].data.data.Status, 'Filled');
 
   const positionStream = streams.find((stream) => stream.endpoint.at(-1) === 'positions');
-  positionStream.onData({ StreamStatus: 'EndSnapshot' });
   positionStream.onData({
     AccountID: '11827414',
     Symbol: 'CRWV 280121C80',
     Quantity: '3',
     AssetType: 'OPT',
   });
+  positionStream.onData({ StreamStatus: 'EndSnapshot' });
+
+  assert.equal(queued.length, 2);
+  assert.equal(queued[1].data.type, 'position');
+  assert.equal(queued[1].data.data.event, 'snapshot');
+  assert.equal(queued[1].data.data.positions[0].symbol, 'CRWV280121C00080000');
 
   const position = positions.getPosition({
     account: 11827414,
@@ -3324,10 +3329,163 @@ test('brokerage streams start once and update orders and positions', async () =>
     }),
     null,
   );
+  assert.equal(queued.length, 3);
+  assert.equal(queued[2].data.data.event, 'change');
+  assert.equal(queued[2].data.data.previousQuantity, 3);
+  assert.equal(queued[2].data.data.quantity, 0);
+  assert.equal(queued[2].data.data.delta, -3);
 
   await client.close({ reason: 'test.close' });
   assert.equal(stopped.length, 2);
   assert.ok(stopped.every((entry) => entry.reason === 'test.close'));
+});
+
+test('positions stream publishes broker snapshots and quantity truth across reconnects', async () => {
+  const utils = loadUtils();
+  const positions = loadExpressionModule('application/domain/ts/positions.js', {
+    lib: { utils },
+  });
+  const orders = loadExpressionModule('application/domain/ts/orders.js', {});
+  const queued = [];
+  const streams = [];
+  const logs = [];
+  let failDelivery = false;
+  let zeroVisible = false;
+  let refreshes = 0;
+  const factory = loadExpressionModule('application/domain/ts/client.js', {
+    console: {
+      debug: (...args) => logs.push(['debug', ...args]),
+      error: (...args) => logs.push(['error', ...args]),
+      log: (...args) => logs.push(['log', ...args]),
+      warn: (...args) => logs.push(['warn', ...args]),
+    },
+    domain: {
+      queue: {
+        addTask: (task) => {
+          queued.push(task);
+          if (task.data.data.event === 'change' && task.data.data.quantity === 0) {
+            zeroVisible = positions.getPosition({ account: task.data.data.account, symbol: task.data.data.symbol }) !== null;
+          }
+          if (failDelivery) task.onFailure(new Error('downstream rejected'));
+        },
+      },
+      ts: { orders, positions },
+    },
+    lib: {
+      utils,
+      ptfin: { getContract: async () => [{ account: '11957784', live: true }] },
+      ts: {
+        orders: async () => ({ errors: [], orders: [] }),
+        refresh: async () => {
+          refreshes += 1;
+        },
+        stream: ({ endpoint, onData, onError, onStatus }) => {
+          const stream = {
+            endpoint,
+            onData,
+            onError,
+            onStatus,
+            state: 'starting',
+            shouldReconnect: true,
+            connected: false,
+            initiateStream: async () => {
+              stream.state = 'active';
+              stream.connected = true;
+            },
+            stopStream: async () => {
+              stream.state = 'stopped';
+              stream.shouldReconnect = false;
+              stream.connected = false;
+            },
+          };
+          streams.push(stream);
+          return stream;
+        },
+      },
+    },
+  });
+  const client = await factory();
+  client.tokens.access = 'token';
+  assert.equal(await client.syncBrokerageStreams({ name: 'ptfin' }), true);
+  const stream = streams.find((item) => item.endpoint.at(-1) === 'positions');
+
+  stream.onData({
+    AccountID: '11957784',
+    Symbol: 'PINS 260904P22',
+    Quantity: '-100',
+    AssetType: 'OPT',
+    PositionID: 'P1',
+    AveragePrice: '0.37',
+    Timestamp: '2026-09-04T10:00:00Z',
+  });
+  stream.onData({ AccountID: '11957784', Symbol: 'LI', Quantity: '100', AssetType: 'STOCK', PositionID: 'P2' });
+  stream.onData({ AccountID: '11957784', Symbol: 'ZERO', Quantity: '-80', AssetType: 'STOCK', PositionID: 'P3' });
+  assert.equal(queued.length, 0);
+  stream.onData({ StreamStatus: 'EndSnapshot' });
+
+  assert.equal(queued.length, 1);
+  const initial = queued[0].data.data;
+  assert.equal(initial.version, 1);
+  assert.equal(initial.event, 'snapshot');
+  assert.equal(initial.account, '11957784');
+  assert.equal(initial.live, true);
+  assert.equal(initial.complete, true);
+  assert.equal(initial.reason, 'initial');
+  assert.equal(initial.streamGeneration, 1);
+  assert.equal(initial.positions.length, 3);
+  const pins = initial.positions.find((item) => item.positionId === 'P1');
+  assert.deepEqual(JSON.parse(JSON.stringify(pins)), {
+    symbol: 'PINS260904P00022000',
+    upstreamSymbol: 'PINS 260904P22',
+    positionId: 'P1',
+    assetType: 'OPT',
+    quantity: -100,
+    averagePrice: 0.37,
+    upstreamTimestamp: '2026-09-04T10:00:00Z',
+  });
+
+  stream.onData({ AccountID: '11957784', Symbol: 'PINS 260904P22', Quantity: '-80', AssetType: 'OPT', PositionID: 'P1' });
+  assert.equal(queued.length, 2);
+  const change = queued[1].data.data;
+  assert.equal(change.event, 'change');
+  assert.equal(change.previousQuantity, -100);
+  assert.equal(change.quantity, -80);
+  assert.equal(change.delta, 20);
+  stream.onData({ AccountID: '11957784', Symbol: 'PINS 260904P22', Quantity: '-80', AssetType: 'OPT', PositionID: 'P1' });
+  assert.equal(queued.length, 2);
+
+  stream.onData({ AccountID: '11957784', Symbol: 'ZERO', Quantity: '0', AssetType: 'STOCK', PositionID: 'P3' });
+  assert.equal(queued.length, 3);
+  assert.equal(queued[2].data.data.previousQuantity, -80);
+  assert.equal(queued[2].data.data.quantity, 0);
+  assert.equal(queued[2].data.data.delta, 80);
+  assert.equal(zeroVisible, true);
+  assert.equal(positions.getPosition({ account: '11957784', symbol: 'ZERO' }), null);
+
+  stream.onData({ StreamStatus: 'GoAway' });
+  stream.onData({ StreamStatus: 'Heartbeat' });
+  stream.onData({ Symbol: 'PINS 260904PXX', AssetType: 'OPT', Quantity: '1', PositionID: 'BAD' });
+  assert.equal(queued.length, 3);
+  assert.equal(positions.getPosition({ account: '11957784', symbol: 'PINS 260904PXX' }), null);
+
+  stream.onStatus({ state: 'active', reason: 'reconnected', terminal: false });
+  stream.onData({ AccountID: '11957784', Symbol: 'LI', Quantity: '100', AssetType: 'STOCK', PositionID: 'P2' });
+  failDelivery = true;
+  stream.onData({ StreamStatus: 'EndSnapshot' });
+  assert.equal(queued.length, 4);
+  const reconnected = queued[3].data.data;
+  assert.equal(reconnected.event, 'snapshot');
+  assert.equal(reconnected.reason, 'reconnected');
+  assert.equal(reconnected.streamGeneration, 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(reconnected.positions.map((item) => item.symbol))), ['LI']);
+  assert.equal(positions.getPosition({ account: '11957784', symbol: 'PINS260904P00022000' }), null);
+  assert.equal(stream.state, 'active');
+  assert.equal(streams.length, 2);
+  assert.equal(refreshes, 0);
+  assert.ok(logs.some((entry) => entry[1] === 'brokerage position symbol invalid' && entry[2].positionId === 'BAD'));
+  assert.ok(
+    logs.some((entry) => entry[1] === 'brokerage position downstream' && entry[2].state === 'failed' && entry[2].kind === 'snapshot'),
+  );
 });
 
 test('deleteClient closes brokerage streams through client close', async () => {
