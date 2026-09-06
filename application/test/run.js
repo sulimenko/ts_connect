@@ -3608,21 +3608,62 @@ test('orders REST helper bounds network and read timeouts to two attempts', asyn
   assert.equal(timeoutAttempts, 2);
 });
 
+test('orders REST helper bounds native fetch DNS and connect timeout failures', async () => {
+  for (const code of ['ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']) {
+    for (const recover of [true, false]) {
+      let attempts = 0;
+      const helper = loadExpressionModule('application/lib/ts/orders.js', {
+        setTimeout: (fn, delay) => {
+          const timer = { cleared: false };
+          if (delay < 7000) Promise.resolve().then(() => !timer.cleared && fn());
+          return timer;
+        },
+        clearTimeout: (timer) => {
+          timer.cleared = true;
+        },
+        lib: {
+          ts: {
+            send: async () => {
+              attempts += 1;
+              if (recover && attempts === 2) return { Errors: [], Orders: [{ OrderID: code }] };
+              throw Object.assign(new TypeError('fetch failed'), { cause: { code } });
+            },
+          },
+        },
+      });
+
+      if (recover) {
+        const response = await helper({ account: 'A1', token: 'token' });
+        assert.equal(response.orders[0].OrderID, code);
+      } else {
+        const error = await helper({ account: 'A1', token: 'token' }).catch((caught) => caught);
+        assert.equal(error.code === 'ETIMEOUT', code === 'UND_ERR_CONNECT_TIMEOUT');
+      }
+      assert.equal(attempts, 2);
+    }
+  }
+});
+
 test('orders REST helper rejects application TypeError without retry', async () => {
-  let attempts = 0;
-  const helper = loadExpressionModule('application/lib/ts/orders.js', {
-    lib: {
-      ts: {
-        send: async () => {
-          attempts += 1;
-          throw new TypeError('Cannot read properties of undefined');
+  for (const error of [
+    new TypeError('Cannot read properties of undefined'),
+    Object.assign(new TypeError('fetch failed'), { cause: { code: 'ERR_TLS_CERT_ALTNAME_INVALID' } }),
+  ]) {
+    let attempts = 0;
+    const helper = loadExpressionModule('application/lib/ts/orders.js', {
+      lib: {
+        ts: {
+          send: async () => {
+            attempts += 1;
+            throw error;
+          },
         },
       },
-    },
-  });
+    });
 
-  await assert.rejects(helper({ account: 'A1', token: 'token' }), TypeError);
-  assert.equal(attempts, 1);
+    await assert.rejects(helper({ account: 'A1', token: 'token' }), TypeError);
+    assert.equal(attempts, 1);
+  }
 });
 
 test('orders REST helper stops timeout retry when deadline cannot fit backoff', async () => {
