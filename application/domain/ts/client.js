@@ -96,6 +96,33 @@ async () => ({
     return true;
   },
 
+  sendPosition({ position }) {
+    const details = {
+      event: 'brokerage.position.downstream',
+      account: position.account,
+      kind: position.event,
+      symbol: position.symbol,
+    };
+    try {
+      console.debug('brokerage position downstream', { ...details, state: 'queued' });
+      domain.queue.addTask({
+        endpoint: ['response'],
+        data: { type: 'position', data: position },
+        onSuccess: () => console.debug('brokerage position downstream', { ...details, state: 'delivered' }),
+        onFailure: (error) =>
+          console.warn('brokerage position downstream', {
+            ...details,
+            state: 'failed',
+            error: error?.message ?? error,
+          }),
+      });
+      return true;
+    } catch (error) {
+      console.warn('brokerage position downstream', { ...details, state: 'failed', error: error?.message ?? error });
+      return false;
+    }
+  },
+
   async hydrateOrder({ live, account, order }) {
     let merged = domain.ts.orders.merge({ live, account, order });
     if (domain.ts.orders.missing(merged).length === 0) return { order: merged, source: 'cache' };
@@ -462,16 +489,141 @@ async () => ({
 
       const endpoint = ['brokerage', 'stream', 'accounts', account, 'positions'];
 
+      let generation = 1;
+      let snapshot = new Map();
+      let snapshotActive = true;
+      let snapshotReason = 'initial';
+      let snapshotValid = true;
+      let invalidPacketCount = 0;
+
+      const rejectPosition = (message, reason) => {
+        if (snapshotActive) {
+          snapshotValid = false;
+          invalidPacketCount += 1;
+        }
+        console.warn('brokerage position invalid', {
+          event: 'brokerage.position.invalid',
+          account,
+          streamKey: key,
+          generation,
+          reason,
+          upstreamSymbol: message?.Symbol,
+          positionId: message?.PositionID,
+          snapshotActive,
+        });
+      };
+
       const onData = (message) => {
         try {
-          if (message?.StreamStatus) return;
-          const symbol = lib.utils.makeSymbol(message.Symbol)?.symbol ?? null;
-          if (!symbol) return;
-          const accountId = message.AccountID ?? account;
-          const position = domain.ts.positions.setPosition({ account: accountId, symbol, data: message });
-          if (lib.utils.readPositionQuantity(position) === 0) {
-            domain.ts.positions.clearPosition({ account: accountId, symbol });
+          if (message?.StreamStatus) {
+            if (message.StreamStatus !== 'EndSnapshot' || !snapshotActive) return;
+            if (!snapshotValid) {
+              console.warn('brokerage position snapshot', {
+                event: 'brokerage.position.snapshot',
+                account,
+                streamKey: key,
+                generation,
+                reason: snapshotReason,
+                invalidPacketCount,
+                state: 'invalid',
+              });
+              snapshotActive = false;
+              snapshot.clear();
+              return;
+            }
+            const completed = domain.ts.positions.replaceAccount({ account, items: [...snapshot.values()] });
+            if (!completed) return;
+            const position = {
+              version: 1,
+              event: 'snapshot',
+              source: 'tradestation',
+              account,
+              live: contract.live,
+              complete: true,
+              reason: snapshotReason,
+              streamGeneration: generation,
+              positions: completed.positions,
+            };
+            console.debug('brokerage position snapshot', {
+              account,
+              reason: snapshotReason,
+              streamKey: key,
+              generation,
+              positionsCount: completed.positions.length,
+              removedCount: completed.removedCount,
+              changedCount: completed.changedCount,
+              state: 'completed',
+            });
+            this.sendPosition({ position });
+            snapshotActive = false;
+            snapshot.clear();
+            return;
           }
+          const packetAccount = message?.AccountID;
+          const accountId = packetAccount === undefined || packetAccount === null ? account : `${packetAccount}`.trim();
+          if (accountId !== account) {
+            rejectPosition(message, 'account_mismatch');
+            return;
+          }
+          const upstreamSymbol = message?.Symbol;
+          const parsed = lib.utils.makeSymbol(upstreamSymbol);
+          const symbol = parsed && (message?.AssetType !== 'OPT' || parsed.type === 'OPT') ? parsed.symbol : null;
+          if (!symbol) {
+            rejectPosition(message, 'invalid_symbol');
+            return;
+          }
+          const rawQuantity = message?.Quantity;
+          const quantity = Number(rawQuantity);
+          if (
+            !['number', 'string'].includes(typeof rawQuantity) ||
+            (typeof rawQuantity === 'string' && rawQuantity.trim() === '') ||
+            !Number.isFinite(quantity)
+          ) {
+            rejectPosition(message, 'invalid_quantity');
+            return;
+          }
+          const previous = domain.ts.positions.getPosition({ account: accountId, symbol });
+          const previousQuantity = lib.utils.readPositionQuantity(previous);
+          const position = domain.ts.positions.setPosition({ account: accountId, symbol, data: message });
+          if (snapshotActive) {
+            if (quantity === 0) snapshot.delete(symbol);
+            else snapshot.set(symbol, { symbol, data: { ...message, AccountID: accountId } });
+            if (quantity === 0) domain.ts.positions.clearPosition({ account: accountId, symbol });
+            return;
+          }
+          if (quantity === previousQuantity) {
+            if (quantity === 0) domain.ts.positions.clearPosition({ account: accountId, symbol });
+            return;
+          }
+          const record = domain.ts.positions.toRecord({ symbol, position });
+          if (!record) {
+            if (quantity === 0) domain.ts.positions.clearPosition({ account: accountId, symbol });
+            return;
+          }
+          const change = {
+            version: 1,
+            event: 'change',
+            source: 'tradestation',
+            account,
+            live: contract.live,
+            complete: false,
+            reason: 'stream',
+            streamGeneration: generation,
+            ...record,
+            previousQuantity,
+            delta: quantity - previousQuantity,
+          };
+          console.debug('brokerage position change', {
+            account,
+            symbol,
+            positionId: record.positionId,
+            previousQuantity,
+            quantity,
+            delta: change.delta,
+            generation,
+          });
+          this.sendPosition({ position: change });
+          if (quantity === 0) domain.ts.positions.clearPosition({ account: accountId, symbol });
         } catch (error) {
           console.error('Error processing position message:', error);
         }
@@ -491,6 +643,22 @@ async () => ({
       const onStatus = (status) => {
         if (!stream) return;
         stream.state = status.state;
+        if (status.state === 'active' && status.reason === 'reconnected') {
+          generation += 1;
+          snapshot = new Map();
+          snapshotActive = true;
+          snapshotReason = 'reconnected';
+          snapshotValid = true;
+          invalidPacketCount = 0;
+        }
+        console.debug('brokerage position stream', {
+          account,
+          streamKey: key,
+          state: status.state,
+          reason: status.reason,
+          generation,
+          brokerageReady: this.brokerage.ready,
+        });
         if (status.terminal || ['failed', 'stopped'].includes(status.state)) {
           this.brokerage.ready = false;
           const authorization = status.error?.classification === 'authorization' || status.reason === 'upstream.authorization';
