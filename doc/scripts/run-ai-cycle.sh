@@ -1,3 +1,3 @@
 #!/usr/bin/env bash
 set -euo pipefail
-exec "${AI_PIPELINE_HOME:-$HOME/.codex/ai-pipeline}/bin/run-ai-cycle.sh" "$@"
+exec "${AI_PIPELINE_HOME:-$HOME/.ai-pipeline}/bin/run-ai-cycle.sh" "$@"

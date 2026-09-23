@@ -1,301 +1,152 @@
-# ts_connect
+# ts_connect — AI Pipeline v8.2
 
-Локальные правила `ts_connect` для AI Pipeline v8.
+Repository: `sulimenko/ts_connect`.
 
-Repo: `sulimenko/ts_connect`.
-
-Всегда писать задачи, уточняющие вопросы, review, follow-up задачи и критерии готовности на русском языке.
-
-## Документация
-
-- `doc/blueprint.md` — архитектурные правила, слои, контракт процедур, stream lifecycle.
-- `doc/openapi_20260411.md` — компактный индекс и дополнение по snapshot TradeStation OpenAPI от 2026-04-11.
-- `doc/ai/chatgpt/project-settings.md` — правила AI Pipeline v8 для проекта.
-- `doc/ai/chatgpt/architect.instructions.md` — обязательные role-specific правила Architect для анализа, task draft и архитектурных решений.
-- `doc/ai/chatgpt/reviewer.instructions.md` — обязательные role-specific правила Reviewer.
-- `doc/ai/chatgpt/task-template.md` — шаблон task contract.
-- `doc/ai/chatgpt/followup-template.md` — шаблон follow-up к открытому PR.
-- `doc/ai/chatgpt/review-checklist.md` — review-checklist для PR.
-- `doc/ai/project-checks.sh` — project-specific validation wrapper.
-- `doc/tasks/ready/*.md` — активные задачи для runner.
-- `doc/tasks/done/*.md` — закрытые/перенесённые task files.
-- `doc/task.md` — legacy task history после миграции.
-- `doc/review.md` — legacy review history после миграции.
-- `doc/changelog.md` — архив закрытых задач и заключений.
+Все tasks, review, follow-up и acceptance criteria писать на русском языке.
 
 ## Instruction precedence
 
-Правила читаются и применяются в следующем порядке:
+1. Direct user instruction.
+2. Active `ai-task-contract`.
+3. This `AGENTS.md`.
+4. `doc/ai/chatgpt/project-settings.md`.
+5. Shared AI Pipeline v8.2 policy.
+6. `doc/blueprint.md` and project-specific documentation.
 
-1. Явная текущая инструкция пользователя для конкретной работы.
-2. Активный `ai-task-contract` — источник истины для scope, routing, validation и PR behavior уже созданной runner-задачи.
-3. `AGENTS.md` — общие обязательные инварианты проекта и эта таблица precedence.
-4. Role-specific instructions:
-   - `doc/ai/chatgpt/architect.instructions.md` для Architect/task preparation;
-   - `doc/ai/chatgpt/reviewer.instructions.md` для review.
-5. `doc/ai/chatgpt/project-settings.md` — shared AI Pipeline v8 rules.
-6. `doc/blueprint.md` — архитектурные и runtime-инварианты сервиса.
-7. `task-template.md`, `followup-template.md`, `review-checklist.md` — templates/checklists; они не могут переопределять документы выше.
-8. `doc/task.md` и `doc/review.md` — только legacy/history и никогда не являются источником активных правил или задач.
+## Shared pipeline
 
-Если документы одного уровня конфликтуют, действует более узкое правило для текущей роли/области, но оно не может отменить правило более высокого уровня.
+Version: `8.2.0`.
 
-Если новая инструкция пользователя меняет уже созданный `ai-task-contract`, Architect не должен молча выполнять задачу вне contract: сначала нужно явно обновить/создать подходящую task/follow-up.
+Local runtime:
 
-### Impress optional metadata
+`~/.ai-pipeline/`
 
-Metarhia/Impress допускает simple API function и extended declaration.
+ChatGPT-readable policy:
 
-Поля extended declaration `access`, `parameters`, `returns`, `errors`, `validate` являются optional по framework contract. Их отсутствие само по себе не является defect или review blocker.
+`ai-task-queue:doc/pipeline/v8.2.0/`
 
-Конкретное optional поле становится обязательным только если:
+## Roles
 
-- пользователь явно потребовал его в текущей работе;
-- `ai-task-contract` явно требует его;
-- существующее поведение уже зависит от этого поля и изменение/удаление изменит runtime semantics.
+- ChatGPT = Architect + Final Reviewer.
+- Kimi K3 = Researcher and optional Executor.
+- GPT-6 Astra = default Executor.
+- Runner owns queue/git/scope/validation/runtime verification/commit/push/PR.
+- Codex read-only = Runtime Verifier.
+- Codex/Kimi = Test Author.
 
-Если пользователь явно просит не добавлять или не проверять descriptive/optional Impress metadata в текущей задаче, отсутствие этих полей не должно блокировать task или PR.
+## Repository
 
-При этом существующие `access`, schemas, validation и error mappings нельзя молча удалять или ослаблять: если они уже влияют на runtime behavior, review проверяет сохранение их семантики.
+Base: `develop`.
 
-## Repo access
+Queue: `ai-task-queue`.
 
-ChatGPT работает с `sulimenko/ts_connect` только через GitHub connector или через файлы, приложенные пользователем.
+Contract:
 
-Не предлагать `git clone` для `ts_connect`.
+`version: 8.2.0`
 
-Если нужен локальный запуск, проверка, runner или git-команды — команды даются пользователю или Local Watcher.
+## Runtime
 
-## AI Pipeline v8
+Node.js 24 required.
 
-Base branch: `develop`.
+Bootstrap:
 
-Queue branch: `ai-task-queue`.
+`~/.ai-pipeline/projects/<repo-key>/env.sh`
 
-Project runner:
+## Sources of truth
 
-```bash
-bash doc/scripts/watch-and-run-tasks.sh
-```
+- `doc/blueprint.md`
+- `doc/openapi_20260411.md`
+- relevant current production code
+- official compatible Impress contract
+- official TradeStation API contract
 
-Run once:
+## Layers
 
-```bash
-RUN_ONCE=1 bash doc/scripts/watch-and-run-tasks.sh
-```
+- `application/api/` — RPC contract, access, validation, orchestration.
+- `application/domain/` — state, lifecycle, registries, cleanup, multiplex subscriptions.
+- `application/lib/` — TradeStation transport/protocol/parsing/normalization.
+- `config/` — configuration only.
+- `types/` — typing.
 
-Runner читает `ai-task-contract` как источник правды.
-
-Активные задачи создаются только в:
-
-```text
-doc/tasks/ready/*.md
-```
-
-## Task ID and branch naming
-
-- Перед draft новой задачи ChatGPT должен найти максимальный завершённый `T-NNN` в `doc/changelog.md`, `doc/task.md` и `doc/tasks/done/*.md`.
-- Следующий task ID получает `T-NNN`, где `NNN = max existing + 1`.
-- Если создаётся несколько primary tasks одновременно, номера идут последовательно.
-- Work branch должен начинаться с `ai/T-NNN-...`.
-- Название задачи в markdown: `# Task T-NNN: <short title>`.
-- `task_id` в `ai-task-contract` должен быть только `T-NNN`, без slug.
-
-## Naming style
-
-- Имена функций и переменных должны быть лаконичными.
-- 1 слово лучше 2, 2 слова лучше 3.
-- Длинное имя допустимо только если короткое теряет смысл или создаёт ambiguity.
-- Не вводить helper/function/class только ради декоративной абстракции.
-
-`doc/task.md` больше не является источником активных задач.
-
-## Роли
-
-ChatGPT = Architect + Reviewer.
-
-Runner = git / scope / validation / commit / PR executor.
-
-Codex = bounded code editor.
-
-Codex не управляет git: не создаёт branch, commit, push или PR. Это делает runner.
-
-ChatGPT не меняет production code напрямую, кроме явного запроса пользователя.
-
-## Создание задач
-
-Перед созданием каждой GH task ChatGPT обязан сначала показать человеку draft задачи в writing block.
-
-Только после явной команды “создай задачу в GH” ChatGPT создаёт task markdown в `ai-task-queue`.
-
-Task markdown должен содержать machine-readable block:
-
-```ai-task-contract
-...
-```
-
-Opening fence должен быть строго ` ```ai-task-contract ` без `id`, `yaml`, attributes или metadata.
-
-Обязательные поля contract:
-
-- `version`
-- `task_id`
-- `type`
-- `human_summary`
-- `execution_mode`
-- `git`
-- `scope`
-- `tests`
-- `pr`
-- `validation`
-- `diff_budget`
-- `commit`
-
-## Git routing
-
-Primary task:
-
-```yaml
-type: primary
-git:
-  base_branch: develop
-  queue_branch: ai-task-queue
-  parent_branch: none
-  work_branch: ai/T-NNN-short-title
-  work_branch_policy: create_task_branch
-  allow_new_branch: true
-  allow_codex_git: false
-pr:
-  mode: create_new
-  base: develop
-```
-
-ChatGPT не должен придумывать `T-NNN`; сначала проверить историю задач.
-
-Follow-up к открытому PR:
-
-```yaml
-type: follow_up
-git:
-  base_branch: develop
-  queue_branch: ai-task-queue
-  parent_branch: ai/T-XXX-...
-  work_branch_policy: continue_parent_branch
-  allow_new_branch: false
-  allow_codex_git: false
-pr:
-  mode: update_existing_parent_pr
-  base: develop
-```
-
-Follow-up создаётся только после review результата и только при реальном gap.
-
-No silent fallback: если routing follow-up невалидный, задача должна fail, а не превращаться в primary.
-
-## Scope
-
-Каждая задача должна явно задавать `allowed_files` и `forbidden_files`.
-
-По умолчанию запрещать:
-
-- `doc/tasks/**`
-- `doc/ai/**`
-- `node_modules/**`
-- `coverage/**`
-- `dist/**`
-- generated logs / artifacts
-
-В обычных production задачах запрещать `doc/**`, если задача явно не documentation/workflow.
-
-## Слои
-
-- `application/api/` — публичные Impress RPC-процедуры: contract, access, validation, orchestration; не хранит state, не делает reconnect.
-- `application/domain/` — server-side state, lifecycle, registries, cleanup, multiplex subscriptions.
-- `application/lib/` — TradeStation HTTP/stream adapters, protocol, parsing, normalization helpers.
-- `config/` — только `process.env` -> config; без бизнес-логики.
-- `types/` — global/service typing.
+API layer does not own reconnect/state registries.
 
 ## TradeStation
 
-- OAuth lifecycle: `lib.ts.refresh` -> `access_token` + `expires`; auto-refresh до expiry.
-- Stream lifecycle: subscribe -> touch -> unsubscribe; idle cleanup; `client.close` cleanup.
-- `domain.ts.clients` — single-flight setup через `connecting[name]` + `waiters[name]`.
-- `domain.ts.streams` — multiplex подписчиков, stable `streamKey`.
-- `lib.ts.stream` — upstream HTTP stream с reconnect, heartbeat, JSON line parser.
-- Defensive guards на shape ответов TradeStation обязательны.
-- `INVALID SYMBOL` не должен запускать бесконечный reconnect.
-- `GoAway` / `StreamStatus: 'GoAway'` остаются transient stream events, для которых reconnect ожидаем.
+- OAuth lifecycle: refresh -> `access_token` + `expires`.
+- Stream lifecycle: subscribe -> touch -> unsubscribe -> cleanup.
+- `domain.ts.clients` uses single-flight `connecting[name]` + `waiters[name]`.
+- `domain.ts.streams` owns multiplex subscribers and stable `streamKey`.
+- `lib.ts.stream` owns upstream HTTP stream/reconnect/heartbeat/parser.
+- External response shape must be guarded.
+- `INVALID SYMBOL` must not create infinite reconnect.
+- `GoAway` / `StreamStatus: GoAway` remain transient reconnect events.
 
-## Symbol contract
+## Symbols
 
-- Все symbol parsing/formatting должны идти через `lib.utils`.
-- Основные точки входа: `makeSymbol()` и `makeTSSymbol()`.
-- `makeSymbol()` возвращает canonical back/metaterminal symbol.
-- `makeTSSymbol()` возвращает TradeStation upstream symbol.
-- Не собирать OPT symbol вручную через локальные regex + `padStart` / `padEnd` в endpoint-ах, stream parsers или response mappers.
+All parsing/formatting goes through `lib.utils`.
+
+Public helpers:
+
+- `makeSymbol()`
+- `makeTSSymbol()`
+
+Do not manually construct OPT symbols in endpoints/parsers/mappers.
 
 ## Impress
 
-- Impress допускает simple API function `async ({ ... }) => ...` и extended declaration `({ ... })`.
-- Для extended declaration `method` является точкой выполнения.
-- `access`, `parameters`, `returns`, `errors`, `validate` optional по framework contract.
-- Не требовать эти optional поля только потому, что public API файл был создан или затронут.
-- Если optional поле уже существует, его runtime semantics должны быть сохранены.
-- Если behavior зависит от `DomainError`, access policy, schema validation или result validation, соответствующий contract должен оставаться согласованным.
-- Явное требование пользователя или `ai-task-contract` имеет приоритет и может сделать конкретные optional fields обязательными для данной задачи.
-- Файлы экспортируют единственную функцию или объект: `({...}) => { ... }` или `({ ... })`.
-- Глобальные пространства: `lib.*`, `domain.*`, `config.*`, `application.*`.
-- Нельзя делать import-time side effects в файлах, которые загружает общий aggregator.
-- Один файл = одна функция в `application/lib/name/`.
-- Не помещать несколько функций в один `lib/` файл через object export.
-- `domain` файлы экспортируют объект `({...})` с методами и state как registry/singleton.
-- Методы `domain` используют `this.*` для доступа к state объекта.
+Both simple API function and extended declaration with `method` are valid.
 
-## Ошибки
+`access`, `parameters`, `returns`, `errors`, `validate` are optional unless:
 
-- `DomainError` — только для предсказуемых бизнес-ошибок публичного контракта.
-- `Error` — для багов, transport failures и unexpected integration failures.
+- user explicitly requires them;
+- task contract requires them;
+- existing runtime semantics depend on them.
 
-## Validation
+Existing runtime-relevant metadata must not be silently removed or weakened.
 
-Стандартная validation:
+No import-time side effects in autoloaded modules.
 
-```bash
-npm test
-```
+One `application/lib/<name>/` file exports one function.
 
-При необходимости явно:
+Domain objects may hold singleton/registry state using `this.*`.
 
-```bash
-npm run lint
-npm run types
-npm test
-```
+## Errors
 
-## Review
+`DomainError` only for predictable public/business contract errors.
 
-Review должен проверить:
+`Error` for bugs, transport failures and unexpected integration failures.
 
-- branch/base;
-- task contract compliance;
-- changed files vs allowed/forbidden scope;
-- отсутствие workflow artifacts;
-- validation;
-- tests, если required;
-- Impress procedure contract;
-- API/domain/lib boundaries;
-- TradeStation response guards;
-- stream lifecycle;
-- symbol contract;
-- DomainError vs Error;
-- реальные behavioral gaps.
+## Tests
 
-Итог писать строго одним из вариантов:
+Use:
 
-```text
-Review status: blocked
-```
+`tests.strategy: none | before | after_verification | both`
 
-```text
-Review status: merge-ready
-```
+Validation baseline:
+
+`npm test`
+
+## Evidence
+
+Raw:
+
+`~/.ai-pipeline/runs/...`
+
+Compact:
+
+`ai-task-queue:doc/tasks/evidence/T-XXX-summary.md`
+
+Research:
+
+`ai-task-queue:doc/tasks/research/R-XXX-*`
+
+## Safety
+
+Without explicit approval:
+
+- no `.env` or secrets;
+- no dependencies/lockfiles;
+- no production config;
+- no unrelated refactor;
+- no generated artifacts;
+- no destructive production actions.
