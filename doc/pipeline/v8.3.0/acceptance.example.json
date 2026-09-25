@@ -1,0 +1,23 @@
+{
+  "schema": "manual-acceptance/8.3",
+  "repo": "sulimenko__back.ptfin",
+  "task_id": "T-001",
+  "contract_revision": 1,
+  "contract_hash": "REPLACE_WITH_IMPLEMENTATION_CONTRACT_HASH",
+  "branch": "ai/T-001-fixture",
+  "accepted_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "accepted_by": "REPLACE_WITH_HUMAN",
+  "accepted_at": "2026-09-25T12:00:00+00:00",
+  "verdict": "accepted",
+  "permits_test_only": true,
+  "implementation_receipt": "doc/tasks/evidence/T-001-r1-receipt.json",
+  "scenarios": [
+    {
+      "id": "M01",
+      "actual": "REPLACE_WITH_ACTUAL_MANUAL_RESULT",
+      "result": "pass"
+    }
+  ],
+  "deferred_acknowledged": [],
+  "user_reference": "REPLACE_WITH_EXPLICIT_CHAT_CONFIRMATION"
+}
