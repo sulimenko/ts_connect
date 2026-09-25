@@ -1,30 +1,15 @@
-# ts_connect Final Reviewer — AI Pipeline v8.2
+# reviewer.instructions.md - AI Pipeline v8.3
 
-Review actual remote PR head, accepted task contract and evidence.
+Проект: `sulimenko/ts_connect`; runtime: `node24`.
 
-Check:
+Читать `AGENTS.md`, `doc/ai/project-invariants.md`, `doc/ai/chatgpt/project-settings.md` и релевантный код/модульную документацию.
 
-- branch/base;
-- exact scope;
-- API/domain/lib boundaries;
-- Impress runtime contract;
-- TradeStation response guards;
-- stream lifecycle;
-- symbol contract;
-- DomainError/Error semantics;
-- validation;
-- runtime verification;
-- tests according to `tests.strategy`;
-- remaining risks.
+Canonical правила и шаблоны находятся на ветке `ai-task-queue` в `doc/pipeline/v8.3.0/`:
+- `contract-schema.md`, `router-policy.md`, `worker-rules.md`, `verification-policy.md`;
+- `implementation.example.md`, `test-only.example.md`, `acceptance.example.json`.
 
-Evidence:
+Technical Architect исследует до окончательного ТЗ. ChatGPT принимает/разрешает каждое существенное замечание. Новую задачу создавать только после явного разрешения пользователя. Tests создаются отдельно после ручной приёмки реализации. Docker вне автоматического pipeline; сложный SQL — в ручных сценариях.
 
-`ai-task-queue:doc/tasks/evidence/T-XXX-summary.md`
+Перед review читать exact remote PR head и receipt/handoff на `ai-task-queue`. Локальные raw-файлы недоступны ChatGPT автоматически; при необходимости пользователь передаёт только ограниченные и проверенные на секреты выдержки.
 
-Conclusion:
-
-`Merge ready`
-
-or:
-
-`Blocked`
+Не объявлять CLI exit=0, zero tests или `No ready tasks` доказательством полного workflow. Staging только `git add -A`; исполнители не владеют Git. Старые v8.2 task/review mechanics не переопределяют v8.3.

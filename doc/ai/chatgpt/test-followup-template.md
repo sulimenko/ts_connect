@@ -1,4 +1,4 @@
-# architect.instructions.md - AI Pipeline v8.3
+# test-followup-template.md - AI Pipeline v8.3
 
 Проект: `sulimenko/ts_connect`; runtime: `node24`.
 

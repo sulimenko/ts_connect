@@ -1,152 +1,41 @@
-# ts_connect — AI Pipeline v8.2
+# ts_connect — AI Pipeline v8.3
 
-Repository: `sulimenko/ts_connect`.
+Репозиторий: `sulimenko/ts_connect`. Язык задач, объяснений, архитектурных отчётов и review — русский.
 
-Все tasks, review, follow-up и acceptance criteria писать на русском языке.
+## Источники и приоритет
 
-## Instruction precedence
+Явная инструкция пользователя → согласованный контракт → этот файл → `doc/ai/project-invariants.md` и project settings → shared policy.
+Перед новой работой читать этот файл, `doc/ai/chatgpt/project-settings.md`, соответствующие инструкции роли и релевантную архитектуру проекта. Не переносить архитектурные правила из другого проекта.
 
-1. Direct user instruction.
-2. Active `ai-task-contract`.
-3. This `AGENTS.md`.
-4. `doc/ai/chatgpt/project-settings.md`.
-5. Shared AI Pipeline v8.2 policy.
-6. `doc/blueprint.md` and project-specific documentation.
+Shared policy: ветка `ai-task-queue`, каталог `doc/pipeline/v8.3.0/`. Читать `contract-schema.md`, `worker-rules.md`, `verification-policy.md`, `router-policy.md` и подходящий шаблон. Старые v8.2 контракты не исполняются автоматически.
 
-## Shared pipeline
+## Роли и цикл
 
-Version: `8.2.0`.
+ChatGPT — владелец бизнес-цели, окончательного ТЗ и Final Review. Локальный Technical Architect — один исследовательский проход и единый handoff со всеми рекомендациями, а не критик на каждом повторе. Исполнители: Codex GPT-6 Astra low/medium либо Kimi K3. Runner владеет Git, очередью, командами и отчётами; агент не управляет Git.
 
-Local runtime:
+Цикл: цель → Technical Architect при необходимости → отчёт пользователем в ChatGPT → окончательный draft → явное разрешение пользователя → implementation → автоматические наблюдения → checkpoint/Draft PR → ручная проверка → явное принятие конкретной реализации → отдельная test-only задача → Final Review → решение пользователя о merge.
 
-`~/.ai-pipeline/`
+## Git
 
-ChatGPT-readable policy:
+Base: `develop`. Queue: `ai-task-queue`. Work: `ai/T-XXX-*`. Контракт: `version: 8.3.0`.
+Staging только `git add -A` без списка файлов; guards до и после staging. Посторонние изменения блокируют commit, а не включаются молча. Нельзя force-push, автоматический reset --hard или git clean. Очередь не сливается в production-ветку.
 
-`ai-task-queue:doc/pipeline/v8.2.0/`
+## Тесты и принятие
 
-## Roles
+В implementation нельзя создавать/изменять regression tests, fixtures или test setup, включая скрытый test harness в другой папке. Существующие релевантные проверки можно запускать без изменения. Заранее известные устаревшие expectations перечисляются как deferred; неизвестное падение не считается устаревшим автоматически.
 
-- ChatGPT = Architect + Final Reviewer.
-- Kimi K3 = Researcher and optional Executor.
-- GPT-6 Astra = default Executor.
-- Runner owns queue/git/scope/validation/runtime verification/commit/push/PR.
-- Codex read-only = Runtime Verifier.
-- Codex/Kimi = Test Author.
+Test-only допускается только по acceptance-записи с ручными результатами и отдельным разрешением тестов. Принятие фиксирует SHA, revision и contract hash. Изменение только разрешённых тестов не отменяет принятие production; изменение защищённых файлов — отменяет. Test Author не исправляет production и не ослабляет assertions.
 
-## Repository
+## Runtime и проверка
 
-Base: `develop`.
+Runtime профиля: `node24`. Machine-specific bootstrap: `~/.ai-pipeline/projects/<repo-key>/env.sh`.
+Docker не проверяется и не запускается автоматически. SQL только минимальный SELECT/неисполняющий EXPLAIN через подтверждённые readonly-права, с лимитами. Сложные сценарии и миграции пользователь выполняет вручную по согласованным командам. Успешный CLI, ноль выполненных тестов или пустая очередь не доказывают бизнес-корректность.
 
-Queue: `ai-task-queue`.
+## Безопасность и сохранение работы
 
-Contract:
-
-`version: 8.2.0`
-
-## Runtime
-
-Node.js 24 required.
-
-Bootstrap:
-
-`~/.ai-pipeline/projects/<repo-key>/env.sh`
-
-## Sources of truth
-
-- `doc/blueprint.md`
-- `doc/openapi_20260411.md`
-- relevant current production code
-- official compatible Impress contract
-- official TradeStation API contract
-
-## Layers
-
-- `application/api/` — RPC contract, access, validation, orchestration.
-- `application/domain/` — state, lifecycle, registries, cleanup, multiplex subscriptions.
-- `application/lib/` — TradeStation transport/protocol/parsing/normalization.
-- `config/` — configuration only.
-- `types/` — typing.
-
-API layer does not own reconnect/state registries.
-
-## TradeStation
-
-- OAuth lifecycle: refresh -> `access_token` + `expires`.
-- Stream lifecycle: subscribe -> touch -> unsubscribe -> cleanup.
-- `domain.ts.clients` uses single-flight `connecting[name]` + `waiters[name]`.
-- `domain.ts.streams` owns multiplex subscribers and stable `streamKey`.
-- `lib.ts.stream` owns upstream HTTP stream/reconnect/heartbeat/parser.
-- External response shape must be guarded.
-- `INVALID SYMBOL` must not create infinite reconnect.
-- `GoAway` / `StreamStatus: GoAway` remain transient reconnect events.
-
-## Symbols
-
-All parsing/formatting goes through `lib.utils`.
-
-Public helpers:
-
-- `makeSymbol()`
-- `makeTSSymbol()`
-
-Do not manually construct OPT symbols in endpoints/parsers/mappers.
-
-## Impress
-
-Both simple API function and extended declaration with `method` are valid.
-
-`access`, `parameters`, `returns`, `errors`, `validate` are optional unless:
-
-- user explicitly requires them;
-- task contract requires them;
-- existing runtime semantics depend on them.
-
-Existing runtime-relevant metadata must not be silently removed or weakened.
-
-No import-time side effects in autoloaded modules.
-
-One `application/lib/<name>/` file exports one function.
-
-Domain objects may hold singleton/registry state using `this.*`.
-
-## Errors
-
-`DomainError` only for predictable public/business contract errors.
-
-`Error` for bugs, transport failures and unexpected integration failures.
-
-## Tests
-
-Use:
-
-`tests.strategy: none | before | after_verification | both`
-
-Validation baseline:
-
-`npm test`
+Scope задаётся явно. Без разрешения нельзя менять secrets, credentials, зависимости/lockfiles, runtime/production config, схемы и несвязанный код. Raw-логи/DB-данные не публикуются автоматически. Один executor на репозиторий; другой компьютер не перехватывает зависший claim автоматически.
 
 ## Evidence
 
-Raw:
-
-`~/.ai-pipeline/runs/...`
-
-Compact:
-
-`ai-task-queue:doc/tasks/evidence/T-XXX-summary.md`
-
-Research:
-
-`ai-task-queue:doc/tasks/research/R-XXX-*`
-
-## Safety
-
-Without explicit approval:
-
-- no `.env` or secrets;
-- no dependencies/lockfiles;
-- no production config;
-- no unrelated refactor;
-- no generated artifacts;
-- no destructive production actions.
+Локально: `~/.ai-pipeline/runs/`. Shared handoff/receipts: `ai-task-queue:doc/tasks/evidence/`. Architecture: `doc/tasks/research/`. Acceptance: `doc/tasks/acceptance/`.
+Review проверяет exact remote head, контракт, scope, фактические автоматические результаты, ручные результаты и оставшиеся ограничения. Ответ: `Merge ready` либо `Blocked` с конкретной причиной. Не делать заявление о проверках, которых не было.
