@@ -1,67 +1,20 @@
-# ts_connect — AI Pipeline v8.2 project settings
+# ts_connect — настройки проекта v8.3
 
 Repository: `sulimenko/ts_connect`.
+Base: `develop`. Queue: `ai-task-queue`. Runtime: `node24`.
+Local runner: `~/.ai-pipeline/`; profile: `projects/<repo-key>/env.sh`.
 
-## Git
-
-Base: `develop`.
-
-Queue: `ai-task-queue`.
-
-## Runtime
-
-Required Node.js: `24`.
-
-Local bootstrap:
-
-`~/.ai-pipeline/projects/<repo-key>/env.sh`
-
-## Shared policy
-
-Canonical local pipeline:
-
-`~/.ai-pipeline/`
-
-ChatGPT-readable snapshot:
-
-`ai-task-queue:doc/pipeline/v8.2.0/`
-
-## Validation
-
-Default:
-
-    npm test
-
-Optional targeted:
+## Начальные проверки
 
     npm run lint
     npm run types
 
-Project wrapper:
+Команды конкретной задачи выводить из актуального package/composer и code path. Не запускать весь npm test автоматически, если он содержит заранее известные несовместимые expectations или внешние side effects. Существующий project-checks.sh сохранён миграцией; его реальные действия нужно учитывать при выборе команды.
 
-    BASE_BRANCH=develop CHECK_MODE=default bash doc/ai/project-checks.sh
+## Архитектура
 
-## Architecture sources
+`doc/ai/project-invariants.md` сохраняет проектные разделы прежнего AGENTS.md; проверьте diff миграции. Остальная модульная и продуктовая документация не переписывается.
 
-- `AGENTS.md`
-- `doc/blueprint.md`
-- `doc/openapi_20260411.md`
+## Shared policy
 
-## Project constraints
-
-Preserve:
-
-- API/domain/lib ownership;
-- TradeStation response guards;
-- stream lifecycle;
-- stable streamKey;
-- symbol contract;
-- Impress optional-metadata semantics;
-- DomainError/Error distinction.
-
-Without explicit approval:
-
-- no `.env`;
-- no secrets;
-- no dependency/lockfile changes;
-- no unrelated refactor.
+`ai-task-queue:doc/pipeline/v8.3.0/`. Implementation без изменения тестов → runtime observations → checkpoint/Draft PR → ручное принятие → отдельный test-only follow-up. Новые задачи имеют версию 8.3.0 и явное разрешение пользователя.

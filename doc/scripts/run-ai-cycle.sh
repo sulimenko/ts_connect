@@ -1,3 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-exec "${AI_PIPELINE_HOME:-$HOME/.ai-pipeline}/bin/run-ai-cycle.sh" "$@"
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+cd "$ROOT_DIR"
+exec "${AI_PIPELINE_HOME:-$HOME/.ai-pipeline}/bin/ai-pipeline" run "$@"
