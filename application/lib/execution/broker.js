@@ -1,26 +1,34 @@
 /* eslint-disable camelcase */
-async ({ action, data }) => {
+async ({ action, data, deadline }) => {
   const { account, live, orderId, credentials, intent } = data;
   const result = (state, broker = null) => ({ version: 2, orderId, state, broker });
-  if (typeof credentials.refresh_token !== 'string' || !credentials.refresh_token.trim()) {
+  const fingerprintOf = () => {
+    try {
+      return node.crypto.createHash('sha256').update(JSON.stringify(intent)).digest('hex');
+    } catch {
+      return null;
+    }
+  };
+  let attempt = domain.execution.attempts.get(data);
+  // A registered attempt takes precedence over ALL new intent/credential
+  // validation. No changed or malformed replay grants another broker POST.
+  if (action === 'submit' && attempt) {
+    return fingerprintOf() === attempt.fingerprint ? attempt.result || result('ambiguous') : result('ambiguous');
+  }
+  const validId = (value) => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+  const suppliedId = Object.hasOwn(data, 'brokerId');
+  if (action === 'lookup' && suppliedId && (!validId(data.brokerId) || (attempt?.brokerId && attempt.brokerId !== data.brokerId))) {
+    return result('source_unavailable');
+  }
+  const brokerId = attempt?.brokerId || data.brokerId;
+  if (action === 'lookup' && !validId(brokerId)) return result('source_unavailable');
+  if (
+    !credentials ||
+    !['pkey', 'secret', 'refresh_token'].every((name) => typeof credentials[name] === 'string' && credentials[name].trim())
+  ) {
     return result(action === 'submit' ? 'rejected' : 'source_unavailable');
   }
   const base = live ? 'https://api.tradestation.com/v3' : 'https://sim-api.tradestation.com/v3';
-  const brokerOf = (row) => {
-    const states = {
-      ACK: 'accepted',
-      OPN: 'pending',
-      FPR: 'part_filled',
-      FLL: 'filled',
-      OUT: 'cancelled',
-      REJ: 'rejected',
-      EXP: 'expired',
-    };
-    const id = row?.OrderID;
-    const state = states[row?.Status];
-    return typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id) && state ? { terminal_id: id, state } : null;
-  };
-  let attempt = domain.execution.attempts.get(data);
   let body;
   if (action === 'submit') {
     const quantity = intent?.quantity;
@@ -34,19 +42,26 @@ async ({ action, data }) => {
       typeof intent.symbol !== 'string' ||
       !Number.isSafeInteger(quantity) ||
       quantity === 0 ||
+      typeof intent.type !== 'string' ||
       !Object.hasOwn(types, intent.type) ||
+      typeof intent.tif !== 'string' ||
       !Object.hasOwn(tifs, intent.tif) ||
       intent.relation !== 'NORMAL' ||
       !Array.isArray(intent.related) ||
       intent.related.length ||
+      typeof intent.extended !== 'boolean' ||
       intent.extended ||
       (['limit', 'stop_limit'].includes(intent.type) && !price(intent.limitPrice)) ||
-      (['stop', 'stop_limit'].includes(intent.type) && !price(intent.stopPrice))
+      (['stop', 'stop_limit'].includes(intent.type) && !price(intent.stopPrice)) ||
+      (!['limit', 'stop_limit'].includes(intent.type) && intent.limitPrice !== null) ||
+      (!['stop', 'stop_limit'].includes(intent.type) && intent.stopPrice !== null)
     ) {
       return result('rejected');
     }
     let symbol;
     try {
+      const parsed = lib.utils.makeSymbol(intent.symbol);
+      if (parsed?.type !== category) return result('rejected');
       symbol = lib.utils.makeTSSymbol(intent.symbol, category);
     } catch {
       return result('rejected');
@@ -61,27 +76,28 @@ async ({ action, data }) => {
     };
     if (['limit', 'stop_limit'].includes(intent.type)) body.LimitPrice = String(intent.limitPrice);
     if (['stop', 'stop_limit'].includes(intent.type)) body.StopPrice = String(intent.stopPrice);
-    const fingerprint = node.crypto.createHash('sha256').update(JSON.stringify(intent)).digest('hex');
+    const fingerprint = fingerprintOf();
+    if (!fingerprint) return result('rejected');
     const claim = domain.execution.attempts.claim(data, fingerprint);
     if (claim.conflict) return result('ambiguous');
     attempt = claim.attempt;
     if (!claim.owner) return attempt.result || result('ambiguous');
   }
-  // An unknown broker identity is never looked up by order similarity or
-  // treated as not_found. Meta keeps its permanent barrier and reservation.
-  const brokerId = attempt?.brokerId || data.brokerId;
-  if (action === 'lookup' && (typeof brokerId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(brokerId))) {
-    return result('source_unavailable');
-  }
-  let response;
   let accessUpdate;
+  let submitting = false;
+  const finish = (response) => {
+    // Keep only non-secret receipts in the domain registry. Rotation belongs
+    // exclusively to the authenticated response of this invocation.
+    if (action === 'submit') attempt.result = response;
+    return accessUpdate ? { ...response, accessUpdate } : response;
+  };
+  const request = (options) => lib.execution.request({ ...options, deadline });
+  const parse = (kind, response) => lib.execution.protocol({ kind, response, account, brokerId });
   try {
-    const tokenResponse = await lib.execution.request({
+    const tokenResponse = await request({
       url: 'https://signin.tradestation.com/oauth/token',
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      data: null,
-      // This request uses the separate form transport; it never reaches Back.
       form: new URLSearchParams({
         grant_type: 'refresh_token',
         client_id: credentials.pkey,
@@ -89,58 +105,64 @@ async ({ action, data }) => {
         refresh_token: credentials.refresh_token,
       }).toString(),
     });
-    if (tokenResponse.status !== 200 || typeof tokenResponse.body?.access_token !== 'string') return result('source_unavailable');
-    if (typeof tokenResponse.body.refresh_token === 'string' && tokenResponse.body.refresh_token !== credentials.refresh_token) {
-      accessUpdate = { refresh_token: tokenResponse.body.refresh_token };
+    const token = tokenResponse.body;
+    if (
+      tokenResponse.status !== 200 ||
+      !token ||
+      Array.isArray(token) ||
+      typeof token.access_token !== 'string' ||
+      !token.access_token.trim() ||
+      ['error', 'Error', 'Errors', 'error_description'].some((name) => Object.hasOwn(token, name)) ||
+      (Object.hasOwn(token, 'refresh_token') && (typeof token.refresh_token !== 'string' || !token.refresh_token.trim()))
+    ) {
+      return finish(result(action === 'submit' ? 'rejected' : 'source_unavailable'));
     }
-    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenResponse.body.access_token}` };
+    if (typeof token.refresh_token === 'string' && token.refresh_token !== credentials.refresh_token) {
+      accessUpdate = { refresh_token: token.refresh_token };
+    }
+    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${token.access_token}` };
     if (action === 'submit') {
-      const accounts = await lib.execution.request({ url: `${base}/brokerage/accounts`, headers });
+      const accounts = await request({ url: `${base}/brokerage/accounts`, headers });
+      if (!parse('accounts', accounts)) return finish(result('rejected'));
+      const positions = await request({ url: `${base}/brokerage/accounts/${account}/positions`, headers });
+      const snapshot = parse('positions', positions);
+      if (!snapshot) return finish(result('rejected'));
+      const matching = snapshot.positions.filter((row) => row.symbol === body.Symbol);
+      const current = matching.reduce((sum, row) => sum + row.quantity, 0);
       if (
-        accounts.status !== 200 ||
-        !Array.isArray(accounts.body?.Accounts) ||
-        accounts.body?.Errors?.length ||
-        !accounts.body.Accounts.some((row) => row.AccountID === account)
+        !Number.isFinite(current) ||
+        !Number.isFinite(current + intent.quantity) ||
+        (matching.some((row) => row.quantity > 0) && matching.some((row) => row.quantity < 0)) ||
+        (current !== 0 && current * (current + intent.quantity) < 0)
       ) {
-        attempt.result = result('rejected');
-        return Object.assign({}, attempt.result, accessUpdate ? { accessUpdate } : {});
+        return finish(result('rejected'));
       }
-      // Resolve open/close intent using this account's native, authoritative
-      // positions. No global quote client credentials and no Back query.
-      const positions = await lib.execution.request({ url: `${base}/brokerage/accounts/${account}/positions`, headers });
-      if (positions.status !== 200 || !Array.isArray(positions.body?.Positions) || positions.body.Errors?.length) {
-        response = result('rejected'); // no broker submit has occurred
-      } else {
-        const matching = positions.body.Positions.filter((row) => row.AccountID === account && row.Symbol === body.Symbol);
-        const current = matching.reduce((sum, row) => sum + Number(row.Quantity), 0);
-        if (!Number.isFinite(current) || (current !== 0 && current * (current + intent.quantity) < 0)) {
-          response = result('rejected');
-        } else {
-          body.TradeAction = lib.utils.getAction({ type: intent.assetCategory }, intent.quantity, current).toUpperCase();
-          const placed = await lib.execution.request({ url: `${base}/orderexecution/orders`, headers, method: 'POST', data: body });
-          const orders = placed.body?.Orders;
-          const row = Array.isArray(orders) && orders.length === 1 ? orders[0] : null;
-          if (placed.status === 200 && row && !row.Error && typeof row.OrderID === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(row.OrderID)) {
-            attempt.brokerId = row.OrderID;
-            response = result('acknowledged', { terminal_id: row.OrderID, state: 'pending' });
-          } else {
-            response = result('ambiguous');
-          }
-        }
-      }
-      attempt.result = response;
-    } else {
-      const found = await lib.execution.request({
-        url: `${base}/brokerage/accounts/${account}/orders/${brokerId}`,
-        headers,
-      });
-      const rows = found.body?.Orders;
-      const matching = Array.isArray(rows) ? rows.filter((row) => row.AccountID === account && row.OrderID === brokerId) : [];
-      const broker = matching.length === 1 ? brokerOf(matching[0]) : null;
-      response = found.status === 200 && !found.body?.Errors?.length && broker ? result('found', broker) : result('source_unavailable');
+      body.TradeAction = lib.utils.getAction({ type: intent.assetCategory }, intent.quantity, current).toUpperCase();
+      if (Date.now() >= deadline) return finish(result('rejected'));
+      submitting = true;
+      const placed = await request({ url: `${base}/orderexecution/orders`, headers, method: 'POST', data: body });
+      if (!placed.started) return finish(result('rejected'));
+      if (Date.now() >= deadline) return finish(result('ambiguous'));
+      const broker = parse('placed', placed);
+      if (!broker) return finish(result('ambiguous'));
+      attempt.brokerId = broker.terminal_id;
+      return finish(result('acknowledged', broker));
     }
+    const current = await request({ url: `${base}/brokerage/accounts/${account}/orders/${brokerId}`, headers });
+    const parsed = parse('orders', current);
+    if (!parsed) return finish(result('source_unavailable'));
+    if (parsed.broker) return finish(result('found', parsed.broker));
+    const since = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+    const historical = await request({
+      url: `${base}/brokerage/accounts/${account}/historicalorders/${brokerId}?since=${since}`,
+      headers,
+    });
+    const history = parse('orders', historical);
+    // Empty current/history arrays do not prove absence: history is bounded
+    // to 90 days. Never convert an inconclusive response into not_found.
+    return finish(history?.broker ? result('found', history.broker) : result('source_unavailable'));
   } catch {
-    response = result(action === 'submit' ? 'ambiguous' : 'source_unavailable');
+    if (action === 'submit') return finish(result(submitting ? 'ambiguous' : 'rejected'));
+    return finish(result('source_unavailable'));
   }
-  return Object.assign({}, response, accessUpdate ? { accessUpdate } : {});
 };

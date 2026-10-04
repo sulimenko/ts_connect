@@ -1,7 +1,8 @@
 ({
-  router({ method, args, verb, headers }) {
+  router({ method, verb }) {
     const ip = context.client.ip;
-    console.log({ method, args, ip, verb, headers });
+    // Hook bodies and headers may contain execution credentials.
+    console.log({ method, ip, verb });
     return {};
   },
 });
