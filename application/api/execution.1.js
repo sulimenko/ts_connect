@@ -5,7 +5,7 @@
   // before examining credentials and never logs args, headers or exceptions.
   async router({ method, args, verb, headers }) {
     const deadline = Date.now() + 18000;
-    if (verb !== 'POST' || !['execution/submit', 'execution/lookup', 'execution/capabilities'].includes(method)) {
+    if (verb !== 'POST' || !['execution/submit', 'execution/lookup', 'execution/capabilities', 'execution/rules'].includes(method)) {
       return { state: 'invalid' };
     }
     const expected = config.execution.token;
@@ -32,8 +32,10 @@
       };
     }
     try {
+      if (method === 'execution/rules') return await lib.execution.rules({ data: args, deadline });
       return await lib.execution.handle({ action: method.split('/')[1], data: args, deadline });
     } catch {
+      if (method === 'execution/rules') return { version: 1, state: 'unavailable', reason: 'source_unavailable' };
       const orderId = Number.isSafeInteger(args?.orderId) && args.orderId > 0 ? args.orderId : null;
       return { version: 2, orderId, state: method === 'execution/submit' ? 'ambiguous' : 'source_unavailable' };
     }

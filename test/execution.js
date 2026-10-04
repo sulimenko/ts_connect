@@ -36,6 +36,96 @@ const input = () => ({
     stopPrice: null,
   },
 });
+const rulesInput = () => ({
+  version: 1,
+  account: 'EXT-1',
+  live: true,
+  credentials: input().credentials,
+  instrument: {
+    symbol: 'MSFT',
+    assetCategory: 'STK',
+    exchange: 'NASDAQ',
+    currency: 'USD',
+  },
+});
+// Documented SymbolDetailsResponse MSFT example, OpenAPI 2026-04-11.
+// No invented OrderTypes/TimeInForce/Rules fields provide combination proof.
+const symbolDetails = () => ({
+  Symbols: [
+    {
+      AssetType: 'STOCK',
+      Country: 'United States',
+      Currency: 'USD',
+      Description: 'Microsoft Corp',
+      Exchange: 'NASDAQ',
+      Symbol: 'MSFT',
+      Root: 'MSFT',
+      PriceFormat: {
+        Format: 'Decimal',
+        Decimals: '2',
+        IncrementStyle: 'Simple',
+        Increment: '0.01',
+        PointValue: '1',
+      },
+      QuantityFormat: {
+        Format: 'Decimal',
+        Decimals: '0',
+        IncrementStyle: 'Simple',
+        Increment: '1',
+        MinimumTradeQuantity: '1',
+      },
+    },
+  ],
+  Errors: [],
+});
+const expectedRules = (data, maximum = 'infinity') => {
+  const quantity = {
+    fractional: false,
+    minimum: '1',
+    step: '1',
+    maximum,
+    minimumNotional: null,
+  };
+  return {
+    version: 1,
+    state: 'ready',
+    identity: {
+      terminal: 'TS',
+      externalAccount: data.account,
+      live: data.live,
+    },
+    instrument: {
+      symbol: 'MSFT',
+      assetCategory: 'STK',
+      exchange: 'NASDAQ',
+      currency: 'USD',
+    },
+    orders: ['market', 'limit'].map((type) => ({
+      type,
+      tif: 'day',
+      session: 'regular',
+      extended: false,
+      relation: 'NORMAL',
+      orderClass: 'simple',
+      quantityMode: 'whole',
+      side: 'buy',
+      positionEffect: 'open',
+      quantity: { ...quantity },
+    })),
+    quantity,
+    price: {
+      rules: [
+        {
+          minInclusive: '0',
+          maxExclusive: null,
+          tick: '0.01',
+          precision: 2,
+          rounding: 'nearest_half_up',
+        },
+      ],
+    },
+  };
+};
 const order = (overrides = {}) => ({
   AccountID: 'EXT-1',
   OrderID: 'B-1',
@@ -121,7 +211,20 @@ function harness({ clock = false } = {}) {
       return token;
     },
     accounts: () => ({
-      Accounts: [{ AccountID: state.mismatch ? 'OTHER' : 'EXT-1' }],
+      Accounts: [
+        {
+          AccountID: state.mismatch ? 'OTHER' : 'EXT-1',
+          AccountType: 'Cash',
+          Status: 'Active',
+          Currency: 'USD',
+        },
+      ],
+    }),
+    details: symbolDetails,
+    routes: () => ({
+      Routes: [
+        { Id: 'Intelligent', Name: 'Intelligent', AssetTypes: ['STOCK'] },
+      ],
     }),
     positions: () => ({ Positions: [] }),
     place: () => ({ Orders: [{ OrderID: 'B-1' }] }),
@@ -134,6 +237,8 @@ function harness({ clock = false } = {}) {
     let stage = 'current';
     if (url.includes('/oauth/token')) stage = 'oauth';
     else if (url.endsWith('/brokerage/accounts')) stage = 'accounts';
+    else if (url.includes('/marketdata/symbols/')) stage = 'details';
+    else if (url.endsWith('/orderexecution/routes')) stage = 'routes';
     else if (url.endsWith('/positions')) stage = 'positions';
     else if (options.method === 'POST') stage = 'place';
     else if (url.includes('/historicalorders/')) stage = 'historical';
@@ -171,7 +276,18 @@ function harness({ clock = false } = {}) {
     globals,
   );
   globals.lib.utils = load('lib/utils.js', globals);
-  for (const name of ['request', 'protocol', 'broker', 'handle']) {
+  for (const name of [
+    'request',
+    'protocol',
+    'broker',
+    'handle',
+    'decimal',
+    'priceRules',
+    'rulesReady',
+    'intelligentMaximum',
+    'rulesProof',
+    'rules',
+  ]) {
     globals.lib.execution[name] = load(`lib/execution/${name}.js`, globals);
   }
   const hook = load('api/execution.1.js', globals);
@@ -209,7 +325,7 @@ test('auth rejects before touching credentials', async () => {
   const data = Object.defineProperty({}, 'credentials', {
     get: () => assert.fail('unauthorized credentials accessed'),
   });
-  for (const action of ['submit', 'lookup', 'capabilities']) {
+  for (const action of ['submit', 'lookup', 'capabilities', 'rules']) {
     for (const options of [
       { authorization: 'Bearer user-session' },
       { authorization: `Bearer ${'x'.repeat(32)}` },
@@ -983,7 +1099,7 @@ test('late PlaceOrder stays ambiguous without another send', async () => {
 test('generic Impress hook logs only safe execution fields', () => {
   const h = harness();
   const hook = load('api/hook.1.js', h.globals);
-  for (const action of ['submit', 'lookup', 'capabilities']) {
+  for (const action of ['submit', 'lookup', 'capabilities', 'rules']) {
     const method = `execution/${action}`;
     const args = Object.defineProperty(input(), 'credentials', {
       get: () => assert.fail('hook accessed execution credentials'),
@@ -1091,8 +1207,973 @@ test('installed Impress/Metacom dispatch the protected HTTP hook', async () => {
   );
   assert.equal(h.calls.length, 0);
   assert.equal((await invoke('capabilities', {})).restart_safe, false);
+  assert.equal(
+    (await invoke('rules', rulesInput(), 'wrong')).state,
+    'unauthorized',
+  );
+  const ready = plain(await invoke('rules', rulesInput()));
+  assert.equal(ready.state, 'ready');
+  assert.equal(ready.quantity.maximum, 'infinity');
+  assert.deepEqual(plain(await invoke('rules', {})), {
+    version: 1,
+    state: 'unavailable',
+    reason: 'invalid_request',
+  });
   assert.equal((await invoke('submit', input())).state, 'acknowledged');
   assert.equal((await invoke('submit', input())).state, 'acknowledged');
   assert.equal(h.postCount(), 1);
   assert.equal(JSON.stringify(h.logs).includes('private'), false);
+});
+
+test('regular broker fixture returns ready with infinity', async () => {
+  const h = harness();
+  Object.defineProperty(h.globals.domain.execution, 'attempts', {
+    get: () => assert.fail('rules accessed placement receipts'),
+  });
+  const data = rulesInput();
+  const result = plain(await h.invoke('rules', data));
+  assert.deepEqual(result, expectedRules(data));
+  assert.deepEqual(
+    h.calls.map(({ stage }) => stage),
+    ['oauth', 'accounts', 'details', 'routes'],
+  );
+  for (const call of h.calls.slice(1)) {
+    assert.ok(call.url.startsWith('https://api.tradestation.com/v3/'));
+    assert.equal(call.options.method, 'GET');
+    assert.equal(Object.hasOwn(call.options, 'body'), false);
+  }
+  assert.equal(h.postCount(), 0);
+  assert.deepEqual(h.logs, []);
+});
+
+test('common ready wire includes session and exact maximum', () => {
+  const h = harness();
+  const data = rulesInput();
+  // Synthetic confirmed finite bound tests wire assembly; production evidence
+  // above has no applicable finite bound and serializes infinity.
+  const quantity = {
+    fractional: false,
+    minimum: '1',
+    step: '1',
+    maximum: '1000',
+    minimumNotional: null,
+  };
+  const instrument = symbolDetails().Symbols[0];
+  const result = plain(
+    h.globals.lib.execution.rulesReady({
+      data,
+      instrument,
+      quantity,
+      price: h.globals.lib.execution.priceRules(instrument.PriceFormat),
+    }),
+  );
+  assert.deepEqual(result, {
+    version: 1,
+    state: 'ready',
+    identity: { terminal: 'TS', externalAccount: 'EXT-1', live: true },
+    instrument: data.instrument,
+    orders: ['market', 'limit'].map((type) => ({
+      type,
+      tif: 'day',
+      session: 'regular',
+      extended: false,
+      relation: 'NORMAL',
+      orderClass: 'simple',
+      quantityMode: 'whole',
+      side: 'buy',
+      positionEffect: 'open',
+      quantity,
+    })),
+    quantity: { fractional: false, ...quantity },
+    price: {
+      rules: [
+        {
+          minInclusive: '0',
+          maxExclusive: null,
+          tick: '0.01',
+          precision: 2,
+          rounding: 'nearest_half_up',
+        },
+      ],
+    },
+  });
+  for (const row of result.orders) {
+    assert.equal(row.extended, row.session !== 'regular');
+  }
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.postCount(), 0);
+  assert.deepEqual(h.logs, []);
+});
+
+test('unconfirmed bounds use infinity; sessions require proof', async () => {
+  for (const maximum of [
+    undefined,
+    null,
+    '1000',
+    '9007199254740991',
+    'unbounded',
+  ]) {
+    const h = harness();
+    const details = symbolDetails();
+    Object.assign(details.Symbols[0].QuantityFormat, {
+      MaximumTradeQuantity: maximum,
+      Maximum: maximum,
+      Unbounded: true,
+    });
+    details.Symbols[0].Sessions = [
+      'regular',
+      'pre_market',
+      'post_market',
+      'overnight',
+    ];
+    h.state.responses.details = details;
+    const data = rulesInput();
+    data.instrument.maximum = maximum;
+    data.instrument.session = 'overnight';
+    data.quantity = { maximum };
+    assert.deepEqual(plain(await h.invoke('rules', data)), expectedRules(data));
+    assert.equal(h.postCount(), 0);
+    assert.deepEqual(h.logs, []);
+  }
+});
+
+test('ready preserves exact finite maximum and literal infinity', () => {
+  const h = harness();
+  const instrument = symbolDetails().Symbols[0];
+  const assemble = (quantity) =>
+    plain(
+      h.globals.lib.execution.rulesReady({
+        data: rulesInput(),
+        instrument,
+        quantity: {
+          fractional: false,
+          minimum: '1',
+          step: '1',
+          minimumNotional: null,
+          ...quantity,
+        },
+        price: h.globals.lib.execution.priceRules(instrument.PriceFormat),
+      }),
+    );
+  for (const maximum of [
+    '',
+    '0',
+    '+1',
+    '-1',
+    '1e3',
+    ' 1000',
+    '1.5',
+    1000,
+    'unbounded',
+    'Infinity',
+    Infinity,
+    'infinity ',
+    '9'.repeat(257),
+  ]) {
+    assert.deepEqual(assemble({ maximum }), {
+      version: 1,
+      state: 'unavailable',
+      reason: 'quantity_unconfirmed',
+    });
+  }
+  for (const quantity of [
+    { minimum: '1001', maximum: '1000' },
+    { minimum: undefined },
+    { minimum: '0' },
+    { step: undefined },
+    { step: '0' },
+    { step: '0.5' },
+    { fractional: undefined },
+    { fractional: null },
+    { fractional: true },
+    { fractional: 'false' },
+  ]) {
+    assert.equal(assemble(quantity).state, 'unavailable');
+  }
+  for (const [maximum, expected] of [
+    [undefined, 'infinity'],
+    [null, 'infinity'],
+    ['infinity', 'infinity'],
+    ['0001000.000', '1000'],
+    ['9007199254740990', '9007199254740990'],
+    ['9007199254740991', '9007199254740991'],
+    ['9007199254740992', '9007199254740992'],
+    ['999999999999999999999999999999999', '999999999999999999999999999999999'],
+  ]) {
+    const quantity = { maximum };
+    const result = assemble(quantity);
+    assert.deepEqual(result, expectedRules(rulesInput(), expected));
+    for (const row of result.orders) {
+      assert.equal(row.quantity.maximum, expected);
+      assert.equal(row.quantity.fractional, row.quantityMode === 'fractional');
+      assert.equal(row.extended, row.session !== 'regular');
+    }
+    assert.deepEqual(quantity, { maximum });
+  }
+  // Broker rules retain exact minimum/step too; concrete order safety is T-068.
+  assert.equal(
+    assemble({ minimum: '9007199254740992' }).quantity.minimum,
+    '9007199254740992',
+  );
+  assert.equal(
+    assemble({ step: '9007199254740992' }).quantity.step,
+    '9007199254740992',
+  );
+  assert.equal(h.calls.length, 0);
+});
+
+test('Intelligent range requires proof for every combination', () => {
+  const h = harness();
+  const instrument = symbolDetails().Symbols[0];
+  const orders = expectedRules(rulesInput()).orders.map(
+    ({ quantity, ...order }) => {
+      assert.equal(quantity.maximum, 'infinity');
+      return order;
+    },
+  );
+  // Synthetic authoritative applicability proof, NOT a GetRoutes response.
+  // The official page conditions its range on the chosen downstream route.
+  const applicability = {
+    source:
+      'https://help.tradestation.com/10_00/eng/tradestationhelp/routes/intelligent.htm',
+    symbol: 'MSFT',
+    exchange: 'NASDAQ',
+    apiDefaultRoute: 'Intelligent',
+    selectedRoute: 'synthetic-confirmed-route',
+    minimum: '1',
+    maximum: '1000000',
+    combinations: orders,
+  };
+  const evaluate = (changes = {}) =>
+    h.globals.lib.execution.intelligentMaximum({
+      instrument,
+      route: 'Intelligent',
+      orders,
+      applicability,
+      ...changes,
+    });
+  assert.equal(evaluate(), '1000000');
+  for (const proof of [
+    undefined,
+    null,
+    {},
+    { ...applicability, source: 'client' },
+    { ...applicability, symbol: 'AAPL' },
+    { ...applicability, exchange: 'NYSE' },
+    { ...applicability, apiDefaultRoute: 'ARCA' },
+    { ...applicability, selectedRoute: undefined },
+    { ...applicability, selectedRoute: '' },
+    { ...applicability, minimum: undefined },
+    { ...applicability, maximum: undefined },
+    { ...applicability, maximum: '9007199254740991' },
+    { ...applicability, combinations: undefined },
+    { ...applicability, combinations: [orders[0]] },
+    {
+      ...applicability,
+      combinations: orders.map((row) => ({ ...row, session: 'overnight' })),
+    },
+    { ...applicability, combinations: [{ type: 'market' }, { type: 'limit' }] },
+  ]) {
+    assert.equal(evaluate({ applicability: proof }), 'infinity');
+  }
+  for (const changes of [
+    { route: 'ARCA' },
+    { orders: [] },
+    { instrument: { ...instrument, AssetType: 'STOCKOPTION' } },
+    { instrument: { ...instrument, Country: 'Canada' } },
+    { instrument: { ...instrument, Currency: 'CAD' } },
+    { instrument: { ...instrument, Exchange: 'UNPROVEN' } },
+  ]) {
+    assert.equal(evaluate(changes), 'infinity');
+  }
+  const quantity = {
+    fractional: false,
+    minimum: '1',
+    step: '1',
+    maximum: evaluate(),
+    minimumNotional: null,
+  };
+  const result = plain(
+    h.globals.lib.execution.rulesReady({
+      data: rulesInput(),
+      instrument,
+      quantity,
+      price: h.globals.lib.execution.priceRules(instrument.PriceFormat),
+    }),
+  );
+  assert.deepEqual(result, expectedRules(rulesInput(), '1000000'));
+  assert.equal(h.calls.length, 0);
+});
+
+test('rules checks Intelligent applicability for every row', async () => {
+  const h = harness();
+  const evaluate = h.globals.lib.execution.intelligentMaximum;
+  let checked = false;
+  h.globals.lib.execution.intelligentMaximum = (context) => {
+    checked = true;
+    assert.equal(context.route, 'Intelligent');
+    assert.equal(context.applicability, undefined);
+    assert.deepEqual(
+      plain(context.orders),
+      expectedRules(rulesInput()).orders.map(({ quantity, ...row }) => {
+        assert.equal(quantity.maximum, 'infinity');
+        return row;
+      }),
+    );
+    return evaluate(context);
+  };
+  const data = rulesInput();
+  // Client and undocumented metadata cannot grant internal applicability.
+  data.applicability = { apiDefaultRoute: 'Intelligent', maximum: '1000000' };
+  const details = symbolDetails();
+  details.Symbols[0].QuantityFormat.MaximumTradeQuantity = '1000000';
+  details.Symbols[0].applicability = data.applicability;
+  h.state.responses.details = details;
+  h.state.responses.routes = {
+    Routes: [
+      {
+        Id: 'Intelligent',
+        AssetTypes: ['STOCK'],
+        SelectedRoute: 'ARCA',
+        Maximum: '1000000',
+      },
+    ],
+  };
+  assert.deepEqual(plain(await h.invoke('rules', data)), expectedRules(data));
+  assert.equal(checked, true);
+  assert.equal(h.postCount(), 0);
+});
+
+test('large finite bound preserves T-068 transport guard', async () => {
+  const h = harness();
+  const instrument = symbolDetails().Symbols[0];
+  const ready = plain(
+    h.globals.lib.execution.rulesReady({
+      data: rulesInput(),
+      instrument,
+      quantity: {
+        fractional: false,
+        minimum: '1',
+        step: '1',
+        maximum: '9007199254740992',
+        minimumNotional: null,
+      },
+      price: h.globals.lib.execution.priceRules(instrument.PriceFormat),
+    }),
+  );
+  assert.deepEqual(ready, expectedRules(rulesInput(), '9007199254740992'));
+  const data = input();
+  data.intent.quantity = 9007199254740992;
+  assert.equal((await h.invoke('submit', data)).state, 'rejected');
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.postCount(), 0);
+});
+
+test('rules malformed requests and exceptions keep v1 envelope', async () => {
+  const malformed = [null, [], false, 'private-secret', {}, input()];
+  for (const changes of [
+    { version: 2 },
+    { account: '' },
+    { account: 'EXT/1' },
+    { live: 'true' },
+    { credentials: [] },
+    { credentials: { ...input().credentials, secret: '' } },
+    { instrument: [] },
+    { instrument: { ...rulesInput().instrument, currency: undefined } },
+    { instrument: { ...rulesInput().instrument, currency: 1 } },
+    { instrument: { ...rulesInput().instrument, exchange: '' } },
+    { instrument: { ...rulesInput().instrument, assetCategory: 'OPT' } },
+  ]) {
+    malformed.push({ ...rulesInput(), ...changes });
+  }
+  for (const data of malformed) {
+    const h = harness();
+    assert.deepEqual(plain(await h.invoke('rules', data)), {
+      version: 1,
+      state: 'unavailable',
+      reason: 'invalid_request',
+    });
+    assert.equal(h.calls.length, 0);
+  }
+  const h = harness();
+  const poison = Object.defineProperty({}, 'instrument', {
+    get: () => {
+      throw new Error('private-secret schema exception');
+    },
+  });
+  assert.deepEqual(plain(await h.invoke('rules', poison)), {
+    version: 1,
+    state: 'unavailable',
+    reason: 'source_unavailable',
+  });
+  h.globals.lib.execution.rules = () => {
+    throw new Error('private-secret domain exception');
+  };
+  const args = Object.defineProperty(rulesInput(), 'orderId', {
+    get: () => assert.fail('v1 exception handler inspected orderId'),
+  });
+  assert.deepEqual(plain(await h.invoke('rules', args)), {
+    version: 1,
+    state: 'unavailable',
+    reason: 'source_unavailable',
+  });
+  assert.equal(h.calls.length, 0);
+  assert.deepEqual(h.logs, []);
+});
+
+test('rules proves live/sim account within T-068 assets', async () => {
+  const unsupported = harness();
+  const future = rulesInput();
+  future.instrument.assetCategory = 'FUT';
+  assert.deepEqual(plain(await unsupported.invoke('rules', future)), {
+    version: 1,
+    state: 'unsupported',
+    reason: 'execution_domain',
+  });
+  assert.equal(unsupported.calls.length, 0);
+  const sim = harness();
+  const data = rulesInput();
+  data.live = false;
+  data.instrument.currency = null;
+  const result = plain(await sim.invoke('rules', data));
+  assert.deepEqual(result, expectedRules(data));
+  // Null requested currency resolves to the proven broker currency in SIM.
+  assert.deepEqual(
+    sim.calls.map(({ stage }) => stage),
+    ['oauth', 'accounts', 'details', 'routes'],
+  );
+  for (const call of sim.calls.slice(1)) {
+    assert.ok(call.url.startsWith('https://sim-api.tradestation.com/v3/'));
+  }
+  // The requested ID exists only in live, not in the selected SIM environment.
+  const mismatch = harness();
+  const fetch = mismatch.globals.fetch;
+  mismatch.globals.fetch = async (url, options) => {
+    const response = await fetch(url, options);
+    if (url === 'https://sim-api.tradestation.com/v3/brokerage/accounts') {
+      return { status: 200, json: async () => ({ Accounts: [] }) };
+    }
+    return response;
+  };
+  assert.deepEqual(plain(await mismatch.invoke('rules', data)), {
+    version: 1,
+    state: 'unavailable',
+    reason: 'account_unconfirmed',
+  });
+  assert.deepEqual(
+    mismatch.calls.map(({ stage }) => stage),
+    ['oauth', 'accounts'],
+  );
+});
+
+test('rules rejects duplicate or unconfirmed accounts', async () => {
+  const active = {
+    AccountID: 'EXT-1',
+    Status: 'Active',
+    AccountType: 'Margin',
+    Currency: 'USD',
+  };
+  const cases = [
+    null,
+    {},
+    { Accounts: null },
+    { Accounts: [active], AccountID: 'OTHER' },
+    { Accounts: [active], NextToken: 'more' },
+    { Accounts: [active], Errors: [{ Message: 'private-secret' }] },
+    { Accounts: [active, active] },
+    { Accounts: [{ ...active, AccountID: 'OTHER' }] },
+    { Accounts: [{ ...active, Status: 'Closed' }] },
+    { Accounts: [{ ...active, Status: 'Closing Transaction Only' }] },
+    { Accounts: [{ ...active, Status: undefined }] },
+    { Accounts: [{ ...active, AccountType: 'Futures' }] },
+    { Accounts: [{ ...active, Currency: undefined }] },
+  ];
+  for (const accounts of cases) {
+    const h = harness();
+    h.state.responses.accounts = accounts;
+    assert.deepEqual(plain(await h.invoke('rules', rulesInput())), {
+      version: 1,
+      state: 'unavailable',
+      reason: 'account_unconfirmed',
+    });
+    assert.equal(h.postCount(), 0);
+  }
+});
+
+test('rules requires authoritative instrument identity', async () => {
+  const cases = [
+    { Symbol: 'AAPL' },
+    { Symbol: undefined },
+    { AssetType: 'STOCKOPTION' },
+    { AssetType: 'UNKNOWN' },
+    { Exchange: undefined },
+    { Exchange: 'NYSE' },
+    { Currency: null },
+    { Currency: 'EUR' },
+    { Error: 'private-secret' },
+  ];
+  for (const changes of cases) {
+    const h = harness();
+    const details = symbolDetails();
+    Object.assign(details.Symbols[0], changes);
+    h.state.responses.details = details;
+    const data = rulesInput();
+    data.instrument.source = 'TradeStation';
+    assert.deepEqual(plain(await h.invoke('rules', data)), {
+      version: 1,
+      state: 'unavailable',
+      reason: 'instrument_unconfirmed',
+    });
+  }
+  for (const details of [
+    null,
+    {},
+    { Symbols: [] },
+    { Symbols: [symbolDetails().Symbols[0], symbolDetails().Symbols[0]] },
+    { ...symbolDetails(), Errors: [{ Symbol: 'MSFT', Error: 'NotFound' }] },
+    { ...symbolDetails(), NextToken: 'more' },
+  ]) {
+    const h = harness();
+    h.state.responses.details = details;
+    assert.equal((await h.invoke('rules', rulesInput())).state, 'unavailable');
+  }
+  const h = harness();
+  const data = rulesInput();
+  data.instrument.exchange = 'TS';
+  assert.equal(
+    (await h.invoke('rules', data)).reason,
+    'instrument_unconfirmed',
+  );
+  assert.deepEqual(h.logs, []);
+});
+
+test('rules requires combination proof, never an enum product', async () => {
+  const route = {
+    Id: 'Intelligent',
+    Name: 'Intelligent',
+    AssetTypes: ['STOCK'],
+  };
+  for (const routes of [
+    null,
+    {},
+    { Routes: [] },
+    { Routes: [route, route] },
+    { Routes: [{ ...route, Id: 'ARCA' }] },
+    { Routes: [{ ...route, AssetTypes: ['STOCKOPTION'] }] },
+    { Routes: [{ ...route, AssetTypes: null }] },
+    { Routes: [route], Errors: [{ Error: 'private-secret' }] },
+    { Routes: [route], NextToken: 'more' },
+    { OrderTypes: ['Market', 'Limit'], Durations: ['DAY', 'GTC'] },
+  ]) {
+    const h = harness();
+    h.state.responses.routes = routes;
+    assert.deepEqual(plain(await h.invoke('rules', rulesInput())), {
+      version: 1,
+      state: 'unavailable',
+      reason: 'combination_unconfirmed',
+    });
+  }
+  for (const changes of [
+    { Country: 'Canada' },
+    { Exchange: 'UNPROVEN' },
+    { Currency: 'CAD' },
+  ]) {
+    const h = harness();
+    const details = symbolDetails();
+    Object.assign(details.Symbols[0], changes);
+    h.state.responses.details = details;
+    const data = rulesInput();
+    data.instrument.exchange = details.Symbols[0].Exchange;
+    data.instrument.currency = details.Symbols[0].Currency;
+    assert.equal(
+      (await h.invoke('rules', data)).reason,
+      'combination_unconfirmed',
+    );
+  }
+  const h = harness();
+  const details = symbolDetails();
+  details.Symbols[0].OrderTypes = [
+    'Market',
+    'Limit',
+    'StopMarket',
+    'StopLimit',
+  ];
+  details.Symbols[0].Durations = ['DAY', 'GTC', 'IOC', 'FOK'];
+  h.state.responses.details = details;
+  const result = plain(await h.invoke('rules', rulesInput()));
+  assert.deepEqual(result, expectedRules(rulesInput()));
+  const option = harness();
+  const data = rulesInput();
+  data.instrument = {
+    symbol: 'MSFT261218C00400000',
+    assetCategory: 'OPT',
+    exchange: 'OPRA',
+    currency: 'USD',
+  };
+  const optionDetails = symbolDetails();
+  Object.assign(optionDetails.Symbols[0], {
+    Symbol: 'MSFT 261218C400',
+    AssetType: 'STOCKOPTION',
+    Exchange: 'OPRA',
+  });
+  option.state.responses.details = optionDetails;
+  option.state.responses.routes = {
+    Routes: [{ ...route, AssetTypes: ['STOCKOPTION'] }],
+  };
+  assert.deepEqual(plain(await option.invoke('rules', data)), {
+    version: 1,
+    state: 'unavailable',
+    reason: 'combination_unconfirmed',
+  });
+  assert.ok(
+    option.calls
+      .find(({ stage }) => stage === 'details')
+      .url.endsWith('/MSFT%20261218C400'),
+  );
+  assert.equal(option.postCount(), 0);
+});
+
+test('rules quantity uses explicit canonical broker decimals', async () => {
+  const base = symbolDetails().Symbols[0].QuantityFormat;
+  for (const format of [
+    undefined,
+    null,
+    [],
+    { ...base, MinimumTradeQuantity: undefined },
+    { ...base, MinimumTradeQuantity: '0' },
+    { ...base, MinimumTradeQuantity: '+1' },
+    { ...base, MinimumTradeQuantity: '1e0' },
+    { ...base, MinimumTradeQuantity: 1 },
+    { ...base, Increment: undefined },
+    { ...base, Increment: '0' },
+    { ...base, Increment: '0.5', Decimals: '1' },
+    { ...base, Decimals: undefined },
+    { ...base, Decimals: 0 },
+    { ...base, IncrementStyle: 'Schedule' },
+    { ...base, IncrementSchedule: [] },
+    { ...base, Error: 'private-secret' },
+  ]) {
+    const h = harness();
+    const details = symbolDetails();
+    details.Symbols[0].QuantityFormat = format;
+    h.state.responses.details = details;
+    assert.deepEqual(plain(await h.invoke('rules', rulesInput())), {
+      version: 1,
+      state: 'unavailable',
+      reason: 'quantity_unconfirmed',
+    });
+  }
+  const h = harness();
+  const details = symbolDetails();
+  details.Symbols[0].QuantityFormat = {
+    ...base,
+    MinimumTradeQuantity: '0003.0000',
+    Increment: '0002.00',
+  };
+  h.state.responses.details = details;
+  assert.deepEqual(plain(await h.invoke('rules', rulesInput())).quantity, {
+    fractional: false,
+    minimum: '3',
+    step: '2',
+    maximum: 'infinity',
+    minimumNotional: null,
+  });
+  const result = plain(
+    h.globals.lib.execution.rulesReady({
+      data: rulesInput(),
+      instrument: details.Symbols[0],
+      quantity: {
+        fractional: false,
+        minimum: '0003.0000',
+        step: '0002.00',
+        maximum: '001000.00',
+        minimumNotional: null,
+      },
+      price: h.globals.lib.execution.priceRules(details.Symbols[0].PriceFormat),
+    }),
+  );
+  assert.deepEqual(result.quantity, {
+    fractional: false,
+    minimum: '3',
+    step: '2',
+    maximum: '1000',
+    minimumNotional: null,
+  });
+  for (const row of result.orders) {
+    assert.deepEqual(row.quantity, {
+      fractional: false,
+      minimum: '3',
+      step: '2',
+      maximum: '1000',
+      minimumNotional: null,
+    });
+  }
+});
+
+test('rules never defaults unconfirmed price rules', async () => {
+  const base = symbolDetails().Symbols[0].PriceFormat;
+  const schedule = (rows) => ({
+    Format: 'Decimal',
+    Decimals: '2',
+    IncrementStyle: 'Schedule',
+    IncrementSchedule: rows,
+  });
+  for (const format of [
+    undefined,
+    null,
+    [],
+    { ...base, Increment: undefined },
+    { ...base, Increment: '0' },
+    { ...base, Increment: 0.01 },
+    { ...base, Increment: '1e-2' },
+    { ...base, Increment: '+0.01' },
+    { ...base, Increment: '-0.01' },
+    { ...base, Increment: ' 0.01' },
+    { ...base, Increment: '0.001' },
+    { ...base, Decimals: undefined },
+    { ...base, Decimals: 2 },
+    { ...base, Decimals: '-1' },
+    { ...base, Format: 'Fraction' },
+    { ...base, Format: 'SubFraction' },
+    { ...base, IncrementStyle: 'Unknown' },
+    { ...base, IncrementSchedule: [] },
+    { ...base, Error: 'private-secret' },
+    schedule([]),
+    schedule([{ StartsAt: '1', Increment: '0.01' }]),
+    schedule([
+      { StartsAt: '0', Increment: '0.01' },
+      { StartsAt: '0', Increment: '0.02' },
+    ]),
+    schedule([
+      { StartsAt: '0', Increment: '0.01' },
+      { StartsAt: '-1', Increment: '0.02' },
+    ]),
+    schedule([{ StartsAt: '0', Increment: '0.01' }, { StartsAt: '1' }]),
+    schedule([{ StartsAt: '0', Increment: '0.01', Error: 'private-secret' }]),
+    schedule([
+      { StartsAt: '0', Increment: '0.01' },
+      { StartsAt: '1', Increment: '0.05' },
+      { StartsAt: '1.01', Increment: '0.01' },
+      { StartsAt: '1.02', Increment: '0.01' },
+      { StartsAt: '1.01', Increment: '0.01' },
+    ]),
+    schedule([
+      { StartsAt: '0', Increment: '0.01' },
+      { StartsAt: '0.011', Increment: '0.05' },
+      { StartsAt: '0.012', Increment: '0.01' },
+    ]),
+  ]) {
+    const h = harness();
+    const details = symbolDetails();
+    details.Symbols[0].PriceFormat = format;
+    h.state.responses.details = details;
+    assert.deepEqual(plain(await h.invoke('rules', rulesInput())), {
+      version: 1,
+      state: 'unavailable',
+      reason: 'price_unconfirmed',
+    });
+  }
+});
+
+// Independent consumer of the common wire: fixed exact scale for these vectors.
+// No connector parsing helpers decide range or grid membership here.
+const priceAllowed = (price, value) => {
+  const exact = (decimal) => {
+    const [whole, fraction = ''] = decimal.split('.');
+    return BigInt(whole + fraction.padEnd(32, '0'));
+  };
+  const amount = exact(value);
+  const row = price.rules.find(
+    (rule) =>
+      amount >= exact(rule.minInclusive) &&
+      (rule.maxExclusive === null || amount < exact(rule.maxExclusive)),
+  );
+  const tail = (value.split('.')[1] || '').replace(/0+$/, '');
+  return Boolean(
+    row && tail.length <= row.precision && amount % exact(row.tick) === 0n,
+  );
+};
+
+test('rules exact ranges, zero-origin grids and precision', () => {
+  const h = harness();
+  const details = symbolDetails();
+  details.Symbols[0].PriceFormat = {
+    Format: 'Decimal',
+    Decimals: '2',
+    IncrementStyle: 'Schedule',
+    IncrementSchedule: [
+      { StartsAt: '000.000', Increment: '0.0100' },
+      { StartsAt: '0.01500', Increment: '0.0200' },
+      { StartsAt: '1.0000', Increment: '0.0500' },
+    ],
+  };
+  const price = plain(
+    h.globals.lib.execution.priceRules(details.Symbols[0].PriceFormat),
+  );
+  assert.deepEqual(price.rules, [
+    {
+      minInclusive: '0',
+      maxExclusive: '0.015',
+      tick: '0.01',
+      precision: 2,
+      rounding: 'nearest_half_up',
+    },
+    {
+      minInclusive: '0.015',
+      maxExclusive: '1',
+      tick: '0.02',
+      precision: 2,
+      rounding: 'nearest_half_up',
+    },
+    {
+      minInclusive: '1',
+      maxExclusive: null,
+      tick: '0.05',
+      precision: 2,
+      rounding: 'nearest_half_up',
+    },
+  ]);
+  for (const [value, allowed] of [
+    ['0.01', true],
+    ['0.015', false],
+    ['0.02', true],
+    ['0.035', false],
+    ['0.03', false],
+    ['0.98', true],
+    ['0.9999999999999999', false],
+    ['1', true],
+    ['1.02', false],
+    ['1.05', true],
+    ['1.05000', true],
+    ['1.0500000000000001', false],
+  ]) {
+    assert.equal(priceAllowed(price, value), allowed, value);
+  }
+  // Thresholds that collapse to one Number must still remain distinct.
+  details.Symbols[0].PriceFormat = {
+    Format: 'Decimal',
+    Decimals: '16',
+    IncrementStyle: 'Schedule',
+    IncrementSchedule: [
+      { StartsAt: '0', Increment: '0.0000000000000001' },
+      {
+        StartsAt: '9007199254740993.0000000000000001',
+        Increment: '0.0000000000000002',
+      },
+      {
+        StartsAt: '9007199254740993.0000000000000005',
+        Increment: '0.0000000000000001',
+      },
+    ],
+  };
+  const high = plain(
+    h.globals.lib.execution.priceRules(details.Symbols[0].PriceFormat),
+  );
+  assert.equal(high.rules[1].minInclusive, '9007199254740993.0000000000000001');
+  assert.equal(priceAllowed(high, '9007199254740993.0000000000000001'), false);
+  assert.equal(priceAllowed(high, '9007199254740993.0000000000000002'), true);
+  assert.equal(priceAllowed(high, '9007199254740993.0000000000000004'), true);
+  assert.equal(priceAllowed(high, '9007199254740993.0000000000000005'), true);
+});
+
+test('rules rotation stays only in accessUpdate on all outcomes', async () => {
+  for (const outcome of [
+    'ready',
+    'quantity',
+    'accounts',
+    'details',
+    'routes',
+    'exception',
+  ]) {
+    const h = harness();
+    Object.defineProperty(h.globals.domain.execution, 'attempts', {
+      get: () => assert.fail('rules stored rotation in placement receipts'),
+    });
+    h.state.rotate = true;
+    if (['accounts', 'details', 'routes'].includes(outcome)) {
+      h.state.responses[outcome] = { Error: 'private-secret private-access' };
+    } else if (outcome === 'quantity') {
+      const details = symbolDetails();
+      delete details.Symbols[0].QuantityFormat.Increment;
+      h.state.responses.details = details;
+    } else if (outcome === 'exception') {
+      h.globals.lib.execution.rulesProof = () => {
+        throw new Error('private-secret private-access parser exception');
+      };
+    }
+    const result = plain(await h.invoke('rules', rulesInput()));
+    assert.equal(result.state, outcome === 'ready' ? 'ready' : 'unavailable');
+    if (outcome === 'quantity') {
+      assert.equal(result.reason, 'quantity_unconfirmed');
+    }
+    assert.deepEqual(result.accessUpdate, { refresh_token: 'rotated-refresh' });
+    const { accessUpdate, ...rules } = result;
+    assert.equal(accessUpdate.refresh_token, 'rotated-refresh');
+    assert.equal(JSON.stringify(rules).includes('refresh'), false);
+    assert.equal(JSON.stringify(result).includes('private'), false);
+    assert.equal(JSON.stringify(result).includes('access_token'), false);
+    assert.equal(JSON.stringify(result).includes('credentials'), false);
+    assert.deepEqual(h.logs, []);
+    assert.equal(h.postCount(), 0);
+  }
+  const same = harness();
+  same.state.responses.oauth = {
+    access_token: 'private-access',
+    refresh_token: rulesInput().credentials.refresh_token,
+  };
+  assert.equal(
+    Object.hasOwn(await same.invoke('rules', rulesInput()), 'accessUpdate'),
+    false,
+  );
+});
+
+test('rules source errors and expired evidence fail closed', async () => {
+  for (const stage of ['oauth', 'accounts', 'details', 'routes']) {
+    for (const status of [401, 429, 500]) {
+      const h = harness();
+      h.state.statuses[stage] = status;
+      const result = plain(await h.invoke('rules', rulesInput()));
+      assert.equal(result.version, 1);
+      assert.equal(result.state, 'unavailable');
+      assert.deepEqual(Object.keys(result).sort(), [
+        'reason',
+        'state',
+        'version',
+      ]);
+      assert.equal(h.postCount(), 0);
+    }
+    const h = harness();
+    h.state.responses[stage] = new Error(
+      'private-secret private-access raw upstream error',
+    );
+    assert.equal((await h.invoke('rules', rulesInput())).state, 'unavailable');
+    assert.deepEqual(h.logs, []);
+  }
+  for (const token of [
+    null,
+    [],
+    { access_token: 'private-access', refresh_token: '' },
+    { access_token: 'private-access', error: 'private-secret' },
+    { access_token: '' },
+  ]) {
+    const h = harness();
+    h.state.responses.oauth = token;
+    assert.deepEqual(plain(await h.invoke('rules', rulesInput())), {
+      version: 1,
+      state: 'unavailable',
+      reason: 'source_unavailable',
+    });
+    assert.equal(h.calls.length, 1);
+  }
+  const expired = harness({ clock: true });
+  expired.state.rotate = true;
+  expired.state.bodyDelays.details = 18000;
+  const result = plain(await expired.invoke('rules', rulesInput()));
+  assert.deepEqual(result, {
+    version: 1,
+    state: 'unavailable',
+    reason: 'source_unavailable',
+    accessUpdate: { refresh_token: 'rotated-refresh' },
+  });
+  assert.equal(expired.time.pending(), 0);
 });
