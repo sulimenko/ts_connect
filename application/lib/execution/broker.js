@@ -72,7 +72,7 @@ async ({ action, data, deadline }) => {
       Quantity: String(Math.abs(quantity)),
       OrderType: types[intent.type],
       TimeInForce: { Duration: tifs[intent.tif] },
-      OrderConfirmId: `meta-${orderId}`,
+      OrderConfirmID: `meta-${orderId}`,
     };
     if (['limit', 'stop_limit'].includes(intent.type)) body.LimitPrice = String(intent.limitPrice);
     if (['stop', 'stop_limit'].includes(intent.type)) body.StopPrice = String(intent.stopPrice);

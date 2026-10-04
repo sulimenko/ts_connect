@@ -146,7 +146,9 @@ function harness({ clock = false } = {}) {
     }
     if (stage === 'place') {
       const payload = JSON.parse(options.body);
-      assert.equal(payload.OrderConfirmId, 'meta-17');
+      assert.equal(payload.OrderConfirmID, 'meta-17');
+      assert.equal(payload.OrderConfirmID.length <= 22, true);
+      assert.equal(Object.hasOwn(payload, 'OrderConfirmId'), false);
       if (state.loss) throw new Error('private-secret raw upstream exception');
     }
     if (state.hang === stage) return new Promise(() => {});
@@ -806,19 +808,46 @@ test('late PlaceOrder stays ambiguous without another send', async () => {
   assert.equal(h.postCount(), 1);
   assert.equal(h.time.pending(), 0);
 });
-test('generic Impress hook never logs credentials or Authorization', () => {
+test('generic Impress hook logs only safe execution fields', () => {
   const h = harness();
   const hook = load('api/hook.1.js', h.globals);
-  hook.router({
-    method: 'execution/submit',
-    args: input(),
-    verb: 'POST',
-    headers: { Authorization: 'private-service-token' },
-  });
+  for (const action of ['submit', 'lookup', 'capabilities']) {
+    const method = `execution/${action}`;
+    const args = Object.defineProperty(input(), 'credentials', {
+      get: () => assert.fail('hook accessed execution credentials'),
+    });
+    hook.router({
+      method,
+      args,
+      verb: 'POST',
+      headers: { Authorization: 'private-service-token' },
+    });
+    assert.deepEqual(plain(h.logs.at(-1)), [
+      { method, ip: '127.0.0.1', verb: 'POST' },
+    ]);
+  }
   const logs = JSON.stringify(h.logs);
   assert.equal(logs.includes('private'), false);
   assert.equal(logs.includes('credentials'), false);
   assert.equal(logs.includes('Authorization'), false);
+});
+test('generic Impress hook preserves logging for other methods', () => {
+  const h = harness();
+  const hook = load('api/hook.1.js', h.globals);
+  const args = { symbol: 'AAPL' };
+  const headers = { 'content-type': 'application/json' };
+  hook.router({ method: 'marketdata/quotes', args, verb: 'POST', headers });
+  assert.deepEqual(plain(h.logs), [
+    [
+      {
+        method: 'marketdata/quotes',
+        args,
+        ip: '127.0.0.1',
+        verb: 'POST',
+        headers,
+      },
+    ],
+  ]);
 });
 test('installed Impress/Metacom dispatch the protected HTTP hook', async () => {
   const { Api } = require(path.join(root, 'node_modules/impress/lib/api.js'));

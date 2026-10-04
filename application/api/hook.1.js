@@ -1,8 +1,12 @@
 ({
-  router({ method, verb }) {
+  router({ method, args, verb, headers }) {
     const ip = context.client.ip;
-    // Hook bodies and headers may contain execution credentials.
-    console.log({ method, ip, verb });
+    // Protected execution bodies and headers may contain credentials.
+    if (['execution/submit', 'execution/lookup', 'execution/capabilities'].includes(method)) {
+      console.log({ method, ip, verb });
+    } else {
+      console.log({ method, args, ip, verb, headers });
+    }
     return {};
   },
 });
