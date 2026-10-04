@@ -5,6 +5,7 @@
 Читать `AGENTS.md`, `doc/ai/project-invariants.md`, `doc/ai/chatgpt/project-settings.md` и релевантный код/модульную документацию.
 
 Canonical правила и шаблоны находятся на ветке `ai-task-queue` в `doc/pipeline/v8.3.0/`:
+
 - `contract-schema.md`, `router-policy.md`, `worker-rules.md`, `verification-policy.md`;
 - `implementation.example.md`, `test-only.example.md`, `acceptance.example.json`.
 
