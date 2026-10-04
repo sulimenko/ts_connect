@@ -289,6 +289,178 @@ test('changed and invalid replays never reject anew or send', async () => {
     assert.equal(h.logs.length, 0);
   }
 });
+test('orderId alone owns immutable attempt identity', () => {
+  const h = harness();
+  const registry = h.globals.domain.execution.attempts;
+  const data = input();
+  for (const orderId of [0, -1, NaN, 1.5, '17', null, undefined]) {
+    const claim = registry.claim({ ...data, orderId }, 'intent-1');
+    assert.equal(claim.owner, false);
+    assert.equal(claim.conflict, true);
+    assert.equal(claim.attempt, null);
+  }
+  const first = registry.claim(data, 'intent-1');
+  assert.equal(first.owner, true);
+  assert.deepEqual(plain(first.attempt), {
+    account: data.account,
+    live: data.live,
+    fingerprint: 'intent-1',
+    brokerId: null,
+    result: null,
+  });
+  for (const changed of [
+    { ...data, account: 'EXT-2' },
+    { ...data, live: false },
+    { ...data, account: 'EXT-2', live: false, credentials: null },
+  ]) {
+    const claim = registry.claim(changed, 'intent-1');
+    assert.equal(claim.owner, false);
+    assert.equal(claim.conflict, true);
+    assert.equal(claim.attempt, first.attempt);
+    assert.equal(registry.get(changed), first.attempt);
+  }
+  const changedIntent = registry.claim(data, 'intent-2');
+  assert.equal(changedIntent.owner, false);
+  assert.equal(changedIntent.conflict, true);
+  const replay = registry.claim({ ...data, credentials: null }, 'intent-1');
+  assert.equal(replay.owner, false);
+  assert.equal(replay.conflict, false);
+  assert.equal(replay.attempt, first.attempt);
+  assert.equal(
+    registry.claim({ ...data, orderId: 18 }, 'intent-1').owner,
+    true,
+  );
+});
+test('account/live replay cannot place after ack or loss', async () => {
+  for (const loss of [false, true]) {
+    for (const live of [false, true]) {
+      const h = harness();
+      const data = { ...input(), live };
+      h.state.loss = loss;
+      h.state.rotate = true;
+      // Both accounts are valid upstream: a second owner could place again.
+      h.state.responses.accounts = {
+        Accounts: [{ AccountID: 'EXT-1' }, { AccountID: 'EXT-2' }],
+      };
+      const first = await h.invoke('submit', data);
+      assert.equal(first.state, loss ? 'ambiguous' : 'acknowledged');
+      const attempt = h.globals.domain.execution.attempts.get(data);
+      const saved = plain(attempt);
+      h.state.loss = false;
+      const before = h.calls.length;
+      for (const credentials of [
+        data.credentials,
+        {
+          pkey: 'changed-key',
+          secret: 'changed-secret',
+          refresh_token: 'changed-refresh',
+        },
+        null,
+      ]) {
+        for (const changed of [
+          { account: 'EXT-2' },
+          { live: !live },
+          { account: 'EXT-2', live: !live },
+          { intent: { ...data.intent, quantity: 3 } },
+          {
+            account: 'EXT-2',
+            live: !live,
+            intent: { ...data.intent, quantity: 3 },
+          },
+        ]) {
+          const result = await h.invoke('submit', {
+            ...data,
+            ...changed,
+            credentials,
+          });
+          assert.equal(result.state, 'ambiguous');
+          assert.equal(result.broker, null);
+          assert.equal(result.accessUpdate, undefined);
+          assert.equal(h.calls.length, before);
+          assert.equal(h.postCount(), 1);
+          assert.deepEqual(plain(attempt), saved);
+        }
+        assert.deepEqual(
+          plain(await h.invoke('submit', { ...data, credentials })),
+          saved.result,
+        );
+      }
+      assert.equal(h.calls.length, before);
+      assert.equal(h.postCount(), 1);
+      assert.equal(JSON.stringify(attempt).includes('private'), false);
+      assert.equal(JSON.stringify(attempt).includes('refresh'), false);
+      assert.equal(h.logs.length, 0);
+    }
+  }
+});
+test('pending PlaceOrder retains account/live ownership', async () => {
+  const h = harness({ clock: true });
+  const data = input();
+  h.state.hang = 'place';
+  h.state.responses.accounts = {
+    Accounts: [{ AccountID: 'EXT-1' }, { AccountID: 'EXT-2' }],
+  };
+  const pending = h.invoke('submit', data);
+  await flush();
+  assert.equal(h.postCount(), 1);
+  const before = h.calls.length;
+  for (const changed of [
+    data,
+    { ...data, account: 'EXT-2' },
+    { ...data, live: false },
+    { ...data, account: 'EXT-2', live: false, credentials: null },
+  ]) {
+    assert.equal((await h.invoke('submit', changed)).state, 'ambiguous');
+    assert.equal(h.calls.length, before);
+  }
+  h.time.advance(12000);
+  assert.equal((await pending).state, 'ambiguous');
+  assert.equal((await h.invoke('submit', data)).state, 'ambiguous');
+  assert.equal(h.postCount(), 1);
+  assert.equal(h.time.pending(), 0);
+});
+test('registered lookup closes account/live identity conflicts', async () => {
+  for (const loss of [false, true]) {
+    const h = harness();
+    const data = input();
+    h.state.loss = loss;
+    await h.invoke('submit', data);
+    const attempt = h.globals.domain.execution.attempts.get(data);
+    const saved = plain(attempt);
+    const before = h.calls.length;
+    for (const changed of [
+      { account: 'EXT-2' },
+      { live: false },
+      { account: 'EXT-2', live: false },
+    ]) {
+      for (const broker of [{}, { brokerId: 'B-1' }, { brokerId: 'OTHER' }]) {
+        const result = await h.invoke('lookup', {
+          ...data,
+          ...changed,
+          ...broker,
+          credentials: {
+            ...data.credentials,
+            refresh_token: 'changed-refresh',
+          },
+        });
+        assert.equal(result.state, 'source_unavailable');
+        assert.equal(h.calls.length, before);
+        assert.equal(
+          h.globals.domain.execution.attempts.get({ ...data, ...changed }),
+          attempt,
+        );
+        assert.deepEqual(plain(attempt), saved);
+      }
+    }
+    assert.equal(
+      (await h.invoke('lookup', { ...data, brokerId: 'B-1' })).state,
+      'found',
+    );
+    assert.deepEqual(plain(attempt), saved);
+    assert.deepEqual(plain(await h.invoke('submit', data)), saved.result);
+    assert.equal(h.postCount(), 1);
+  }
+});
 test('lost response and restart allow only known OrderID lookup', async () => {
   const h = harness();
   const data = input();

@@ -12,6 +12,9 @@ async ({ action, data, deadline }) => {
   let attempt = domain.execution.attempts.get(data);
   // A registered attempt takes precedence over ALL new intent/credential
   // validation. No changed or malformed replay grants another broker POST.
+  if (attempt && (attempt.account !== account || attempt.live !== live)) {
+    return result(action === 'submit' ? 'ambiguous' : 'source_unavailable');
+  }
   if (action === 'submit' && attempt) {
     return fingerprintOf() === attempt.fingerprint ? attempt.result || result('ambiguous') : result('ambiguous');
   }
