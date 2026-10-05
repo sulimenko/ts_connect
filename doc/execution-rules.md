@@ -1,4 +1,4 @@
-# T-072: защищённый execution/rules v1
+# Защищённый execution/rules v1
 
 `POST /api/execution/rules` использует существующий service boundary T-068:
 `Authorization: Bearer <service-token>` и `X-Service-Identity`. Проверка проходит
@@ -69,7 +69,7 @@ Authenticated malformed request, exception и неполные доказате�
 
 ## Доказательства и ограниченный submit domain
 
-Каждый вызов выполняет OAuth refresh существующим execution transport, затем
+В provisioned режиме каждый вызов выполняет OAuth refresh существующим execution transport, затем
 только GET accounts, SymbolDetails и routes. Общий deadline — 18 секунд;
 нет кэша, реестра rules, Back calls или PlaceOrder. AccountID должен точно
 встречаться один раз в выбранной live/SIM среде. Для account proof нужны
@@ -193,9 +193,66 @@ Finite maximum требует authoritative evidence; unknown maximum — infini
 Fractional и schedule quantity без полной доказанной
 интерпретации unavailable; step=1 не подставляется.
 
+## T-073: источник connector_env для rules/submit/lookup
+
+В существующих rules v1 и submit/lookup v2 requests можно указать
+`credential_source: "connector_env"` и **убрать** `credentials`. Отсутствующий
+`credential_source` и явный `"provisioned"` сохраняют прежнюю credentials
+validation, OAuth transport, rotation и envelopes. Неизвестный source запрещён.
+Capabilities и wire responses не расширяются.
+
+Local gate использует comma-separated `TRADING_TS_CONNECTOR_ENV_ACCOUNTS` через
+`config.execution.connectorEnvAccounts`: пробелы вокруг элементов удаляются,
+пустые элементы пропускаются, account сравнивается точно с полной строкой.
+Утверждённая конфигурация:
+`SIM2811593M,11957784,12062622,12062620,11827414,12062623`.
+Отсутствующая/пустая конфигурация запрещает режим; встроенного разрешающего
+fallback нет. Изменённый регистр, prefix и wildcard не дают совпадение.
+
+`credentials` с любым значением, отдельные credential/token поля (включая
+вложенные pkey/secret/rtoken, refresh/access token и их aliases) запрещены.
+Local отказ происходит без чтения их значений, client setup или сети.
+Service token и identity проверяются раньше local gate, request secrets,
+client registry и attempts.
+
+После local gate execution вызывает только
+`domain.ts.clients.getClient({name: 'ptfin', sync: false})`. Второй независимый
+gate требует точный ключ account в `client.brokerage.accounts` и строгое
+`contract.live === request.live`, где live — boolean. Имя account не определяет
+live. Execution не загружает contracts, не запускает streams и не вызывает
+sync, update или deleteClient ради подтверждения. Поэтому cold client с пустым
+registry account безопасно отказывает даже после успешного token setup.
+Broker accounts остаётся отдельным proof для rules/submit; SymbolDetails,
+routes, intent и authoritative positions проверяются по прежним правилам.
+
+Env credentials остаются в существующем `config.ts.ptfin` / ptfin client,
+загружаемом из локального .env. Они не переносятся в execution request data.
+При пригодном access token новый refresh не выполняется. Необходимый refresh
+и уже выполняющийся refresh разделяют `client.refreshAccessToken` single-flight
+с normal lifecycle; cold setup разделяет registry single-flight. Execution
+ограничивает ожидание своим deadline, не отменяя общую операцию. Перед каждым
+broker request повторно проверяются deadline, closed, registry/live и token,
+а Authorization берётся из актуального client token после refresh.
+
+Rules отказы используют существующие `invalid_request` (source/request secrets),
+`account_unconfirmed` (local allowlist/registry/live) и `source_unavailable`
+(client/setup/refresh/deadline). Submit до отправки возвращает `rejected`,
+lookup — `source_unavailable`. Начатый POST сохраняет прежнюю ambiguity.
+Connector_env никогда не возвращает `accessUpdate`, в том числе после refresh,
+при unavailable/rejection/ambiguous и replay. Secrets и raw exceptions не
+попадают в envelopes, логи или attempts. OAuth rotation persistence normal
+client lifecycle не изменяется.
+
+OrderId остаётся единственной identity attempts. Синхронный claim выполняется
+до первого await. Зарегистрированный submit receipt имеет прежний приоритет
+над повторной validation: смена source/account/live/intent или malformed replay
+не разрешают ещё один POST и не возвращают rotation. Worker-local receipts,
+lost-response recovery, current/history lookup, known broker ID после restart
+и `restart_safe: false` сохраняются. Пустой current/history не доказывает not_found.
+
 ## OAuth и проверки
 
-Если refresh_token ротирован, он возвращается **только** в существующем
+В provisioned режиме, если refresh_token ротирован, он возвращается **только** в существующем
 protected service-envelope `accessUpdate: {refresh_token: '...'}` вне rules data,
 в том числе при последующей ошибке source/proof. Access token никогда не
 возвращается. Secrets, args и headers не логируются; rotation не сохраняется
@@ -210,6 +267,14 @@ combination proof, decimal grids/ranges/precision, mandatory minimum/step/fracti
 rotation на ready и unavailable, safe hook и неизменный T-068 transport guard. Все broker ответы подменены: реальные orders не вызываются.
 Проверки: `npm test`, `npm run lint`, `npm run types`,
 `BASE_BRANCH=develop CHECK_MODE=default bash doc/ai/project-checks.sh`.
+
+T-073 scenarios проверяют все шесть accounts для rules/submit/lookup, exact
+allowlist, запрет request secrets и раннюю auth, независимый registry/live gate,
+token reuse, реальные registry/client single-flight с mock upstream, bounded
+setup/refresh и отсутствие позднего POST, closed/missing-token/refresh failures,
+смену token перед placement, replay/source collision, current/history и restart
+recovery. Реальный Impress dispatch проверяет оба источника. Broker transport
+и OAuth upstream подменены; реальные orders и .env не используются.
 
 Port выполнен из локальной `ai/T-071-v84` (a5d9db8), diff относительно утверждённой
 базы `55fe95574f58b61c5610ab9b3c221b61910f0bcb`. Старый локальный develop не
