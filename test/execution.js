@@ -48,6 +48,27 @@ const rulesInput = () => ({
     currency: 'USD',
   },
 });
+const connectorFailure = (action) =>
+  ({ rules: 'unavailable', submit: 'rejected', lookup: 'source_unavailable' })[
+    action
+  ];
+const connectorAccounts = [
+  ['SIM2811593M', false],
+  ['11957784', true],
+  ['12062622', true],
+  ['12062620', true],
+  ['11827414', true],
+  ['12062623', true],
+];
+const connectorInput = (action, account = 'SIM2811593M', live = false) => {
+  const data = action === 'rules' ? rulesInput() : input();
+  delete data.credentials;
+  data.account = account;
+  data.live = live;
+  data.credential_source = 'connector_env';
+  if (action === 'lookup') data.brokerId = 'B-1';
+  return data;
+};
 // Documented SymbolDetailsResponse MSFT example, OpenAPI 2026-04-11.
 // No invented OrderTypes/TimeInForce/Rules fields provide combination proof.
 const symbolDetails = () => ({
@@ -181,6 +202,8 @@ function harness({ clock = false } = {}) {
     rotate: false,
     hang: null,
     jsonHang: null,
+    account: 'EXT-1',
+    accessToken: 'private-access',
   };
   const globals = {
     node: { crypto },
@@ -213,7 +236,7 @@ function harness({ clock = false } = {}) {
     accounts: () => ({
       Accounts: [
         {
-          AccountID: state.mismatch ? 'OTHER' : 'EXT-1',
+          AccountID: state.mismatch ? 'OTHER' : state.account,
           AccountType: 'Cash',
           Status: 'Active',
           Currency: 'USD',
@@ -229,9 +252,14 @@ function harness({ clock = false } = {}) {
     positions: () => ({ Positions: [] }),
     place: () => ({ Orders: [{ OrderID: 'B-1' }] }),
     current: () => ({
-      Orders: [order({ Status: state.unknown ? 'UNKNOWN' : 'FLL' })],
+      Orders: [
+        order({
+          AccountID: state.account,
+          Status: state.unknown ? 'UNKNOWN' : 'FLL',
+        }),
+      ],
     }),
-    historical: () => ({ Orders: [order()] }),
+    historical: () => ({ Orders: [order({ AccountID: state.account })] }),
   };
   globals.fetch = async (url, options) => {
     let stage = 'current';
@@ -247,7 +275,10 @@ function harness({ clock = false } = {}) {
       assert.ok(options.body.includes('grant_type=refresh_token'));
       assert.equal(options.redirect, 'error');
     } else {
-      assert.equal(options.headers.Authorization, 'Bearer private-access');
+      assert.equal(
+        options.headers.Authorization,
+        `Bearer ${state.accessToken}`,
+      );
     }
     if (stage === 'place') {
       const payload = JSON.parse(options.body);
@@ -278,6 +309,8 @@ function harness({ clock = false } = {}) {
   globals.lib.utils = load('lib/utils.js', globals);
   for (const name of [
     'request',
+    'credentialSource',
+    'authorization',
     'protocol',
     'broker',
     'handle',
@@ -320,6 +353,804 @@ function harness({ clock = false } = {}) {
     hook,
   };
 }
+async function connectorHarness({ cold = false } = {}) {
+  const h = harness({ clock: true });
+  const { globals } = h;
+  globals.config.execution.connectorEnvAccounts = connectorAccounts.map(
+    ([account]) => account,
+  );
+  globals.config.ts = {
+    ptfin: {
+      pkey: 'env-private-key',
+      secret: 'env-private-secret',
+      rtoken: 'env-private-refresh',
+    },
+  };
+  const client = await load('domain/ts/client.js', globals)();
+  client.tokens.access = h.state.accessToken;
+  client.tokens.expires = new globals.Date(globals.Date.now() + 120000);
+  const populate = () => {
+    for (const [account, live] of connectorAccounts) {
+      client.brokerage.accounts.set(account, { account, live });
+    }
+  };
+  if (!cold) populate();
+  const lifecycle = {
+    get: [],
+    factories: 0,
+    refreshes: 0,
+    syncs: 0,
+    allowSync: false,
+    refreshGate: null,
+    refreshError: null,
+    missingToken: false,
+  };
+  client.syncBrokerageStreams = async () => {
+    assert.ok(lifecycle.allowSync, 'execution started brokerage sync');
+    lifecycle.syncs++;
+    populate();
+    return true;
+  };
+  globals.lib.ptfin = {
+    getContract: () => assert.fail('execution loaded contracts'),
+  };
+  globals.lib.ts = {
+    stream: () => assert.fail('execution started streams'),
+    refresh: load('lib/ts/refresh.js', globals),
+    send: async ({ data }) => {
+      lifecycle.refreshes++;
+      assert.equal(data.client_id, 'env-private-key');
+      assert.equal(data.client_secret, 'env-private-secret');
+      assert.equal(data.refresh_token, 'env-private-refresh');
+      if (lifecycle.refreshGate) await lifecycle.refreshGate;
+      if (lifecycle.refreshError) throw lifecycle.refreshError;
+      if (lifecycle.missingToken) return {};
+      h.state.accessToken = 'refreshed-private-access';
+      return {
+        access_token: h.state.accessToken,
+        expires_in: 600,
+        refresh_token: 'env-private-rotation',
+      };
+    },
+  };
+  // Real setup and refresh single-flight, with only upstream transport mocked.
+  globals.domain.ts = {
+    client: async () => {
+      lifecycle.factories++;
+      return client;
+    },
+    orders: { clearAccount: () => {} },
+    clients: load('domain/ts/clients.js', globals),
+  };
+  const clients = globals.domain.ts.clients;
+  clients.deleteClient = () => assert.fail('execution deleted/updated client');
+  const getClient = clients.getClient.bind(clients);
+  clients.getClient = (options) => {
+    lifecycle.get.push(plain(options));
+    return getClient(options);
+  };
+  if (!cold) {
+    clients.values.ptfin = client;
+    client.key = { pkey: 'env-private-key', secret: 'env-private-secret' };
+    client.tokens.refresh = 'env-private-refresh';
+  }
+  h.state.account = 'SIM2811593M';
+  return { ...h, client, clients, lifecycle };
+}
+const safeConnector = (h, ...responses) => {
+  for (const response of responses) {
+    assert.equal(Object.hasOwn(response, 'accessUpdate'), false);
+  }
+  const receipt = h.globals.domain.execution.attempts.get({ orderId: 17 });
+  assert.doesNotMatch(
+    JSON.stringify([responses, receipt, h.logs]),
+    /private|pkey|secret|rtoken|refresh_token|access_token|accessUpdate/,
+  );
+};
+test('connector_env uses registry live for all six accounts', async () => {
+  for (const [account, live] of connectorAccounts) {
+    for (const action of ['rules', 'submit', 'lookup']) {
+      const h = await connectorHarness();
+      h.state.account = account;
+      const data = connectorInput(
+        action,
+        account,
+        h.client.brokerage.accounts.get(account).live,
+      );
+      const result = await h.invoke(action, data);
+      assert.equal(
+        result.state,
+        { rules: 'ready', submit: 'acknowledged', lookup: 'found' }[action],
+      );
+      assert.ok(
+        h.calls.every(({ url }) =>
+          url.startsWith(
+            live
+              ? 'https://api.tradestation.com/v3/'
+              : 'https://sim-api.tradestation.com/v3/',
+          ),
+        ),
+      );
+      assert.equal(h.lifecycle.refreshes, 0);
+      assert.deepEqual(h.lifecycle.get, [{ name: 'ptfin', sync: false }]);
+      assert.equal(h.lifecycle.syncs, 0);
+      assert.equal(
+        h.calls.some(({ stage }) => stage === 'oauth'),
+        false,
+      );
+      if (action === 'rules') {
+        assert.deepEqual(plain(result), expectedRules(data));
+      }
+      safeConnector(h, result);
+    }
+  }
+  // The registry, even for a SIM-looking name, is the sole source of live.
+  const h = await connectorHarness();
+  h.client.brokerage.accounts.get('SIM2811593M').live = true;
+  assert.equal(
+    (await h.invoke('rules', connectorInput('rules', 'SIM2811593M', true)))
+      .state,
+    'ready',
+  );
+  assert.ok(
+    h.calls.every(({ url }) =>
+      url.startsWith('https://api.tradestation.com/v3/'),
+    ),
+  );
+});
+
+test('connector_env parses exact allowlist with no fallback', async () => {
+  for (const value of [
+    undefined,
+    '',
+    ' , ',
+    ' SIM2811593M , 11957784 ',
+    'SIM*,119*',
+  ]) {
+    const h = await connectorHarness();
+    const execution = load('config/execution.js', {
+      process: { env: { TRADING_TS_CONNECTOR_ENV_ACCOUNTS: value } },
+    });
+    h.globals.config.execution.connectorEnvAccounts =
+      execution.connectorEnvAccounts;
+    const result = await h.invoke('rules', connectorInput('rules'));
+    assert.equal(
+      result.state,
+      value === ' SIM2811593M , 11957784 ' ? 'ready' : 'unavailable',
+    );
+    if (result.state !== 'ready') {
+      assert.equal(result.reason, 'account_unconfirmed');
+      assert.equal(h.lifecycle.get.length, 0);
+      assert.equal(h.calls.length, 0);
+    }
+  }
+});
+
+test('connector_env local denial skips clients and network', async () => {
+  for (const action of ['rules', 'submit', 'lookup']) {
+    for (const change of [
+      { account: 'OTHER' },
+      { account: 'sim2811593m' },
+      { account: 'SIM2811593' },
+      { account: 'SIM2811593MX' },
+      { account: 'SIM*' },
+      { account: '1195778' },
+      { credential_source: 'unknown' },
+      { credential_source: null },
+      { credential_source: '' },
+      { credential_source: undefined },
+      { intent: { ...input().intent, pkey: 'private-request-key' } },
+      {
+        instrument: {
+          ...rulesInput().instrument,
+          access_token: 'private-request-token',
+        },
+      },
+      { extra: { nested: { credentials: null } } },
+      ...[null, undefined, '', {}, [], 0, false, input().credentials].map(
+        (credentials) => ({ credentials }),
+      ),
+      ...[
+        'pkey',
+        'secret',
+        'rtoken',
+        'refresh_token',
+        'access_token',
+        'id_token',
+        'token',
+        'tokens',
+        'accessToken',
+        'refreshToken',
+        'client_id',
+        'client_secret',
+        'api_key',
+        'authorization',
+      ].map((key) => ({ [key]: 'private-request-secret' })),
+    ]) {
+      const h = await connectorHarness();
+      const data = { ...connectorInput(action), ...change };
+      for (const key of Object.keys(change).filter(
+        (key) =>
+          /credential|token|secret|pkey/.test(key) &&
+          key !== 'credential_source',
+      )) {
+        Object.defineProperty(data, key, {
+          get: () => assert.fail('execution read request secret'),
+          enumerable: true,
+        });
+      }
+      const result = await h.invoke(action, data);
+      assert.equal(result.state, connectorFailure(action));
+      assert.equal(h.lifecycle.get.length, 0);
+      assert.equal(h.lifecycle.refreshes, 0);
+      assert.equal(h.calls.length, 0);
+      assert.equal(h.globals.domain.execution.attempts.get(data), null);
+      safeConnector(h, result);
+    }
+    for (const accounts of [
+      undefined,
+      [],
+      ['SIM*'],
+      ['sim2811593m'],
+      ['SIM2811593'],
+      ['SIM2811593MX'],
+    ]) {
+      const h = await connectorHarness();
+      h.globals.config.execution.connectorEnvAccounts = accounts;
+      const result = await h.invoke(action, connectorInput(action));
+      assert.equal(result.state, connectorFailure(action));
+      assert.equal(h.lifecycle.get.length, 0);
+      assert.equal(h.calls.length, 0);
+    }
+  }
+});
+
+test('connector_env service auth precedes all other access', async () => {
+  for (const action of ['rules', 'submit', 'lookup']) {
+    for (const options of [
+      { identity: 'wrong' },
+      { authorization: 'Bearer wrong' },
+    ]) {
+      const h = await connectorHarness();
+      const data = new Proxy(
+        {},
+        { get: () => assert.fail('unauthorized request inspected') },
+      );
+      Object.defineProperty(
+        h.globals.config.execution,
+        'connectorEnvAccounts',
+        { get: () => assert.fail('unauthorized allowlist accessed') },
+      );
+      Object.defineProperty(h.globals.domain, 'ts', {
+        get: () => assert.fail('unauthorized client accessed'),
+      });
+      Object.defineProperty(h.globals.domain.execution, 'attempts', {
+        get: () => assert.fail('unauthorized attempts accessed'),
+      });
+      assert.deepEqual(plain(await h.invoke(action, data, options)), {
+        state: 'unauthorized',
+      });
+      assert.equal(h.calls.length, 0);
+    }
+  }
+});
+
+test('connector_env registry/live denial skips broker calls', async () => {
+  for (const action of ['rules', 'submit', 'lookup']) {
+    for (const value of [
+      null,
+      { live: true },
+      { live: 0 },
+      { live: 'false' },
+      {},
+    ]) {
+      const h = await connectorHarness();
+      h.client.tokens.expires = 0;
+      h.client.brokerage.accounts.delete('SIM2811593M');
+      if (value) h.client.brokerage.accounts.set('SIM2811593M', value);
+      // Similar keys must not confirm the exact requested key.
+      h.client.brokerage.accounts.set('sim2811593m', { live: false });
+      h.client.brokerage.accounts.set('SIM2811593MX', { live: false });
+      const result = await h.invoke(action, connectorInput(action));
+      assert.equal(result.state, connectorFailure(action));
+      if (action === 'rules') {
+        assert.equal(result.reason, 'account_unconfirmed');
+      }
+      assert.equal(h.lifecycle.refreshes, 0);
+      assert.equal(h.calls.length, 0);
+      safeConnector(h, result);
+    }
+  }
+});
+
+test('connector_env cold setup shares normal client flight', async () => {
+  const h = await connectorHarness({ cold: true });
+  let release;
+  h.lifecycle.refreshGate = new Promise((resolve) => {
+    release = resolve;
+  });
+  h.lifecycle.allowSync = true;
+  const normal = h.clients.getClient({ name: 'ptfin' });
+  const rules = h.invoke('rules', connectorInput('rules'));
+  const submit = h.invoke('submit', connectorInput('submit'));
+  const lookup = h.invoke('lookup', connectorInput('lookup'));
+  await flush();
+  assert.equal(h.lifecycle.factories, 1);
+  assert.equal(h.lifecycle.refreshes, 1);
+  assert.equal(h.calls.length, 0);
+  release();
+  const [client, ready, acknowledged, found] = await Promise.all([
+    normal,
+    rules,
+    submit,
+    lookup,
+  ]);
+  assert.equal(client, h.client);
+  assert.equal(ready.state, 'ready');
+  assert.equal(acknowledged.state, 'acknowledged');
+  assert.equal(found.state, 'found');
+  assert.equal(h.lifecycle.syncs, 1); // Only the normal call requests sync.
+  assert.deepEqual(
+    h.lifecycle.get.slice(1),
+    Array(3).fill({ name: 'ptfin', sync: false }),
+  );
+  assert.equal(h.postCount(), 1);
+  safeConnector(h, ready, acknowledged, found);
+
+  const isolated = await connectorHarness({ cold: true });
+  const results = await Promise.all(
+    ['rules', 'submit', 'lookup'].map((action) =>
+      isolated.invoke(action, connectorInput(action)),
+    ),
+  );
+  assert.deepEqual(
+    results.map(({ state }) => state),
+    ['unavailable', 'rejected', 'source_unavailable'],
+  );
+  assert.equal(results[0].reason, 'account_unconfirmed');
+  assert.equal(isolated.lifecycle.factories, 1);
+  assert.equal(isolated.lifecycle.refreshes, 1);
+  assert.equal(isolated.lifecycle.syncs, 0);
+  assert.equal(isolated.calls.length, 0);
+  safeConnector(isolated, ...results);
+});
+
+test('connector_env refresh shares normal lifecycle flight', async () => {
+  for (const normalFirst of [false, true]) {
+    const h = await connectorHarness();
+    h.client.tokens.expires = 0;
+    let release;
+    h.lifecycle.refreshGate = new Promise((resolve) => {
+      release = resolve;
+    });
+    let normal;
+    if (normalFirst) {
+      normal = h.client.refreshAccessToken({ reason: 'lifetime' });
+    }
+    const pending = ['rules', 'submit', 'lookup'].map((action) =>
+      h.invoke(action, connectorInput(action)),
+    );
+    await flush();
+    if (!normalFirst) {
+      normal = h.client.refreshAccessToken({ reason: 'lifetime' });
+    }
+    assert.equal(h.lifecycle.refreshes, 1);
+    assert.equal(h.calls.length, 0);
+    release();
+    await normal;
+    const results = await Promise.all(pending);
+    assert.deepEqual(
+      results.map(({ state }) => state),
+      ['ready', 'acknowledged', 'found'],
+    );
+    assert.equal(h.lifecycle.refreshes, 1);
+    assert.ok(
+      h.calls.every(
+        ({ options }) =>
+          options.headers.Authorization === 'Bearer refreshed-private-access',
+      ),
+    );
+    // Existing persistence semantics.
+    assert.equal(h.client.tokens.refresh, 'env-private-refresh');
+    safeConnector(h, ...results);
+  }
+});
+
+test('connector_env bounds setup/refresh without late POST', async () => {
+  for (const cold of [false, true]) {
+    for (const action of ['rules', 'submit', 'lookup']) {
+      const h = await connectorHarness({ cold });
+      if (!cold) h.client.tokens.expires = 0;
+      let release;
+      h.lifecycle.refreshGate = new Promise((resolve) => {
+        release = resolve;
+      });
+      const pending = h.invoke(action, connectorInput(action));
+      await flush();
+      const flight = cold ? h.clients.connecting.ptfin : h.client.tokenRefresh;
+      h.time.advance(18000);
+      const result = await pending;
+      assert.equal(result.state, connectorFailure(action));
+      if (action === 'rules') assert.equal(result.reason, 'source_unavailable');
+      assert.equal(h.calls.length, 0);
+      assert.equal(
+        cold ? h.clients.connecting.ptfin : h.client.tokenRefresh,
+        flight,
+      );
+      release();
+      await flight;
+      await flush();
+      assert.equal(h.calls.length, 0);
+      safeConnector(h, result);
+      if (action === 'submit') {
+        assert.equal(
+          (await h.invoke(action, connectorInput(action))).state,
+          'rejected',
+        );
+      }
+    }
+  }
+  const h = await connectorHarness();
+  for (const action of ['rules', 'submit', 'lookup']) {
+    const data = connectorInput(action);
+    const result =
+      action === 'rules'
+        ? await h.globals.lib.execution.rules({
+            data,
+            deadline: h.time.Date.now(),
+          })
+        : await h.globals.lib.execution.handle({
+            action,
+            data,
+            deadline: h.time.Date.now(),
+          });
+    assert.equal(result.state, connectorFailure(action));
+  }
+  assert.equal(h.lifecycle.get.length, 0);
+  assert.equal(h.calls.length, 0);
+});
+
+test('connector_env safely handles client/token failures', async () => {
+  for (const action of ['rules', 'submit', 'lookup']) {
+    for (const failure of [
+      'closed',
+      'missing-client',
+      'setup-error',
+      'missing-token',
+      'refresh-error',
+      'refresh-false',
+      'close-during-refresh',
+      'registry-during-refresh',
+    ]) {
+      const h = await connectorHarness();
+      if (failure === 'closed') h.client.closed = true;
+      if (failure === 'missing-client') h.clients.getClient = async () => null;
+      if (failure === 'setup-error') {
+        h.clients.getClient = async () => {
+          throw new Error('private-secret setup exception');
+        };
+      }
+      if (failure === 'missing-token') {
+        h.client.tokens.access = null;
+        h.lifecycle.missingToken = true;
+      }
+      if (failure === 'refresh-error') {
+        h.client.tokens.expires = 0;
+        h.lifecycle.refreshError = new Error(
+          'private-secret private-access raw refresh exception',
+        );
+      }
+      if (failure === 'refresh-false') {
+        h.client.tokens.expires = 0;
+        h.client.refreshAccessToken = async () => false;
+      }
+      let release;
+      if (failure.endsWith('during-refresh')) {
+        h.client.tokens.expires = 0;
+        h.lifecycle.refreshGate = new Promise((resolve) => {
+          release = resolve;
+        });
+      }
+      const pending = h.invoke(action, connectorInput(action));
+      if (release) {
+        await flush();
+        if (failure === 'close-during-refresh') await h.client.close();
+        else h.client.brokerage.accounts.get('SIM2811593M').live = true;
+        release();
+      }
+      const result = await pending;
+      assert.equal(result.state, connectorFailure(action));
+      if (action === 'rules') assert.equal(result.reason, 'source_unavailable');
+      assert.equal(h.calls.length, 0);
+      safeConnector(h, result);
+    }
+  }
+});
+
+test('connector_env rechecks auth and token before POST', async () => {
+  for (const change of [
+    'closed',
+    'live',
+    'missing-token',
+    'refresh-error',
+    'deadline',
+    'refresh',
+  ]) {
+    const h = await connectorHarness();
+    const fetch = h.globals.fetch;
+    h.globals.fetch = async (url, options) => {
+      const response = await fetch(url, options);
+      if (url.endsWith('/positions')) {
+        if (change === 'closed') h.client.closed = true;
+        if (change === 'live') {
+          h.client.brokerage.accounts.get('SIM2811593M').live = true;
+        }
+        if (change === 'missing-token') {
+          h.client.tokens.access = null;
+          h.lifecycle.missingToken = true;
+        }
+        if (change === 'refresh-error') {
+          h.client.tokens.expires = 0;
+          h.lifecycle.refreshError = new Error('private-secret');
+        }
+        if (change === 'deadline') h.time.advance(18000);
+        if (change === 'refresh') h.client.tokens.expires = 0;
+      }
+      return response;
+    };
+    const result = await h.invoke('submit', connectorInput('submit'));
+    assert.equal(
+      result.state,
+      change === 'refresh' ? 'acknowledged' : 'rejected',
+    );
+    assert.equal(h.postCount(), change === 'refresh' ? 1 : 0);
+    if (change === 'refresh') {
+      assert.equal(
+        h.calls.at(-1).options.headers.Authorization,
+        'Bearer refreshed-private-access',
+      );
+    }
+    safeConnector(h, result);
+  }
+});
+
+test('connector_env concurrency and replay preserve one POST', async () => {
+  for (const loss of [false, true]) {
+    const h = await connectorHarness();
+    h.state.loss = loss;
+    const data = connectorInput('submit');
+    const first = h.invoke('submit', data);
+    assert.ok(
+      h.globals.domain.execution.attempts.get(data),
+      'claim must precede first await',
+    );
+    const concurrent = await h.invoke('submit', data);
+    assert.equal(concurrent.state, 'ambiguous');
+    const result = await first;
+    assert.equal(result.state, loss ? 'ambiguous' : 'acknowledged');
+    for (const change of [
+      { account: '11957784' },
+      { live: true },
+      { intent: { ...data.intent, quantity: 3 } },
+      { intent: null },
+      { intent: [] },
+      { credentials: null },
+      { credential_source: 'provisioned', credentials: input().credentials },
+      { credential_source: 'unknown' },
+      { credential_source: undefined },
+    ]) {
+      const before = h.calls.length;
+      const replay = await h.invoke('submit', { ...data, ...change });
+      assert.ok(['acknowledged', 'ambiguous'].includes(replay.state));
+      assert.equal(h.calls.length, before);
+      safeConnector(h, replay);
+    }
+    assert.equal(h.postCount(), 1);
+    const saved = plain(h.globals.domain.execution.attempts.get(data));
+    h.state.loss = false;
+    const lookup = await h.invoke('lookup', connectorInput('lookup'));
+    assert.equal(lookup.state, 'found');
+    assert.deepEqual(
+      plain(h.globals.domain.execution.attempts.get(data)),
+      saved,
+    );
+    safeConnector(h, result, concurrent, lookup);
+  }
+  const h = await connectorHarness();
+  h.state.account = 'EXT-1';
+  h.state.rotate = true;
+  const provisioned = await h.invoke('submit', input());
+  assert.ok(provisioned.accessUpdate);
+  const replay = await h.invoke('submit', {
+    ...input(),
+    credential_source: 'connector_env',
+    credentials: null,
+  });
+  assert.equal(replay.state, 'acknowledged');
+  safeConnector(h, replay);
+  assert.equal(h.postCount(), 1);
+});
+
+test('connector_env lookup preserves evidence and recovery', async () => {
+  for (const evidence of [
+    'current',
+    'historical',
+    'empty',
+    'malformed',
+    'partial',
+  ]) {
+    const h = await connectorHarness();
+    if (evidence !== 'current') h.state.responses.current = { Orders: [] };
+    if (evidence === 'empty') h.state.responses.historical = { Orders: [] };
+    if (evidence === 'malformed') {
+      h.state.responses.current = { Orders: [{ OrderID: 'OTHER' }] };
+    }
+    if (evidence === 'partial') {
+      h.state.responses.historical = {
+        Orders: [order({ AccountID: 'SIM2811593M' })],
+        NextToken: 'next',
+      };
+    }
+    const result = await h.invoke('lookup', connectorInput('lookup'));
+    assert.equal(
+      result.state,
+      ['current', 'historical'].includes(evidence)
+        ? 'found'
+        : 'source_unavailable',
+    );
+    assert.equal(h.postCount(), 0);
+    safeConnector(h, result);
+  }
+  const h = await connectorHarness();
+  assert.equal(
+    (await h.invoke('submit', connectorInput('submit'))).state,
+    'acknowledged',
+  );
+  const withoutId = connectorInput('lookup');
+  delete withoutId.brokerId;
+  assert.equal((await h.invoke('lookup', withoutId)).state, 'found');
+  const before = h.calls.length;
+  assert.equal(
+    (await h.invoke('lookup', { ...withoutId, brokerId: 'OTHER' })).state,
+    'source_unavailable',
+  );
+  assert.equal(h.calls.length, before);
+  h.restart();
+  assert.equal(
+    (await h.invoke('lookup', withoutId)).state,
+    'source_unavailable',
+  );
+  assert.equal(h.calls.length, before);
+  const restored = await h.invoke('lookup', connectorInput('lookup'));
+  assert.equal(restored.state, 'found');
+  assert.equal(h.postCount(), 1);
+  safeConnector(h, restored);
+});
+
+test('connector_env timeout leaves a shared waiter alive', async () => {
+  const h = await connectorHarness();
+  h.client.tokens.expires = 0;
+  let release;
+  h.lifecycle.refreshGate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const short = h.invoke('submit', connectorInput('submit'));
+  const long = h.globals.lib.execution.handle({
+    action: 'lookup',
+    data: connectorInput('lookup'),
+    deadline: h.time.Date.now() + 36000,
+  });
+  await flush();
+  assert.equal(h.lifecycle.refreshes, 1);
+  h.time.advance(18000);
+  const rejected = await short;
+  assert.equal(rejected.state, 'rejected');
+  assert.equal(h.calls.length, 0);
+  release();
+  const found = await long;
+  assert.equal(found.state, 'found');
+  assert.equal(h.postCount(), 0);
+  assert.equal(h.lifecycle.refreshes, 1);
+  safeConnector(h, rejected, found);
+});
+
+test('connector_env hanging refresh before POST stays rejected', async () => {
+  const h = await connectorHarness();
+  let release;
+  h.lifecycle.refreshGate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const fetch = h.globals.fetch;
+  h.globals.fetch = async (url, options) => {
+    const response = await fetch(url, options);
+    if (url.endsWith('/positions')) h.client.tokens.expires = 0;
+    return response;
+  };
+  const pending = h.invoke('submit', connectorInput('submit'));
+  await flush();
+  assert.equal(h.lifecycle.refreshes, 1);
+  h.time.advance(18000);
+  const rejected = await pending;
+  assert.equal(rejected.state, 'rejected');
+  assert.equal(h.postCount(), 0);
+  const flight = h.client.tokenRefresh;
+  release();
+  await flight;
+  await flush();
+  assert.equal(h.postCount(), 0);
+  safeConnector(h, rejected);
+});
+
+test('connector_env keeps rules proof and broker failures safe', async () => {
+  for (const [action, stage, body, expected] of [
+    ['rules', 'accounts', { Accounts: [] }, 'account_unconfirmed'],
+    ['rules', 'details', { Symbols: [] }, 'instrument_unconfirmed'],
+    ['rules', 'routes', { Routes: [] }, 'combination_unconfirmed'],
+    ['submit', 'positions', { Positions: [], NextToken: 'next' }, 'rejected'],
+    ['submit', 'place', { Orders: [] }, 'ambiguous'],
+    ['lookup', 'current', new Error('private-secret'), 'source_unavailable'],
+  ]) {
+    const h = await connectorHarness();
+    h.client.tokens.expires = 0;
+    h.state.responses[stage] = body;
+    const result = await h.invoke(action, connectorInput(action));
+    assert.equal(action === 'rules' ? result.reason : result.state, expected);
+    assert.equal(h.lifecycle.refreshes, 1);
+    safeConnector(h, result);
+  }
+  const h = await connectorHarness();
+  const fetch = h.globals.fetch;
+  h.globals.fetch = async (url, options) => {
+    const response = await fetch(url, options);
+    if (url.includes('/marketdata/symbols/')) {
+      await h.client.refreshAccessToken({ reason: 'lifetime' });
+    }
+    return response;
+  };
+  const ready = await h.invoke('rules', connectorInput('rules'));
+  assert.equal(ready.state, 'ready');
+  assert.equal(
+    h.calls.at(-1).options.headers.Authorization,
+    'Bearer refreshed-private-access',
+  );
+  safeConnector(h, ready);
+});
+
+test('explicit provisioned preserves rotation and validation', async () => {
+  for (const action of ['rules', 'submit', 'lookup']) {
+    const h = harness();
+    h.state.rotate = true;
+    const data = action === 'rules' ? rulesInput() : input();
+    if (action === 'lookup') data.brokerId = 'B-1';
+    Object.defineProperty(h.globals.domain, 'ts', {
+      get: () => assert.fail('provisioned accessed connector client'),
+    });
+    Object.defineProperty(h.globals.config.execution, 'connectorEnvAccounts', {
+      get: () => assert.fail('provisioned accessed connector allowlist'),
+    });
+    const result = await h.invoke(action, {
+      ...data,
+      credential_source: 'provisioned',
+    });
+    assert.equal(
+      result.state,
+      { rules: 'ready', submit: 'acknowledged', lookup: 'found' }[action],
+    );
+    assert.deepEqual(plain(result.accessUpdate), {
+      refresh_token: 'rotated-refresh',
+    });
+    assert.equal(h.calls[0].stage, 'oauth');
+    const invalid = harness();
+    const rejected = await invalid.invoke(action, {
+      ...data,
+      credential_source: 'provisioned',
+      credentials: null,
+    });
+    assert.equal(rejected.state, connectorFailure(action));
+    assert.equal(invalid.calls.length, 0);
+  }
+});
+
 test('auth rejects before touching credentials', async () => {
   const h = harness();
   const data = Object.defineProperty({}, 'credentials', {
@@ -1145,7 +1976,8 @@ test('installed Impress/Metacom dispatch the protected HTTP hook', async () => {
   const { metarhia } = require(
     path.join(root, 'node_modules/impress/lib/deps.js'),
   );
-  const h = harness();
+  const h = await connectorHarness();
+  h.state.account = 'EXT-1';
   const sandbox = metarhia.metavm.createContext({
     ...metarhia.metavm.COMMON_CONTEXT,
     ...h.globals,
@@ -1222,6 +2054,17 @@ test('installed Impress/Metacom dispatch the protected HTTP hook', async () => {
   assert.equal((await invoke('submit', input())).state, 'acknowledged');
   assert.equal((await invoke('submit', input())).state, 'acknowledged');
   assert.equal(h.postCount(), 1);
+  h.restart();
+  h.state.account = 'SIM2811593M';
+  const connectorReady = await invoke('rules', connectorInput('rules'));
+  const connectorSubmit = await invoke('submit', connectorInput('submit'));
+  const connectorLookup = await invoke('lookup', connectorInput('lookup'));
+  assert.equal(connectorReady.state, 'ready');
+  assert.equal(connectorSubmit.state, 'acknowledged');
+  assert.equal(connectorLookup.state, 'found');
+  assert.equal(h.postCount(), 2);
+  assert.equal(h.lifecycle.refreshes, 0);
+  safeConnector(h, connectorReady, connectorSubmit, connectorLookup);
   assert.equal(JSON.stringify(h.logs).includes('private'), false);
 });
 

@@ -1,6 +1,6 @@
 /* eslint-disable camelcase */
 async ({ action, data, deadline }) => {
-  const { account, live, orderId, credentials, intent } = data;
+  const { account, live, orderId, intent } = data;
   const result = (state, broker = null) => ({ version: 2, orderId, state, broker });
   const fingerprintOf = () => {
     try {
@@ -25,11 +25,16 @@ async ({ action, data, deadline }) => {
   }
   const brokerId = attempt?.brokerId || data.brokerId;
   if (action === 'lookup' && !validId(brokerId)) return result('source_unavailable');
-  if (
-    !credentials ||
-    !['pkey', 'secret', 'refresh_token'].every((name) => typeof credentials[name] === 'string' && credentials[name].trim())
-  ) {
-    return result(action === 'submit' ? 'rejected' : 'source_unavailable');
+  const selection = lib.execution.credentialSource({ data });
+  if (selection.reason) return result(action === 'submit' ? 'rejected' : 'source_unavailable');
+  if (selection.source === 'provisioned') {
+    const credentials = data.credentials;
+    if (
+      !credentials ||
+      !['pkey', 'secret', 'refresh_token'].every((name) => typeof credentials[name] === 'string' && credentials[name].trim())
+    ) {
+      return result(action === 'submit' ? 'rejected' : 'source_unavailable');
+    }
   }
   const base = live ? 'https://api.tradestation.com/v3' : 'https://sim-api.tradestation.com/v3';
   let body;
@@ -94,36 +99,13 @@ async ({ action, data, deadline }) => {
     if (action === 'submit') attempt.result = response;
     return accessUpdate ? { ...response, accessUpdate } : response;
   };
-  const request = (options) => lib.execution.request({ ...options, deadline });
   const parse = (kind, response) => lib.execution.protocol({ kind, response, account, brokerId });
   try {
-    const tokenResponse = await request({
-      url: 'https://signin.tradestation.com/oauth/token',
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      form: new URLSearchParams({
-        grant_type: 'refresh_token',
-        client_id: credentials.pkey,
-        client_secret: credentials.secret,
-        refresh_token: credentials.refresh_token,
-      }).toString(),
-    });
-    const token = tokenResponse.body;
-    if (
-      tokenResponse.status !== 200 ||
-      !token ||
-      Array.isArray(token) ||
-      typeof token.access_token !== 'string' ||
-      !token.access_token.trim() ||
-      ['error', 'Error', 'Errors', 'error_description'].some((name) => Object.hasOwn(token, name)) ||
-      (Object.hasOwn(token, 'refresh_token') && (typeof token.refresh_token !== 'string' || !token.refresh_token.trim()))
-    ) {
-      return finish(result(action === 'submit' ? 'rejected' : 'source_unavailable'));
-    }
-    if (typeof token.refresh_token === 'string' && token.refresh_token !== credentials.refresh_token) {
-      accessUpdate = { refresh_token: token.refresh_token };
-    }
-    const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${token.access_token}` };
+    const authorization = await lib.execution.authorization({ data, source: selection.source, deadline });
+    if (authorization.reason) return finish(result(action === 'submit' ? 'rejected' : 'source_unavailable'));
+    accessUpdate = authorization.accessUpdate;
+    const { request } = authorization;
+    const headers = { 'Content-Type': 'application/json' };
     if (action === 'submit') {
       const accounts = await request({ url: `${base}/brokerage/accounts`, headers });
       if (!parse('accounts', accounts)) return finish(result('rejected'));
