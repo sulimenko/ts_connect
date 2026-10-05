@@ -58,7 +58,7 @@ async ({ action, data, deadline }) => {
       !Array.isArray(intent.related) ||
       intent.related.length ||
       typeof intent.extended !== 'boolean' ||
-      intent.extended ||
+      (intent.extended && (intent.type !== 'limit' || intent.tif !== 'gtc')) ||
       (['limit', 'stop_limit'].includes(intent.type) && !price(intent.limitPrice)) ||
       (['stop', 'stop_limit'].includes(intent.type) && !price(intent.stopPrice)) ||
       (!['limit', 'stop_limit'].includes(intent.type) && intent.limitPrice !== null) ||
@@ -79,7 +79,7 @@ async ({ action, data, deadline }) => {
       Symbol: symbol,
       Quantity: String(Math.abs(quantity)),
       OrderType: types[intent.type],
-      TimeInForce: { Duration: tifs[intent.tif] },
+      TimeInForce: { Duration: intent.extended ? 'GCP' : tifs[intent.tif] },
       OrderConfirmID: `meta-${orderId}`,
     };
     if (['limit', 'stop_limit'].includes(intent.type)) body.LimitPrice = String(intent.limitPrice);

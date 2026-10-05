@@ -36,11 +36,11 @@
       exchange: instrument.Exchange,
       currency: instrument.Currency,
     },
-    orders: ['market', 'limit'].map((type) => ({
-      type,
-      tif: 'day',
-      session: 'regular',
-      extended: false,
+    orders: [
+      { type: 'market', tif: 'day', sessions: ['regular'] },
+      { type: 'limit', tif: 'gtc', sessions: ['regular', 'pre_market', 'post_market'] },
+    ].map((order) => ({
+      ...order,
       relation: 'NORMAL',
       orderClass: 'simple',
       quantityMode: 'whole',

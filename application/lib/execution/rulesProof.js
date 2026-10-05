@@ -56,9 +56,9 @@
   }
   // Documented atomic combinations, not OrderType x Duration enums.
   // OrderRequest.Route defaults to Intelligent (OpenAPI 2026-04-11).
-  // Intelligent covers US NYSE/AMEX/Nasdaq stocks. TradeStation's Basket Order
-  // documentation jointly confirms Market/Day and Limit/Day on that route. See
-  // doc/execution-rules.md for sources and the deliberately narrow coverage.
+  // Intelligent covers US NYSE/AMEX/Nasdaq stocks. Documented Market/Day and
+  // Limit/GTC+ cover regular-only and regular+pre/post sessions respectively.
+  // See doc/execution-rules.md for sources and the deliberately narrow coverage.
   const intelligent = routeRows.find((row) => row.Id === 'Intelligent');
   if (
     instrument.AssetType !== 'STOCK' ||
@@ -96,11 +96,11 @@
   const maximum = lib.execution.intelligentMaximum({
     instrument,
     route: intelligent.Id,
-    orders: ['market', 'limit'].map((type) => ({
-      type,
-      tif: 'day',
-      session: 'regular',
-      extended: false,
+    orders: [
+      { type: 'market', tif: 'day', sessions: ['regular'] },
+      { type: 'limit', tif: 'gtc', sessions: ['regular', 'pre_market', 'post_market'] },
+    ].map((order) => ({
+      ...order,
       relation: 'NORMAL',
       orderClass: 'simple',
       quantityMode: 'whole',

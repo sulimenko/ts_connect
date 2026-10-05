@@ -4,7 +4,9 @@
   // This is a trusted internal proof input, never request/broker extension
   // fields. API Routes has no selected-route/range/combination proof today.
   const source = 'https://help.tradestation.com/10_00/eng/tradestationhelp/routes/intelligent.htm';
-  const keys = ['type', 'tif', 'session', 'extended', 'relation', 'orderClass', 'quantityMode', 'side', 'positionEffect'];
+  const keys = ['type', 'tif', 'relation', 'orderClass', 'quantityMode', 'side', 'positionEffect'];
+  const sessionsMatch = (actual, expected) =>
+    Array.isArray(actual) && actual.length === expected.length && expected.every((session, index) => actual[index] === session);
   if (
     route !== 'Intelligent' ||
     instrument.AssetType !== 'STOCK' ||
@@ -24,17 +26,20 @@
     orders.length === 0 ||
     !orders.every(
       (order) =>
-        ['market', 'limit'].includes(order.type) &&
-        order.tif === 'day' &&
-        order.session === 'regular' &&
-        order.extended === false &&
+        order &&
+        ((order.type === 'market' && order.tif === 'day' && sessionsMatch(order.sessions, ['regular'])) ||
+          (order.type === 'limit' && order.tif === 'gtc' && sessionsMatch(order.sessions, ['regular', 'pre_market', 'post_market']))) &&
         order.relation === 'NORMAL' &&
         order.orderClass === 'simple' &&
         order.quantityMode === 'whole' &&
         order.side === 'buy' &&
         order.positionEffect === 'open' &&
         applicability.combinations.some(
-          (proven) => proven && keys.every((key) => Object.hasOwn(proven, key) && proven[key] === order[key]),
+          (proven) =>
+            proven &&
+            keys.every((key) => Object.hasOwn(proven, key) && proven[key] === order[key]) &&
+            Object.hasOwn(proven, 'sessions') &&
+            sessionsMatch(proven.sessions, order.sessions),
         ),
     )
   ) {
