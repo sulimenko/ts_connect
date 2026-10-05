@@ -41,11 +41,13 @@ finite maximum: согласно решению пользователя неи�
 
 - `identity`: `{terminal: 'TS', externalAccount: account, live: boolean}`.
 - `instrument`: `{symbol, assetCategory, exchange, currency: string|null}`.
-- `orders`: атомарные строки с полями `type`, `tif`, `session`, `extended`, `relation`,
+- `orders`: атомарные строки с полями `type`, `tif`, `sessions`, `relation`,
   `orderClass`, `quantityMode`, `side`, `positionEffect`, `quantity`.
-- `session`: `regular|pre_market|post_market|overnight`;
-  `extended = (session !== 'regular')`. Только regular имеет доказательство
-  для рассматриваемых Market/Day и Limit/Day; остальные session не рекламируются.
+- `sessions`: полный список сессий сочетания: `['regular']` для market/day и
+  `['regular', 'pre_market', 'post_market']` для limit/gtc (native GTC+).
+  Поля `session` и `extended` в Rule rows отсутствуют. Overnight, limit/day и
+  дополнительные сочетания не публикуются; выбора сессии или определения её
+  по часам нет.
 - Quantity каждой строки: `{fractional: boolean, minimum: string, step: string, maximum: string, minimumNotional}`.
   `fractional: false` согласован с `quantityMode: whole` в каждой строке.
   Для подтверждённых обычных ордеров в акциях используются explicit
@@ -86,21 +88,33 @@ NASDAQ/NYSE/AMEX. Endpoint routes должен независимо подтве
 Две доказанные комбинации для common v1 formatter (публикация требует полного
 minimum/step/fractional/price proof; неизвестный maximum допускается):
 
-| type   | tif | session | extended | relation | orderClass | quantityMode | side | positionEffect |
-| ------ | --- | ------- | -------- | -------- | ---------- | ------------ | ---- | -------------- |
-| market | day | regular | false    | NORMAL   | simple     | whole        | buy  | open           |
-| limit  | day | regular | false    | NORMAL   | simple     | whole        | buy  | open           |
+| type   | tif | sessions                         | relation | orderClass | quantityMode | side | positionEffect |
+| ------ | --- | -------------------------------- | -------- | ---------- | ------------ | ---- | -------------- |
+| market | day | regular                          | NORMAL   | simple     | whole        | buy  | open           |
+| limit  | gtc | regular, pre_market, post_market | NORMAL   | simple     | whole        | buy  | open           |
 
-Это консервативный subset T-068. Ready не обещает buying power, исполнение или
+Это консервативный subset T-075 в существующем rules v1. Ready не обещает buying power, исполнение или
 fill; T-068 продолжает самостоятельно проверять позиции и intent. Options,
 другие listing environments, стороны, position effects и TIF пока не имеют
 полного combination proof в этом adapter и не рекламируются. Подтверждённый OPT
-с неполной evidence возвращает unavailable. BRK/OCO и extended hours выключены;
+с неполной evidence возвращает unavailable. BRK/OCO выключены;
 fractional quantity не объявляется. Enum OrderType/Duration либо дополнительные
-клиентские поля не расширяют строки. Capabilities, submit/lookup/recovery,
+клиентские поля не расширяют строки. Capabilities, версии submit/lookup, recovery,
 `restart_safe=false` и durable barriers Metaterminal не изменены.
 
-Evidence для сочетаний (документация сверена 2026-10-04):
+Protected submit v2 сохраняет существующий boolean `intent.extended`.
+Для первого submit `extended: true` разрешён только при `type: 'limit'` и
+`tif: 'gtc'`: broker POST содержит `OrderType: 'Limit'`, действующий `LimitPrice`
+и `TimeInForce: {Duration: 'GCP'}`. Другой type/tif или неboolean extended
+возвращает `rejected` до OAuth/client setup и любых broker requests.
+`extended: false` сохраняет DAY/GTC/IOC/FOK mappings, quantity/price validation
+и прежние проверки позиций. Rules рекламируют только две строки выше;
+остальные прежние regular submit mappings не расширяют опубликованный domain.
+Зарегистрированный attempt сохраняет приоритет над новой validation:
+точный extended replay возвращает receipt, конфликтующий — `ambiguous`,
+повторный POST не разрешается. Acknowledged submit не подтверждает fill.
+
+Evidence для сочетаний (duration и Intelligent сверены 2026-10-05):
 
 1. OpenAPI snapshot 2026-04-11, индекс [openapi_20260411.md](openapi_20260411.md):
    GetAccounts/Account (AccountID, Status, AccountType, Currency),
@@ -109,7 +123,8 @@ Evidence для сочетаний (документация сверена 2026
    прямо задаёт Intelligent как default для stocks/options. Пример MSFT в
    SymbolDetails использован в broker fixture; он возвращает ready с
    `maximum: "infinity"`. Числовые значения minimum/step/price читаются из
-   ответа, а не из примера. Официальная [API specification](https://api.tradestation.com/docs/specification/).
+   ответа, а не из примера. Schema `Duration` определяет GCP как Good till
+   canceled plus. Официальная [API specification](https://api.tradestation.com/docs/specification/).
 2. [Intelligent](https://help.tradestation.com/10_00/eng/tradestationhelp/routes/intelligent.htm)
    подтверждает coverage US NYSE/AMEX/Nasdaq stocks и conditional диапазон
    quantity 1–1 000 000; применимость диапазона рассмотрена отдельно ниже.
@@ -118,9 +133,10 @@ Evidence для сочетаний (документация сверена 2026
    type/duration/route evidence, а не произведение enum-списков.
 4. [Trade Bar Durations for Equities](https://help.tradestation.com/10_00/eng/tradestationhelp/tb_definitions/trade_bar_durations_equities.htm)
    определяет Day как regular session.
-5. [.PlaceOrder Command](https://help.tradestation.com/10_00/eng/tradestationhelp/tb/placeorder_command.htm)
-   содержит explicit Buy/Equity/Limit/Day example. Используется только как
-   документальная evidence; ни этот command, ни любой order endpoint не вызывается.
+5. [GTC and GTD Orders](https://help.tradestation.com/10_00/eng/tradestationhelp/tb_definitions/gtc_gtd_orders.htm)
+   описывает GTC+ с extended pre-market и DAY+; совместно с Intelligent и
+   API Duration это evidence для одобренного limit/gtc regular+pre/post сочетания.
+   Эти источники не подтверждают применимость finite maximum ко всем сессиям.
 
 ### Результат исследования quantity maximum
 
@@ -133,10 +149,10 @@ quantity без maximum. Routes содержит только Id, Name и AssetT
 в broker payload не является подтверждённой границей.
 
 Официальная [Intelligent route help](https://help.tradestation.com/10_00/eng/tradestationhelp/routes/intelligent.htm),
-проверенная 2026-10-04, указывает 1–1 000 000 shares, но обусловливает диапазон
+проверенная 2026-10-05, указывает 1–1 000 000 shares, но обусловливает диапазон
 выбранным маршрутом. Intelligent выбирает downstream route при placement.
 API default Intelligent и наличие Id в GetRoutes не подтверждают выбранный
-маршрут и применимость этого диапазона к каждому Market/Day и Limit/Day
+маршрут и применимость этого диапазона к каждому Market/Day regular и Limit/GTC+
 сочетанию. Связь между conditional range в Desktop help и этими API orders
 не доказана. Поэтому production использует `"infinity"` по финальному правилу
 пользователя. Источник учтён; значение 1 000 000 не игнорируется и не переносится
@@ -150,7 +166,11 @@ API** и не вход endpoint. Сегодня production не имеет та�
 передаёт applicability. Клиентские и undocumented broker поля не могут её
 подставить. Helper fixture с синтетически подтверждённой применимостью ко всем
 строкам использует конечный maximum `"1000000"`; отсутствующая применимость,
-иной контекст и доказательство только одного из двух сочетаний дают infinity.
+иной контекст и доказательство только одного из двух сочетаний дают infinity
+в summary и каждой строке. Проверяются остальные параметры сочетания и полный
+`sessions` array, включая длину и каждый элемент. Частичный или несовпадающий
+список сессий не разрешает finite maximum. Прежний regular/day proof с
+`session`/`extended` не применяется автоматически к limit/gtc regular+pre/post.
 Никаких guessed route mappings, новых endpoints или пробных orders нет.
 
 `rulesReady` отделяет wire от broker proof: explicit `fractional: false`,
@@ -259,12 +279,17 @@ protected service-envelope `accessUpdate: {refresh_token: '...'}` вне rules d
 в ts_connect или placement receipts. Повторный вызов снова получает свежую
 evidence через read-only broker endpoints.
 
-`test/execution.js` проверяет documented regular ready fixture с infinity,
-finite maximum выше safe integer без clipping, per-combination fractional и session,
+`test/execution.js` проверяет ready fixture с двумя одобренными sessions rows и infinity,
+finite maximum выше safe integer без clipping, per-combination fractional и sessions,
 применимость официального Intelligent range, реальный Impress dispatch, раннюю auth,
 malformed/exception envelope, live/SIM identity, ambiguous instruments, отсутствие
 combination proof, decimal grids/ranges/precision, mandatory minimum/step/fractional,
-rotation на ready и unavailable, safe hook и неизменный T-068 transport guard. Все broker ответы подменены: реальные orders не вызываются.
+rotation на ready и unavailable, safe hook и неизменный T-068 transport guard.
+Extended limit/gtc проверяется с обоими credential sources: один GCP POST,
+ранний отказ неподдерживаемых intents, price/quantity validation, concurrency,
+точный/конфликтующий replay и lost-response/restart lookup. Regular intents
+сохраняют DAY/GTC/IOC/FOK и прежние price mappings.
+Все broker ответы подменены: реальные orders не вызываются.
 Проверки: `npm test`, `npm run lint`, `npm run types`,
 `BASE_BRANCH=develop CHECK_MODE=default bash doc/ai/project-checks.sh`.
 

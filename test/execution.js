@@ -36,6 +36,17 @@ const input = () => ({
     stopPrice: null,
   },
 });
+const extendedInput = () => {
+  const data = input();
+  data.intent = {
+    ...data.intent,
+    type: 'limit',
+    tif: 'gtc',
+    extended: true,
+    limitPrice: 125.5,
+  };
+  return data;
+};
 const rulesInput = () => ({
   version: 1,
   account: 'EXT-1',
@@ -121,11 +132,15 @@ const expectedRules = (data, maximum = 'infinity') => {
       exchange: 'NASDAQ',
       currency: 'USD',
     },
-    orders: ['market', 'limit'].map((type) => ({
-      type,
-      tif: 'day',
-      session: 'regular',
-      extended: false,
+    orders: [
+      { type: 'market', tif: 'day', sessions: ['regular'] },
+      {
+        type: 'limit',
+        tif: 'gtc',
+        sessions: ['regular', 'pre_market', 'post_market'],
+      },
+    ].map((order) => ({
+      ...order,
       relation: 'NORMAL',
       orderClass: 'simple',
       quantityMode: 'whole',
@@ -1409,22 +1424,23 @@ test('registered lookup closes account/live identity conflicts', async () => {
   }
 });
 test('lost response and restart allow only known OrderID lookup', async () => {
-  const h = harness();
-  const data = input();
-  h.state.loss = true;
-  assert.equal((await h.invoke('submit', data)).state, 'ambiguous');
-  const before = h.calls.length;
-  assert.equal((await h.invoke('lookup', data)).state, 'source_unavailable');
-  assert.equal((await h.invoke('submit', data)).state, 'ambiguous');
-  h.restart();
-  assert.equal((await h.invoke('lookup', data)).state, 'source_unavailable');
-  assert.equal(h.calls.length, before);
-  assert.equal(h.postCount(), 1);
-  assert.equal(
-    (await h.invoke('lookup', { ...data, brokerId: 'B-1' })).state,
-    'found',
-  );
-  assert.equal(h.postCount(), 1);
+  for (const data of [input(), extendedInput()]) {
+    const h = harness();
+    h.state.loss = true;
+    assert.equal((await h.invoke('submit', data)).state, 'ambiguous');
+    const before = h.calls.length;
+    assert.equal((await h.invoke('lookup', data)).state, 'source_unavailable');
+    assert.equal((await h.invoke('submit', data)).state, 'ambiguous');
+    h.restart();
+    assert.equal((await h.invoke('lookup', data)).state, 'source_unavailable');
+    assert.equal(h.calls.length, before);
+    assert.equal(h.postCount(), 1);
+    assert.equal(
+      (await h.invoke('lookup', { ...data, brokerId: 'B-1' })).state,
+      'found',
+    );
+    assert.equal(h.postCount(), 1);
+  }
 });
 test('brokerId conflicts close before OAuth', async () => {
   const h = harness();
@@ -1461,6 +1477,154 @@ test('invalid first intent and credentials cannot place', async () => {
     assert.equal((await h.invoke('submit', invalid)).state, 'rejected');
   }
   assert.equal(h.calls.length, 0);
+});
+test('extended limit/gtc uses GCP with either credential source', async () => {
+  for (const connector of [false, true]) {
+    const h = connector ? await connectorHarness() : harness();
+    const data = connector ? connectorInput('submit') : extendedInput();
+    data.intent = extendedInput().intent;
+    const result = await h.invoke('submit', data);
+    assert.equal(result.state, 'acknowledged');
+    assert.equal(h.postCount(), 1);
+    const placed = h.calls.find((call) => call.stage === 'place');
+    assert.equal(placed.options.method, 'POST');
+    assert.deepEqual(JSON.parse(placed.options.body), {
+      AccountID: data.account,
+      Symbol: 'AAPL',
+      Quantity: '2',
+      OrderType: 'Limit',
+      TimeInForce: { Duration: 'GCP' },
+      OrderConfirmID: 'meta-17',
+      LimitPrice: '125.5',
+      TradeAction: 'BUY',
+    });
+    if (connector) {
+      assert.deepEqual(plain(h.logs), [
+        ['getClient:', { name: 'ptfin', syncBrokerageStreams: false }],
+      ]);
+      safeConnector(h, result);
+    } else {
+      assert.deepEqual(h.logs, []);
+    }
+  }
+});
+test('extended first intent rejects before requests', async () => {
+  for (const connector of [false, true]) {
+    const h = connector ? await connectorHarness() : harness();
+    const data = connector ? connectorInput('submit') : extendedInput();
+    data.intent = extendedInput().intent;
+    const changes = [
+      ...['market', 'stop', 'stop_limit', 'unsupported'].map((type) => ({
+        type,
+        limitPrice: type === 'stop_limit' ? 125.5 : null,
+        stopPrice: ['stop', 'stop_limit'].includes(type) ? 120 : null,
+      })),
+      ...['day', 'ioc', 'fok', 'unsupported'].map((tif) => ({ tif })),
+      ...[undefined, null, 'true', 'false', 0, 1, {}].map((extended) => ({
+        extended,
+      })),
+      ...[undefined, null, 0, -1, NaN, Infinity, '125.5'].map((limitPrice) => ({
+        limitPrice,
+      })),
+      ...[0, 0.5, Number.MAX_SAFE_INTEGER + 1, '2'].map((quantity) => ({
+        quantity,
+      })),
+      { stopPrice: 120 },
+    ];
+    for (const change of changes) {
+      assert.equal(
+        (
+          await h.invoke('submit', {
+            ...data,
+            intent: { ...data.intent, ...change },
+          })
+        ).state,
+        'rejected',
+      );
+      assert.equal(h.calls.length, 0);
+      assert.equal(h.globals.domain.execution.attempts.get(data), null);
+    }
+    if (connector) assert.equal(h.lifecycle.get.length, 0);
+  }
+});
+test('regular intents keep DAY/GTC/IOC/FOK and prices', async () => {
+  const types = {
+    market: 'Market',
+    limit: 'Limit',
+    stop: 'StopMarket',
+    stop_limit: 'StopLimit',
+  };
+  for (const [type, nativeType] of Object.entries(types)) {
+    for (const [tif, duration] of Object.entries({
+      day: 'DAY',
+      gtc: 'GTC',
+      ioc: 'IOC',
+      fok: 'FOK',
+    })) {
+      const h = harness();
+      const data = input();
+      data.intent = {
+        ...data.intent,
+        type,
+        tif,
+        limitPrice: ['limit', 'stop_limit'].includes(type) ? 125.5 : null,
+        stopPrice: ['stop', 'stop_limit'].includes(type) ? 120 : null,
+      };
+      assert.equal((await h.invoke('submit', data)).state, 'acknowledged');
+      assert.equal(h.postCount(), 1);
+      const body = JSON.parse(
+        h.calls.find((call) => call.stage === 'place').options.body,
+      );
+      assert.equal(body.OrderType, nativeType);
+      assert.deepEqual(body.TimeInForce, { Duration: duration });
+      assert.equal(body.Quantity, '2');
+      assert.equal(body.LimitPrice, data.intent.limitPrice?.toString());
+      assert.equal(body.StopPrice, data.intent.stopPrice?.toString());
+    }
+  }
+});
+test('extended concurrency and replays keep one POST', async () => {
+  for (const [connector, loss] of [
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ]) {
+    const h = connector ? await connectorHarness() : harness();
+    const data = connector ? connectorInput('submit') : extendedInput();
+    data.intent = extendedInput().intent;
+    h.state.loss = loss;
+    const [first, parallel] = await Promise.all([
+      h.invoke('submit', data),
+      h.invoke('submit', data),
+    ]);
+    assert.equal(first.state, loss ? 'ambiguous' : 'acknowledged');
+    assert.equal(parallel.state, 'ambiguous');
+    const before = h.calls.length;
+    assert.deepEqual(plain(await h.invoke('submit', data)), plain(first));
+    for (const change of [
+      { extended: false },
+      { extended: 'true' },
+      { type: 'market' },
+      { tif: 'day' },
+      { quantity: 3 },
+      { limitPrice: 126 },
+    ]) {
+      assert.equal(
+        (
+          await h.invoke('submit', {
+            ...data,
+            intent: { ...data.intent, ...change },
+          })
+        ).state,
+        'ambiguous',
+      );
+    }
+    assert.equal(h.calls.length, before);
+    if (!loss) assert.equal((await h.invoke('lookup', data)).state, 'found');
+    assert.equal(h.postCount(), 1);
+    if (connector) safeConnector(h, first, parallel);
+  }
 });
 test('invalid orderId and exceptions are never reflected', async () => {
   const h = harness();
@@ -2089,7 +2253,7 @@ test('regular broker fixture returns ready with infinity', async () => {
   assert.deepEqual(h.logs, []);
 });
 
-test('common ready wire includes session and exact maximum', () => {
+test('common ready wire includes approved sessions and exact maximum', () => {
   const h = harness();
   const data = rulesInput();
   // Synthetic confirmed finite bound tests wire assembly; production evidence
@@ -2115,11 +2279,15 @@ test('common ready wire includes session and exact maximum', () => {
     state: 'ready',
     identity: { terminal: 'TS', externalAccount: 'EXT-1', live: true },
     instrument: data.instrument,
-    orders: ['market', 'limit'].map((type) => ({
-      type,
-      tif: 'day',
-      session: 'regular',
-      extended: false,
+    orders: [
+      { type: 'market', tif: 'day', sessions: ['regular'] },
+      {
+        type: 'limit',
+        tif: 'gtc',
+        sessions: ['regular', 'pre_market', 'post_market'],
+      },
+    ].map((order) => ({
+      ...order,
       relation: 'NORMAL',
       orderClass: 'simple',
       quantityMode: 'whole',
@@ -2141,7 +2309,8 @@ test('common ready wire includes session and exact maximum', () => {
     },
   });
   for (const row of result.orders) {
-    assert.equal(row.extended, row.session !== 'regular');
+    assert.equal(Object.hasOwn(row, 'session'), false);
+    assert.equal(Object.hasOwn(row, 'extended'), false);
   }
   assert.equal(h.calls.length, 0);
   assert.equal(h.postCount(), 0);
@@ -2249,7 +2418,8 @@ test('ready preserves exact finite maximum and literal infinity', () => {
     for (const row of result.orders) {
       assert.equal(row.quantity.maximum, expected);
       assert.equal(row.quantity.fractional, row.quantityMode === 'fractional');
-      assert.equal(row.extended, row.session !== 'regular');
+      assert.equal(Object.hasOwn(row, 'session'), false);
+      assert.equal(Object.hasOwn(row, 'extended'), false);
     }
     assert.deepEqual(quantity, { maximum });
   }
@@ -2285,7 +2455,10 @@ test('Intelligent range requires proof for every combination', () => {
     selectedRoute: 'synthetic-confirmed-route',
     minimum: '1',
     maximum: '1000000',
-    combinations: orders,
+    combinations: orders.map((row) => ({
+      ...row,
+      sessions: [...row.sessions],
+    })),
   };
   const evaluate = (changes = {}) =>
     h.globals.lib.execution.intelligentMaximum({
@@ -2311,17 +2484,57 @@ test('Intelligent range requires proof for every combination', () => {
     { ...applicability, maximum: '9007199254740991' },
     { ...applicability, combinations: undefined },
     { ...applicability, combinations: [orders[0]] },
+    { ...applicability, combinations: [orders[1]] },
     {
       ...applicability,
-      combinations: orders.map((row) => ({ ...row, session: 'overnight' })),
+      combinations: orders.map((row) => ({ ...row, sessions: ['overnight'] })),
+    },
+    {
+      ...applicability,
+      combinations: orders.map(({ sessions, ...row }) => {
+        assert.ok(sessions.length);
+        return { ...row, tif: 'day', session: 'regular', extended: false };
+      }),
     },
     { ...applicability, combinations: [{ type: 'market' }, { type: 'limit' }] },
   ]) {
     assert.equal(evaluate({ applicability: proof }), 'infinity');
   }
   for (const changes of [
+    { sessions: undefined },
+    { sessions: null },
+    { sessions: 'regular' },
+    { sessions: [] },
+    { sessions: ['regular'] },
+    { sessions: ['regular', 'pre_market'] },
+    { sessions: ['pre_market', 'post_market'] },
+    { sessions: ['regular', 'pre_market', 'overnight'] },
+    { sessions: ['regular', 'pre_market', 'post_market', 'overnight'] },
+    { sessions: ['regular', 'pre_market', 'pre_market'] },
+    { type: 'market' },
+    { tif: 'day' },
+    { relation: 'BRK' },
+    { orderClass: 'bracket' },
+    { quantityMode: 'fractional' },
+    { side: 'sell' },
+    { positionEffect: 'close' },
+  ]) {
+    assert.equal(
+      evaluate({
+        applicability: {
+          ...applicability,
+          combinations: [orders[0], { ...orders[1], ...changes }],
+        },
+      }),
+      'infinity',
+    );
+  }
+  for (const changes of [
     { route: 'ARCA' },
     { orders: [] },
+    { orders: [null] },
+    { orders: [{ ...orders[0], sessions: ['regular', 'pre_market'] }] },
+    { orders: [{ ...orders[1], tif: 'day' }] },
     { instrument: { ...instrument, AssetType: 'STOCKOPTION' } },
     { instrument: { ...instrument, Country: 'Canada' } },
     { instrument: { ...instrument, Currency: 'CAD' } },
