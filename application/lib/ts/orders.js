@@ -127,20 +127,13 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
       let error = caught;
       if (signal?.aborted) error = abortError();
       else if (timedOut) error = timeoutError();
+      const { miss: lookupMiss, brokerMessage, requestId } = lib.ts.orderError({ error, exact });
       const codes = [error.code, error.cause?.code];
       const malformed = error.code === 'ERESPONSE';
       const timeout = error.status === 408 || error.code === 'ETIMEOUT' || codes.some((code) => timeoutCodes.has(code));
       const network = codes.some((code) => networkCodes.has(code));
       if (timeout && !malformed) error.code = 'ETIMEOUT';
-      const miss =
-        exact &&
-        error.status === 404 &&
-        error.orderLookupMiss === true &&
-        !signal?.aborted &&
-        !timedOut &&
-        !malformed &&
-        !timeout &&
-        !network;
+      const miss = lookupMiss && !signal?.aborted && !timedOut && !malformed && !timeout && !network;
       const retryable = !signal?.aborted && !malformed && error.status !== 404 && (timeout || network || transient.has(error.status));
       const log = miss ? console.log : console.error;
       log('TradeStation orders read:', {
@@ -154,8 +147,8 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
         ordersCount: miss ? 0 : null,
         retryable,
         retryAttempt: attempt - 1,
-        brokerMessage: error.upstream?.brokerMessage ?? null,
-        requestId: error.upstream?.requestId ?? null,
+        brokerMessage,
+        requestId,
       });
       if (miss) return { errors: [], orders: [] };
       if (!retryable || attempt === 2) {
