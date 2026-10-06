@@ -3604,6 +3604,75 @@ test('orders state merges partial packets, validates shape and suppresses duplic
   assert.equal(orders.get({ live: true, account: 'A1', orderId: 'O1' }), null);
 });
 
+const orderError = loadExpressionModule('application/lib/ts/orderError.js');
+
+test('orderError classifies confirmed 404 only for exact reads and selects safe diagnostics', () => {
+  for (const exact of [false, true]) {
+    for (const validErrorResponse of [undefined, false, true]) {
+      const error = Object.assign(new Error('HTTP 404'), {
+        status: 404,
+        validErrorResponse,
+        upstream: { brokerMessage: 'Order not found', requestId: 'request-123', debug: 'payload-secret' },
+      });
+      const result = orderError({ error, exact });
+      assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+        miss: exact && validErrorResponse === true,
+        brokerMessage: 'Order not found',
+        requestId: 'request-123',
+      });
+      const malformed = exact && validErrorResponse !== true;
+      assert.equal(error.code, malformed ? 'ERESPONSE' : undefined);
+      assert.equal(error.retryable, malformed ? false : undefined);
+    }
+  }
+  for (const status of [401, 403, 429, 500, 502, undefined]) {
+    const error = Object.assign(new Error('unavailable'), { status, validErrorResponse: true });
+    assert.deepEqual(JSON.parse(JSON.stringify(orderError({ error, exact: true }))), {
+      miss: false,
+      brokerMessage: null,
+      requestId: null,
+    });
+    assert.equal(error.code, undefined);
+    assert.equal(error.retryable, undefined);
+  }
+});
+
+test('generic TradeStation send treats 404 equally across endpoints without classifying an order miss', async () => {
+  const source = fs.readFileSync(path.join(repoRoot, 'application/lib/ts/send.js'), 'utf8');
+  assert.doesNotMatch(source, /\b(exactOrders|readContext|orderLookupMiss|orders|historicalorders|current|historical)\b/);
+  for (const endpoint of [
+    ['brokerage', 'accounts', 'A1', 'orders', 'O1'],
+    ['brokerage', 'accounts', 'A1', 'historicalorders', 'O1'],
+    ['brokerage', 'accounts', 'A1', 'orders'],
+    ['marketdata', 'quotes', 'TSLA'],
+  ]) {
+    for (const body of ['{"Message":"Resource not found","StatusCode":404}', '<html>proxy error</html>']) {
+      let attempts = 0;
+      const send = loadExpressionModule('application/lib/ts/send.js', {
+        console: { error: () => {} },
+        fetch: async () => {
+          attempts += 1;
+          return new Response(body, { status: 404, headers: { 'content-type': 'application/json', 'retry-after': '2' } });
+        },
+        lib: { utils: { constructDomain: () => 'https://sim.example', constructURL: () => 'https://sim.example/resource' } },
+      });
+      const meta = {};
+      await assert.rejects(send({ method: 'GET', endpoint, token: 'access-secret', meta }), (error) => {
+        assert.equal(error.status, 404);
+        assert.equal(error.validErrorResponse, body.startsWith('{'));
+        assert.equal(error.retryAfter, '2');
+        assert.equal(error.code, undefined);
+        assert.equal(error.retryable, undefined);
+        assert.equal(Object.hasOwn(error, 'orderLookupMiss'), false);
+        assert.deepEqual(Object.keys(error.upstream), ['brokerMessage', 'requestId']);
+        return true;
+      });
+      assert.deepEqual(meta, { status: 404, retryAfter: '2' });
+      assert.equal(attempts, 1);
+    }
+  }
+});
+
 test('orders REST helper normalizes empty nullable fields and rejects malformed shapes', async () => {
   const responses = [
     {},
@@ -3615,6 +3684,7 @@ test('orders REST helper normalizes empty nullable fields and rejects malformed 
   const helper = loadExpressionModule('application/lib/ts/orders.js', {
     lib: {
       ts: {
+        orderError,
         send: async (payload) => {
           calls.push(payload);
           return responses.shift();
@@ -3639,6 +3709,256 @@ test('orders REST helper normalizes empty nullable fields and rejects malformed 
   await assert.rejects(helper({ account: 'A1', live: true, token: 'token' }), /Orders/);
 });
 
+test('exact orders 404 reaches RPC as empty only for current or explicit historical range', async () => {
+  for (const historical of [false, true]) {
+    for (const body of [{ Message: 'Order not found' }, { Error: 'NotFound', Message: 'Order not found', StatusCode: 404 }]) {
+      const calls = [];
+      const globals = {
+        console: { log: () => {}, error: () => {} },
+        fetch: async (url) => {
+          calls.push(url);
+          return new Response(JSON.stringify(body), { status: 404, headers: { 'content-type': 'application/json; charset=utf-8' } });
+        },
+        lib: {
+          utils: {
+            constructDomain: () => 'https://sim.example',
+            constructURL: (method, domain, endpoint, data) => `${domain}/${endpoint.join('/')}?${new URLSearchParams(data)}`,
+          },
+          ts: { orderError },
+        },
+        domain: { ts: { clients: { getClient: async () => ({ tokens: { access: 'access-secret' } }) } } },
+      };
+      globals.lib.ts.send = loadExpressionModule('application/lib/ts/send.js', globals);
+      globals.lib.ts.orders = loadExpressionModule('application/lib/ts/orders.js', globals);
+      globals.lib.ts.ordersBatch = loadExpressionModule('application/lib/ts/ordersBatch.js', globals);
+      const api = loadExpressionModule(`application/api/account/${historical ? 'historicalorders' : 'orders'}.js`, globals);
+      const input = { contracts: [{ account: 'A1', live: false }], orders: ['O1'], start: '2020-01-01' };
+      assert.deepEqual(JSON.parse(JSON.stringify(await api.method(input))), []);
+      assert.equal(calls.length, 1);
+      assert.ok(calls[0].includes(`/accounts/A1/${historical ? 'historicalorders' : 'orders'}/O1`));
+      assert.equal(calls[0].includes('since=2020-01-01'), historical);
+
+      await assert.rejects(api.method({ ...input, orders: [] }), (error) => error.status === 404);
+      assert.equal(calls.length, 2);
+      if (historical) {
+        await assert.rejects(api.method({ ...input, start: null }), (error) => error.code === 'EHISTORICALSTART');
+        assert.equal(calls.length, 2);
+      }
+    }
+  }
+});
+
+test('exact orders reject malformed 404 through the real send helper without retry', async () => {
+  for (const historical of [false, true]) {
+    for (const [body, contentType] of [
+      ['<html>proxy not found</html>', 'text/html'],
+      ['garbage', 'application/json'],
+      ['', 'application/json'],
+      ['{"Message":', 'application/json'],
+      ['null', 'application/json'],
+      ['[]', 'application/json'],
+      ['"Order not found"', 'application/json'],
+      ['{}', 'application/json'],
+      ['{"error":"proxy not found"}', 'application/json'],
+      ['{"Message":null}', 'application/json'],
+      ['{"Message":{}}', 'application/json'],
+      ['{"Message":"   "}', 'application/json'],
+      ['{"Message":"Order not found","Error":{}}', 'application/json'],
+      ['{"Message":"Order not found","StatusCode":500}', 'application/json'],
+      ['{"Message":"Order not found"}', 'text/html'],
+    ]) {
+      let attempts = 0;
+      const globals = {
+        console: { log: () => {}, error: () => {} },
+        fetch: async () => {
+          attempts += 1;
+          return new Response(body, { status: 404, headers: { 'content-type': contentType } });
+        },
+        lib: {
+          utils: { constructDomain: () => 'https://sim.example', constructURL: () => 'https://sim.example/orders/O1' },
+          ts: { orderError },
+        },
+      };
+      globals.lib.ts.send = loadExpressionModule('application/lib/ts/send.js', globals);
+      const helper = loadExpressionModule('application/lib/ts/orders.js', globals);
+      await assert.rejects(helper({ account: 'A1', orderIds: ['O1'], historical, start: '2020-01-01' }), (error) => {
+        assert.equal(error.status, 404);
+        assert.equal(error.code, 'ERESPONSE');
+        return true;
+      });
+      assert.equal(attempts, 1);
+    }
+  }
+});
+
+test('exact historical requires nonblank explicit start before sending; historical lists retain default', async () => {
+  const calls = [];
+  const helper = loadExpressionModule('application/lib/ts/orders.js', {
+    console: { log: () => {}, error: () => {} },
+    lib: {
+      ts: {
+        orderError,
+        send: async (payload) => {
+          calls.push(payload);
+          return { Orders: [] };
+        },
+      },
+    },
+  });
+  for (const start of [undefined, null, '', '   ', false, 0]) {
+    await assert.rejects(helper({ account: 'A1', orderIds: ['O1'], historical: true, start }), (error) => {
+      assert.equal(error.code, 'EHISTORICALSTART');
+      assert.equal(error.retryable, false);
+      return /explicit start/.test(error.message);
+    });
+  }
+  assert.equal(calls.length, 0);
+  await helper({ account: 'A1', historical: true, orderIds: [] });
+  const since = new Date(new Date().setMonth(new Date().getMonth() - 1)).toISOString().split('T')[0];
+  assert.equal(calls[0].data.since, since);
+  assert.equal(calls[0].endpoint.length, 4);
+});
+
+test('exact orders preserve auth, transient, transport and malformed errors', async () => {
+  const failures = [
+    ...[401, 403, 429, 500, 502, 503, 504].map((status) => Object.assign(new Error(`HTTP ${status}`), { status })),
+    Object.assign(new Error('network'), { code: 'ECONNRESET' }),
+    Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }),
+    Object.assign(new Error('malformed JSON'), { code: 'ERESPONSE', status: 404 }),
+  ];
+  for (const historical of [false, true]) {
+    for (const failure of failures) {
+      let attempts = 0;
+      const helper = loadExpressionModule('application/lib/ts/orders.js', {
+        console: { log: () => {}, error: () => {} },
+        setTimeout: (fn, delay) => {
+          if (delay === 100) Promise.resolve().then(fn);
+          return null;
+        },
+        clearTimeout: () => {},
+        lib: {
+          ts: {
+            orderError,
+            send: async () => {
+              attempts += 1;
+              throw failure;
+            },
+          },
+        },
+      });
+      await assert.rejects(helper({ account: 'A1', orderIds: ['O1'], historical, start: '2020-01-01' }), (error) => error === failure);
+      const retry = [429, 502, 503, 504].includes(failure.status) || ['ECONNRESET', 'ETIMEDOUT', 'ETIMEOUT'].includes(failure.code);
+      assert.equal(attempts, retry ? 2 : 1);
+    }
+    for (const response of [
+      null,
+      [],
+      {},
+      { Orders: null },
+      { Orders: {} },
+      { Errors: {} },
+      { Orders: [null] },
+      { Orders: ['O1'] },
+      { Orders: [{}] },
+      { Orders: [{ OrderID: '' }] },
+    ]) {
+      let attempts = 0;
+      const helper = loadExpressionModule('application/lib/ts/orders.js', {
+        console: { log: () => {}, error: () => {} },
+        lib: {
+          ts: {
+            orderError,
+            send: async () => {
+              attempts += 1;
+              return response;
+            },
+          },
+        },
+      });
+      await assert.rejects(
+        helper({ account: 'A1', orderIds: ['O1'], historical, start: '2020-01-01' }),
+        (error) => error.code === 'ERESPONSE',
+      );
+      assert.equal(attempts, 1);
+    }
+  }
+});
+
+test('exact orders diagnostics allow only bounded broker fields and safe request IDs', async () => {
+  for (const [body, headers, message, requestId] of [
+    [
+      { Message: 'Order not found', RequestID: 'body-123', Authorization: 'Bearer access-secret', debug: 'body-secret' },
+      new Map([
+        ['x-request-id', 'header-123'],
+        ['set-cookie', 'cookie-secret'],
+      ]),
+      'Order not found',
+      'header-123',
+    ],
+    [
+      { Errors: [{ Message: 'Order unavailable', requestId: 'body-456', token: 'access-secret' }] },
+      new Map(),
+      'Order unavailable',
+      'body-456',
+    ],
+    [{ Message: 'Authorization: Bearer access-secret', RequestID: 'access-secret' }, new Map(), null, null],
+    [{ Message: 'cookie=cookie-secret' }, new Map([['x-request-id', 'Bearer access-secret']]), null, null],
+    [{ Message: 'm'.repeat(257), RequestID: 'r'.repeat(129) }, new Map(), null, null],
+    ['raw-body-secret', new Map(), null, null],
+  ]) {
+    const logs = [];
+    const globals = {
+      console: { error: (...args) => logs.push(args), log: (...args) => logs.push(args) },
+      fetch: async () => ({
+        ok: false,
+        status: 404,
+        statusText: 'Not Found',
+        headers,
+        text: async () => (typeof body === 'string' ? body : JSON.stringify(body)),
+      }),
+      lib: {
+        utils: { constructDomain: () => 'https://sim.example', constructURL: () => 'https://sim.example/orders/O1' },
+        ts: { orderError },
+      },
+    };
+    const send = loadExpressionModule('application/lib/ts/send.js', globals);
+    await assert.rejects(
+      send({ method: 'GET', endpoint: ['brokerage', 'accounts', 'A1', 'orders', 'O1'], token: 'access-secret' }),
+      (error) => {
+        assert.equal(error.upstream.brokerMessage, message);
+        assert.equal(error.upstream.requestId, requestId);
+        return error.status === 404;
+      },
+    );
+    globals.lib.ts.send = send;
+    const orders = loadExpressionModule('application/lib/ts/orders.js', globals);
+    const input = { account: 'A1', orderIds: ['O1'], token: 'access-secret' };
+    if (typeof body === 'object' && typeof body.Message === 'string') {
+      assert.deepEqual(JSON.parse(JSON.stringify(await orders(input))), { errors: [], orders: [] });
+    } else {
+      await assert.rejects(orders(input), (error) => error.code === 'ERESPONSE' && error.status === 404);
+    }
+    for (const [label, log] of logs) {
+      if (log.state === 'start') continue;
+      if (label === 'TradeStation orders read:') {
+        assert.equal(log.httpStatus, 404);
+        assert.equal(log.endpoint, 'brokerage/accounts/A1/orders/O1');
+        assert.equal(log.mode, 'current');
+        assert.equal(log.account, 'A1');
+      } else {
+        assert.equal(log.status, 404);
+        for (const key of ['endpoint', 'mode', 'account']) assert.equal(Object.hasOwn(log, key), false);
+      }
+      assert.equal(log.brokerMessage, message);
+      assert.equal(log.requestId, requestId);
+    }
+    const serialized = JSON.stringify(logs);
+    for (const secret of ['access-secret', 'body-secret', 'cookie-secret', 'raw-body-secret']) {
+      assert.equal(serialized.includes(secret), false);
+    }
+  }
+});
+
 test('orders REST helper retries only transient reads and keeps request semantics', async () => {
   for (const status of [408, 429, 502, 503, 504]) {
     let attempts = 0;
@@ -3653,6 +3973,7 @@ test('orders REST helper retries only transient reads and keeps request semantic
       },
       lib: {
         ts: {
+          orderError,
           send: async (payload) => {
             attempts += 1;
             assert.equal(payload.method, 'GET');
@@ -3690,6 +4011,7 @@ test('orders REST helper retries only transient reads and keeps request semantic
       },
       lib: {
         ts: {
+          orderError,
           send: async () => {
             attempts += 1;
             throw Object.assign(new Error(`HTTP ${status}`), { status });
@@ -3708,6 +4030,7 @@ test('orders REST helper retries only transient reads and keeps request semantic
     const helper = loadExpressionModule('application/lib/ts/orders.js', {
       lib: {
         ts: {
+          orderError,
           send: async () => {
             attempts += 1;
             throw Object.assign(new Error(`HTTP ${status}`), { status });
@@ -3727,6 +4050,7 @@ test('orders REST helper retries only transient reads and keeps request semantic
     const helper = loadExpressionModule('application/lib/ts/orders.js', {
       lib: {
         ts: {
+          orderError,
           send: async () => {
             attempts += 1;
             throw error;
@@ -3752,6 +4076,7 @@ test('orders REST helper bounds network and read timeouts to two attempts', asyn
     },
     lib: {
       ts: {
+        orderError,
         send: async () => {
           networkAttempts += 1;
           if (networkAttempts === 1) {
@@ -3777,6 +4102,7 @@ test('orders REST helper bounds network and read timeouts to two attempts', asyn
     },
     lib: {
       ts: {
+        orderError,
         send: ({ signal }) => {
           timeoutAttempts += 1;
           return new Promise((resolve, reject) => {
@@ -3807,6 +4133,7 @@ test('orders REST helper bounds native fetch DNS and connect timeout failures', 
         },
         lib: {
           ts: {
+            orderError,
             send: async () => {
               attempts += 1;
               if (recover && attempts === 2) return { Errors: [], Orders: [{ OrderID: code }] };
@@ -3837,6 +4164,7 @@ test('orders REST helper rejects application TypeError without retry', async () 
     const helper = loadExpressionModule('application/lib/ts/orders.js', {
       lib: {
         ts: {
+          orderError,
           send: async () => {
             attempts += 1;
             throw error;
@@ -3860,6 +4188,7 @@ test('orders REST helper stops timeout retry when deadline cannot fit backoff', 
     },
     lib: {
       ts: {
+        orderError,
         send: async () => {
           attempts += 1;
           throw Object.assign(new Error('HTTP 408'), { status: 408 });
@@ -3878,6 +4207,7 @@ test('orders REST helper does not retry parent abort or malformed success', asyn
   const aborted = loadExpressionModule('application/lib/ts/orders.js', {
     lib: {
       ts: {
+        orderError,
         send: async () => {
           abortAttempts += 1;
           controller.abort(new Error('batch failed'));
@@ -3893,6 +4223,7 @@ test('orders REST helper does not retry parent abort or malformed success', asyn
   const malformed = loadExpressionModule('application/lib/ts/orders.js', {
     lib: {
       ts: {
+        orderError,
         send: async () => {
           malformedAttempts += 1;
           return { Errors: [], Orders: {} };
@@ -3913,6 +4244,7 @@ test('orders diagnostics include bounded metadata without credentials or payload
     },
     lib: {
       ts: {
+        orderError,
         send: async ({ meta }) => {
           meta.status = 200;
           return { Errors: [], Orders: [{ AccountID: 'A1', OrderID: 'O1', Secret: 'payload-secret' }] };

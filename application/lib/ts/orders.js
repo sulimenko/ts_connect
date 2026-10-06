@@ -2,10 +2,25 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
   const accountId = `${account ?? ''}`.trim();
   if (!accountId) throw new Error('TradeStation orders account is required');
 
+  const exact = Array.isArray(orderIds) && orderIds.length > 0;
   const endpoint = ['brokerage', 'accounts', accountId, historical ? 'historicalorders' : 'orders'];
-  if (Array.isArray(orderIds) && orderIds.length > 0) endpoint.push(orderIds.join(','));
+  if (exact) endpoint.push(orderIds.join(','));
   const endpointName = endpoint.join('/');
   const mode = historical ? 'historical' : 'current';
+  if (exact && historical && (typeof start !== 'string' || !start.trim())) {
+    const error = new Error(`TradeStation exact historical orders require explicit start for ${accountId}`);
+    error.code = 'EHISTORICALSTART';
+    error.retryable = false;
+    console.error('TradeStation orders read:', {
+      endpoint: endpointName,
+      account: accountId,
+      mode,
+      state: 'source_unavailable',
+      code: error.code,
+      retryable: false,
+    });
+    throw error;
+  }
 
   const data = {};
   if (historical) {
@@ -89,6 +104,12 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
       if (response.Orders !== undefined && response.Orders !== null && !Array.isArray(response.Orders)) {
         throw Object.assign(new Error('Unexpected TradeStation orders Orders shape'), { code: 'ERESPONSE' });
       }
+      if (exact && !Array.isArray(response.Orders) && !(response.Errors?.length > 0)) {
+        throw Object.assign(new Error('Missing TradeStation exact orders Orders array'), { code: 'ERESPONSE' });
+      }
+      if (exact && response.Orders?.some((order) => !order || typeof order.OrderID !== 'string' || !order.OrderID.trim())) {
+        throw Object.assign(new Error('Unexpected TradeStation exact orders entry'), { code: 'ERESPONSE' });
+      }
       console.log('TradeStation orders read:', {
         endpoint: endpointName,
         account: accountId,
@@ -106,24 +127,30 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
       let error = caught;
       if (signal?.aborted) error = abortError();
       else if (timedOut) error = timeoutError();
+      const { miss: lookupMiss, brokerMessage, requestId } = lib.ts.orderError({ error, exact });
       const codes = [error.code, error.cause?.code];
       const malformed = error.code === 'ERESPONSE';
       const timeout = error.status === 408 || error.code === 'ETIMEOUT' || codes.some((code) => timeoutCodes.has(code));
       const network = codes.some((code) => networkCodes.has(code));
       if (timeout && !malformed) error.code = 'ETIMEOUT';
-      const retryable = !signal?.aborted && !malformed && (timeout || network || transient.has(error.status));
-      console.error('TradeStation orders read:', {
+      const miss = lookupMiss && !signal?.aborted && !timedOut && !malformed && !timeout && !network;
+      const retryable = !signal?.aborted && !malformed && error.status !== 404 && (timeout || network || transient.has(error.status));
+      const log = miss ? console.log : console.error;
+      log('TradeStation orders read:', {
         endpoint: endpointName,
         account: accountId,
         mode,
         attempt,
-        state: 'error',
+        state: miss ? 'miss' : 'error',
         durationMs: Date.now() - started,
         httpStatus: error.status ?? meta.status ?? null,
-        ordersCount: null,
+        ordersCount: miss ? 0 : null,
         retryable,
         retryAttempt: attempt - 1,
+        brokerMessage,
+        requestId,
       });
+      if (miss) return { errors: [], orders: [] };
       if (!retryable || attempt === 2) {
         throw error;
       }
