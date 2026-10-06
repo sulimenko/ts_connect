@@ -85,6 +85,24 @@ async ({
       error.responseText = responseText;
       error.retryAfter = retryAfter;
       if (exactOrders) {
+        if (res.status === 404) {
+          // A proxy 404 is not evidence of an order miss. Require a broker JSON error envelope.
+          const contentType = res.headers?.get?.('content-type')?.split(';')[0].trim().toLowerCase();
+          error.orderLookupMiss = Boolean(
+            (!contentType || contentType === 'application/json') &&
+            brokerError &&
+            typeof brokerError === 'object' &&
+            !Array.isArray(brokerError) &&
+            typeof brokerError.Message === 'string' &&
+            brokerError.Message.trim() &&
+            (brokerError.Error === undefined || (typeof brokerError.Error === 'string' && brokerError.Error.trim())) &&
+            (brokerError.StatusCode === undefined || brokerError.StatusCode === res.status),
+          );
+          if (!error.orderLookupMiss) {
+            error.code = 'ERESPONSE';
+            error.retryable = false;
+          }
+        }
         // Only named broker fields are eligible; never log arbitrary body values.
         const safeText = (value, maximum) => {
           if (typeof value !== 'string') return null;

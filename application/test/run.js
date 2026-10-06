@@ -3641,37 +3641,82 @@ test('orders REST helper normalizes empty nullable fields and rejects malformed 
 
 test('exact orders 404 reaches RPC as empty only for current or explicit historical range', async () => {
   for (const historical of [false, true]) {
-    const calls = [];
-    const globals = {
-      console: { log: () => {}, error: () => {} },
-      fetch: async (url) => {
-        calls.push(url);
-        return { ok: false, status: 404, statusText: 'Not Found', headers: new Map(), text: async () => '{"Message":"Order not found"}' };
-      },
-      lib: {
-        utils: {
-          constructDomain: () => 'https://sim.example',
-          constructURL: (method, domain, endpoint, data) => `${domain}/${endpoint.join('/')}?${new URLSearchParams(data)}`,
+    for (const body of [{ Message: 'Order not found' }, { Error: 'NotFound', Message: 'Order not found', StatusCode: 404 }]) {
+      const calls = [];
+      const globals = {
+        console: { log: () => {}, error: () => {} },
+        fetch: async (url) => {
+          calls.push(url);
+          return new Response(JSON.stringify(body), { status: 404, headers: { 'content-type': 'application/json; charset=utf-8' } });
         },
-        ts: {},
-      },
-      domain: { ts: { clients: { getClient: async () => ({ tokens: { access: 'access-secret' } }) } } },
-    };
-    globals.lib.ts.send = loadExpressionModule('application/lib/ts/send.js', globals);
-    globals.lib.ts.orders = loadExpressionModule('application/lib/ts/orders.js', globals);
-    globals.lib.ts.ordersBatch = loadExpressionModule('application/lib/ts/ordersBatch.js', globals);
-    const api = loadExpressionModule(`application/api/account/${historical ? 'historicalorders' : 'orders'}.js`, globals);
-    const input = { contracts: [{ account: 'A1', live: false }], orders: ['O1'], start: '2020-01-01' };
-    assert.deepEqual(JSON.parse(JSON.stringify(await api.method(input))), []);
-    assert.equal(calls.length, 1);
-    assert.ok(calls[0].includes(`/accounts/A1/${historical ? 'historicalorders' : 'orders'}/O1`));
-    assert.equal(calls[0].includes('since=2020-01-01'), historical);
+        lib: {
+          utils: {
+            constructDomain: () => 'https://sim.example',
+            constructURL: (method, domain, endpoint, data) => `${domain}/${endpoint.join('/')}?${new URLSearchParams(data)}`,
+          },
+          ts: {},
+        },
+        domain: { ts: { clients: { getClient: async () => ({ tokens: { access: 'access-secret' } }) } } },
+      };
+      globals.lib.ts.send = loadExpressionModule('application/lib/ts/send.js', globals);
+      globals.lib.ts.orders = loadExpressionModule('application/lib/ts/orders.js', globals);
+      globals.lib.ts.ordersBatch = loadExpressionModule('application/lib/ts/ordersBatch.js', globals);
+      const api = loadExpressionModule(`application/api/account/${historical ? 'historicalorders' : 'orders'}.js`, globals);
+      const input = { contracts: [{ account: 'A1', live: false }], orders: ['O1'], start: '2020-01-01' };
+      assert.deepEqual(JSON.parse(JSON.stringify(await api.method(input))), []);
+      assert.equal(calls.length, 1);
+      assert.ok(calls[0].includes(`/accounts/A1/${historical ? 'historicalorders' : 'orders'}/O1`));
+      assert.equal(calls[0].includes('since=2020-01-01'), historical);
 
-    await assert.rejects(api.method({ ...input, orders: [] }), (error) => error.status === 404);
-    assert.equal(calls.length, 2);
-    if (historical) {
-      await assert.rejects(api.method({ ...input, start: null }), (error) => error.code === 'EHISTORICALSTART');
+      await assert.rejects(api.method({ ...input, orders: [] }), (error) => error.status === 404);
       assert.equal(calls.length, 2);
+      if (historical) {
+        await assert.rejects(api.method({ ...input, start: null }), (error) => error.code === 'EHISTORICALSTART');
+        assert.equal(calls.length, 2);
+      }
+    }
+  }
+});
+
+test('exact orders reject malformed 404 through the real send helper without retry', async () => {
+  for (const historical of [false, true]) {
+    for (const [body, contentType] of [
+      ['<html>proxy not found</html>', 'text/html'],
+      ['garbage', 'application/json'],
+      ['', 'application/json'],
+      ['{"Message":', 'application/json'],
+      ['null', 'application/json'],
+      ['[]', 'application/json'],
+      ['"Order not found"', 'application/json'],
+      ['{}', 'application/json'],
+      ['{"error":"proxy not found"}', 'application/json'],
+      ['{"Message":null}', 'application/json'],
+      ['{"Message":{}}', 'application/json'],
+      ['{"Message":"   "}', 'application/json'],
+      ['{"Message":"Order not found","Error":{}}', 'application/json'],
+      ['{"Message":"Order not found","StatusCode":500}', 'application/json'],
+      ['{"Message":"Order not found"}', 'text/html'],
+    ]) {
+      let attempts = 0;
+      const globals = {
+        console: { log: () => {}, error: () => {} },
+        fetch: async () => {
+          attempts += 1;
+          return new Response(body, { status: 404, headers: { 'content-type': contentType } });
+        },
+        lib: {
+          utils: { constructDomain: () => 'https://sim.example', constructURL: () => 'https://sim.example/orders/O1' },
+          ts: {},
+        },
+      };
+      globals.lib.ts.send = loadExpressionModule('application/lib/ts/send.js', globals);
+      const helper = loadExpressionModule('application/lib/ts/orders.js', globals);
+      await assert.rejects(helper({ account: 'A1', orderIds: ['O1'], historical, start: '2020-01-01' }), (error) => {
+        assert.equal(error.status, 404);
+        assert.equal(error.code, 'ERESPONSE');
+        return true;
+      });
+      assert.equal(attempts, 1);
     }
   }
 });

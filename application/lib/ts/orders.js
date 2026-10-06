@@ -132,7 +132,15 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
       const timeout = error.status === 408 || error.code === 'ETIMEOUT' || codes.some((code) => timeoutCodes.has(code));
       const network = codes.some((code) => networkCodes.has(code));
       if (timeout && !malformed) error.code = 'ETIMEOUT';
-      const miss = exact && error.status === 404 && !signal?.aborted && !timedOut && !malformed && !timeout && !network;
+      const miss =
+        exact &&
+        error.status === 404 &&
+        error.orderLookupMiss === true &&
+        !signal?.aborted &&
+        !timedOut &&
+        !malformed &&
+        !timeout &&
+        !network;
       const retryable = !signal?.aborted && !malformed && error.status !== 404 && (timeout || network || transient.has(error.status));
       const log = miss ? console.log : console.error;
       log('TradeStation orders read:', {
