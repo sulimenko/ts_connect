@@ -10,6 +10,16 @@ async ({
   signal = null,
   meta = null,
 }) => {
+  const exactOrders =
+    method === 'GET' &&
+    endpoint[0] === 'brokerage' &&
+    endpoint[1] === 'accounts' &&
+    ['orders', 'historicalorders'].includes(endpoint[3]) &&
+    endpoint.length === 5 &&
+    Boolean(endpoint[4]);
+  const readContext = exactOrders
+    ? { endpoint: endpoint.join('/'), mode: endpoint[3] === 'orders' ? 'current' : 'historical', account: endpoint[2] }
+    : {};
   try {
     if (domain === null) domain = lib.utils.constructDomain(live);
     const ep = [ver, ...endpoint];
@@ -53,9 +63,11 @@ async ({
       const errorText = await res.text();
       const responseText = errorText.trim();
       const values = [responseText];
+      let brokerError = null;
       if (responseText) {
         try {
-          const pending = [JSON.parse(responseText)];
+          brokerError = JSON.parse(responseText);
+          const pending = [brokerError];
           while (pending.length > 0) {
             const value = pending.pop();
             if (typeof value === 'string') values.push(value.trim());
@@ -72,6 +84,29 @@ async ({
       error.statusText = res.statusText;
       error.responseText = responseText;
       error.retryAfter = retryAfter;
+      if (exactOrders) {
+        // Only named broker fields are eligible; never log arbitrary body values.
+        const safeText = (value, maximum) => {
+          if (typeof value !== 'string') return null;
+          const text = value.trim();
+          if (!text || text.length > maximum || Array.from(text).some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127)) {
+            return null;
+          }
+          if (typeof token === 'string' && token && text.includes(token)) return null;
+          if (/authorization|bearer|token|cookie|secret|password|credential|api.?key|https?:\/\/|eyJ[\w-]+\./i.test(text)) return null;
+          return text;
+        };
+        const sources = [brokerError, brokerError?.Errors?.[0]];
+        const brokerMessage = sources.map((source) => safeText(source?.Message ?? source?.message, 256)).find(Boolean) ?? null;
+        const requestIds = [
+          res.headers?.get?.('x-request-id'),
+          res.headers?.get?.('request-id'),
+          res.headers?.get?.('x-correlation-id'),
+          ...sources.map((source) => source?.RequestID ?? source?.requestId),
+        ];
+        const requestId = requestIds.map((value) => safeText(value, 128)).find((value) => value && /^[\w.:-]+$/.test(value)) ?? null;
+        error.upstream = { ...readContext, status: res.status, brokerMessage, requestId };
+      }
       const invalidSymbol = values.some((value) => {
         const message = value.trim().toLowerCase();
         return message === 'invalid symbol' || message.startsWith('invalid symbol:');
@@ -86,6 +121,7 @@ async ({
         status: error.status,
         statusText: error.statusText,
         code: error.code,
+        ...error.upstream,
       });
       throw error;
     }
@@ -95,6 +131,8 @@ async ({
       status: error.status,
       statusText: error.statusText,
       code: error.code,
+      ...readContext,
+      ...error.upstream,
     });
     throw error;
   }
