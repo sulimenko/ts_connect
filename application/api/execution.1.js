@@ -25,7 +25,7 @@
       return {
         version: 2,
         terminal: 'TS',
-        contract: 'meta-ts-v2-1',
+        contract: 'meta-ts-v2-2',
         submit: true,
         restart_safe: false,
         recovery: 'known_order_id_only',

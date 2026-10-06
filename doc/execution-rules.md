@@ -85,22 +85,27 @@ NASDAQ/NYSE/AMEX. Endpoint routes должен независимо подтве
 `Id: 'Intelligent'` с `AssetTypes: ['STOCK', ...]`. Совпадение Name при другом Id
 не подтверждает default route.
 
-Две доказанные комбинации для common v1 formatter (публикация требует полного
+Доказанные комбинации для common v1 formatter (публикация требует полного
 minimum/step/fractional/price proof; неизвестный maximum допускается):
 
 | type   | tif | sessions                         | relation | orderClass | quantityMode | side | positionEffect |
 | ------ | --- | -------------------------------- | -------- | ---------- | ------------ | ---- | -------------- |
 | market | day | regular                          | NORMAL   | simple     | whole        | buy  | open           |
 | limit  | gtc | regular, pre_market, post_market | NORMAL   | simple     | whole        | buy  | open           |
+| limit  | gtc | regular                          | BRK      | bracket    | whole        | buy  | open           |
+| limit  | gtc | regular                          | OCO      | simple     | whole        | sell | close          |
+| stop   | gtc | regular                          | OCO      | simple     | whole        | sell | close          |
 
-Это консервативный subset T-075 в существующем rules v1. Ready не обещает buying power, исполнение или
+Это консервативный subset T-075/T-076 в существующем rules v1. Ready не обещает buying power, исполнение или
 fill; T-068 продолжает самостоятельно проверять позиции и intent. Options,
 другие listing environments, стороны, position effects и TIF пока не имеют
 полного combination proof в этом adapter и не рекламируются. Подтверждённый OPT
-с неполной evidence возвращает unavailable. BRK/OCO выключены;
-fractional quantity не объявляется. Enum OrderType/Duration либо дополнительные
-клиентские поля не расширяют строки. Capabilities, версии submit/lookup, recovery,
-`restart_safe=false` и durable barriers Metaterminal не изменены.
+с неполной evidence возвращает unavailable. Fractional quantity не объявляется.
+Enum OrderType/Duration либо дополнительные клиентские поля не расширяют строки.
+BRK/OCO ограничены native сочетаниями ниже. Версии submit/lookup, recovery,
+`restart_safe=false` и durable barriers Metaterminal сохраняются; точный companion
+contract capabilities — `meta-ts-v2-2` (version 2, submit=true,
+recovery=`known_order_id_only`).
 
 Protected submit v2 сохраняет существующий boolean `intent.extended`.
 Для первого submit `extended: true` разрешён только при `type: 'limit'` и
@@ -108,7 +113,7 @@ Protected submit v2 сохраняет существующий boolean `intent.
 и `TimeInForce: {Duration: 'GCP'}`. Другой type/tif или неboolean extended
 возвращает `rejected` до OAuth/client setup и любых broker requests.
 `extended: false` сохраняет DAY/GTC/IOC/FOK mappings, quantity/price validation
-и прежние проверки позиций. Rules рекламируют только две строки выше;
+и прежние проверки позиций. Rules рекламируют только строки таблицы выше;
 остальные прежние regular submit mappings не расширяют опубликованный domain.
 Зарегистрированный attempt сохраняет приоритет над новой validation:
 точный extended replay возвращает receipt, конфликтующий — `ambiguous`,
@@ -137,6 +142,79 @@ Evidence для сочетаний (duration и Intelligent сверены 2026-
    описывает GTC+ с extended pre-market и DAY+; совместно с Intelligent и
    API Duration это evidence для одобренного limit/gtc regular+pre/post сочетания.
    Эти источники не подтверждают применимость finite maximum ко всем сессиям.
+
+## Native BRK/OCO: protected submit и known-ID lookup
+
+T-076 использует signed `quantity` и те же camelCase поля intent, что NORMAL.
+`related` содержит полные sibling/child intents с `relation: 'NORMAL'`,
+`related: []`, `symbol`, `assetCategory`, `quantity`, `type`, `tif`,
+`extended`, `limitPrice`, `stopPrice`. Account/live принадлежат envelope;
+если они продублированы в leg, требуется точное совпадение. Route только
+Intelligent; `extended: false` для всех relation legs. Short, OPT, другие routes,
+сессии, TIF, типы и вложенные relations не поддерживаются.
+
+- BRK: открытие long из flat, parent Limit/GTC BUY; ровно два children,
+  Limit/GTC SELL и StopMarket/GTC SELL, тот же account/symbol и равный абсолютный
+  quantity. Child signed quantity противоположен parent. Один
+  `POST /v3/orderexecution/orders`, parent содержит
+  `OSOs: [{Type: 'BRK', Orders: [limitChild, stopChild]}]`.
+- OCO: закрытие подтверждённого long, base плюс ровно один sibling,
+  Limit/GTC SELL и StopMarket/GTC SELL с одинаковым account/symbol/quantity.
+  Quantity каждого выхода не превышает текущую long-позицию. Один
+  `POST /v3/orderexecution/ordergroups` с `Type: 'OCO'` и двумя Orders.
+  Это OCO cancellation semantics, без обещания BRK auto-decrement.
+
+Перед POST дополнительно подтверждаются Active Cash/Margin USD account,
+US NASDAQ/NYSE/AMEX STOCK, Intelligent route, whole minimum/step и price rules
+через существующий rules proof. Каждый native order имеет отдельный
+`OrderConfirmID` длиной не более 22; это не обещание broker idempotency.
+Отдельных submit/cancel/update legs нет. NORMAL protected и legacy public
+`placeorder` сохраняют прежнее поведение.
+
+Evidence: [официальная v3 specification](https://api.tradestation.com/docs/specification/),
+проверена 2026-10-06: PlaceOrder example `Buy Limit Entry with Multiple Brackets`
+прямо содержит Limit/GTC BUY и OSOs Type BRK с Limit/GTC и StopMarket/GTC SELL.
+Этот adapter ограничивается одним bracket с равным parent quantity, как legacy
+projection. PlaceGroupOrder описывает native OCO/BRK и содержит GTC SELL
+Limit/StopMarket sibling orders; OrderRequestOSO/GroupOrderRequest требуют Type
+и Orders. GetOrders examples показывают `Duration`, `Legs[].Symbol`,
+`QuantityOrdered`, `BuyOrSell`, `OpenOrClose`, а не request echo.
+[Trade Bar advanced orders](https://help.tradestation.com/10_00/eng/tswebtrading/topics/advanced_orders.htm)
+подтверждает long entry с attached bracket, пару Limit/StopMarket exit orders,
+OCO cancellation и default Intelligent. GTC без plus ограничен regular;
+GCP/extended relation rows не выводятся из enum. Эти concrete native examples,
+существующие listing/route/session proofs и runtime guards задают narrow rows.
+
+Placement принимает несколько Orders/Errors и сохраняет все валидные OrderID
+как non-secret group evidence, включая ID из partial errors. Free-form Message,
+Error/RejectReason/StatusDescription, raw payload и credentials не входят
+в receipts/envelopes. Дубликаты, malformed evidence, partial errors,
+неизвестные статусы и неполное соответствие не подтверждают успешную группу.
+Отсутствующий Status в placement сам по себе не считается pending/fill:
+при наличии known IDs разрешены только bounded read-only current/history GET.
+
+Group broker envelope: `{relation: 'BRK'|'OCO', mapping: 'verified'|'ambiguous',
+orders: [{terminal_id, state, leg?}]}`. State фактический per order, без общего
+синтетического fill; неизвестное evidence даёт `state: 'unknown'`. `leg` — индекс
+в `[intent, ...intent.related]`, появляется только при доказанной bijection по
+account, symbol, STOCK, ordered quantity, action/open-close, duration, order type
+и ценам. Ни порядок Orders, ни Message не задают mapping. Статус OSO означает
+pending child, не fill. Успех submit acknowledged требует полной verified mapping
+и accepted/pending/part_filled/filled evidence всех legs; иначе ambiguous с
+сохранёнными ID. Acknowledged по-прежнему не обещает fill всей группы.
+
+Lookup с worker receipt использует все сохранённые IDs. После restart клиент
+передаёт `relation` и `brokerIds: ['known-id-1', 'known-id-2', ...]` вместо brokerId;
+допускается 1–50 уникальных sanitized IDs. Lookup не пытается восстановить IDs
+по symbol/time/Message. Current GET передаёт comma-separated IDs; historical GET
+только отсутствующие current IDs и since в пределах 90 дней. Максимум два broker
+GET, без pagination/retry. Factual found возможен без mapping legs после restart;
+`mapping: 'ambiguous'` сохраняется. Unknown status, ошибки источника или неполный
+набор возвращают source_unavailable с sanitized known evidence. Пустая bounded
+history не доказывает not_found. Точный или изменённый submit replay после claim
+не делает новый POST, включая timeout, malformed reply и mapping uncertainty.
+Worker-local barrier не переживает restart: restart_safe=false, durable placement
+barrier остаётся обязанностью Meta; recovery после restart ограничен known-ID lookup.
 
 ### Результат исследования quantity maximum
 
@@ -279,7 +357,7 @@ protected service-envelope `accessUpdate: {refresh_token: '...'}` вне rules d
 в ts_connect или placement receipts. Повторный вызов снова получает свежую
 evidence через read-only broker endpoints.
 
-`test/execution.js` проверяет ready fixture с двумя одобренными sessions rows и infinity,
+`test/execution.js` проверяет ready fixture с одобренными NORMAL/BRK/OCO rows и infinity,
 finite maximum выше safe integer без clipping, per-combination fractional и sessions,
 применимость официального Intelligent range, реальный Impress dispatch, раннюю auth,
 malformed/exception envelope, live/SIM identity, ambiguous instruments, отсутствие
@@ -305,3 +383,9 @@ Port выполнен из локальной `ai/T-071-v84` (a5d9db8), diff о�
 базы `55fe95574f58b61c5610ab9b3c221b61910f0bcb`. Старый локальный develop не
 используется как source diff base. Изменения T-068 submit/lookup/recovery и
 capabilities не перенесены и не изменены. Git delivery принадлежит pipeline.
+
+T-076 mock scenarios проверяют единственный native POST BRK/OCO с обоими
+credential sources, полное relation fingerprint, distinct confirm IDs, multiple
+placement IDs/partial Errors, ambiguous mapping, per-order current/history states,
+known-ID lookup после restart, malformed/unknown evidence, timeout и concurrent/changed
+replay. Проверки не используют live broker orders.

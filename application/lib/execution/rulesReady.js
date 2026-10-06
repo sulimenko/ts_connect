@@ -1,4 +1,4 @@
-({ data, instrument, quantity, price }) => {
+({ data, instrument, quantity, price, relations = false }) => {
   const fail = () => ({ version: 1, state: 'unavailable', reason: 'quantity_unconfirmed' });
   // Internal common-wire formatter. Its caller owns authoritative evidence.
   // Only maximum has an unknown -> infinity exception; other rules fail closed.
@@ -36,16 +36,8 @@
       exchange: instrument.Exchange,
       currency: instrument.Currency,
     },
-    orders: [
-      { type: 'market', tif: 'day', sessions: ['regular'] },
-      { type: 'limit', tif: 'gtc', sessions: ['regular', 'pre_market', 'post_market'] },
-    ].map((order) => ({
+    orders: lib.execution.ruleRows({ relations }).map((order) => ({
       ...order,
-      relation: 'NORMAL',
-      orderClass: 'simple',
-      quantityMode: 'whole',
-      side: 'buy',
-      positionEffect: 'open',
       quantity: { ...constraints },
     })),
     quantity: { ...constraints },
