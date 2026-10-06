@@ -110,7 +110,7 @@ const symbolDetails = () => ({
   ],
   Errors: [],
 });
-const expectedRules = (data, maximum = 'infinity') => {
+const expectedRules = (data, maximum = 'infinity', relations = true) => {
   const quantity = {
     fractional: false,
     minimum: '1',
@@ -118,7 +118,7 @@ const expectedRules = (data, maximum = 'infinity') => {
     maximum,
     minimumNotional: null,
   };
-  return {
+  const result = {
     version: 1,
     state: 'ready',
     identity: {
@@ -161,6 +161,33 @@ const expectedRules = (data, maximum = 'infinity') => {
       ],
     },
   };
+  if (relations) {
+    result.orders.push(
+      {
+        type: 'limit',
+        tif: 'gtc',
+        sessions: ['regular'],
+        relation: 'BRK',
+        orderClass: 'bracket',
+        quantityMode: 'whole',
+        side: 'buy',
+        positionEffect: 'open',
+        quantity: { ...quantity },
+      },
+      ...['limit', 'stop'].map((type) => ({
+        type,
+        tif: 'gtc',
+        sessions: ['regular'],
+        relation: 'OCO',
+        orderClass: 'simple',
+        quantityMode: 'whole',
+        side: 'sell',
+        positionEffect: 'close',
+        quantity: { ...quantity },
+      })),
+    );
+  }
+  return result;
 };
 const order = (overrides = {}) => ({
   AccountID: 'EXT-1',
@@ -297,8 +324,15 @@ function harness({ clock = false } = {}) {
     }
     if (stage === 'place') {
       const payload = JSON.parse(options.body);
-      assert.equal(payload.OrderConfirmID, 'meta-17');
-      assert.equal(payload.OrderConfirmID.length <= 22, true);
+      if (!payload.Orders) assert.equal(payload.OrderConfirmID, 'meta-17');
+      else assert.equal(payload.Orders[0].OrderConfirmID, 'm17-0');
+      assert.equal(
+        (payload.Orders
+          ? payload.Orders[0].OrderConfirmID
+          : payload.OrderConfirmID
+        ).length <= 22,
+        true,
+      );
       assert.equal(Object.hasOwn(payload, 'OrderConfirmId'), false);
       if (state.loss) throw new Error('private-secret raw upstream exception');
     }
@@ -323,6 +357,10 @@ function harness({ clock = false } = {}) {
   );
   globals.lib.utils = load('lib/utils.js', globals);
   for (const name of [
+    'relation',
+    'groupEvidence',
+    'groupLookup',
+    'ruleRows',
     'request',
     'credentialSource',
     'authorization',
@@ -1193,7 +1231,7 @@ test('protected capabilities describes recovery', async () => {
   assert.deepEqual(plain(await h.invoke('capabilities')), {
     version: 2,
     terminal: 'TS',
-    contract: 'meta-ts-v2-1',
+    contract: 'meta-ts-v2-2',
     submit: true,
     restart_safe: false,
     recovery: 'known_order_id_only',
@@ -1268,6 +1306,9 @@ test('orderId alone owns immutable attempt identity', () => {
     live: data.live,
     fingerprint: 'intent-1',
     brokerId: null,
+    brokerIds: [],
+    relation: null,
+    orders: [],
     result: null,
   });
   for (const changed of [
@@ -2414,7 +2455,7 @@ test('ready preserves exact finite maximum and literal infinity', () => {
   ]) {
     const quantity = { maximum };
     const result = assemble(quantity);
-    assert.deepEqual(result, expectedRules(rulesInput(), expected));
+    assert.deepEqual(result, expectedRules(rulesInput(), expected, false));
     for (const row of result.orders) {
       assert.equal(row.quantity.maximum, expected);
       assert.equal(row.quantity.fractional, row.quantityMode === 'fractional');
@@ -2438,7 +2479,7 @@ test('ready preserves exact finite maximum and literal infinity', () => {
 test('Intelligent range requires proof for every combination', () => {
   const h = harness();
   const instrument = symbolDetails().Symbols[0];
-  const orders = expectedRules(rulesInput()).orders.map(
+  const orders = expectedRules(rulesInput(), 'infinity', false).orders.map(
     ({ quantity, ...order }) => {
       assert.equal(quantity.maximum, 'infinity');
       return order;
@@ -2557,7 +2598,7 @@ test('Intelligent range requires proof for every combination', () => {
       price: h.globals.lib.execution.priceRules(instrument.PriceFormat),
     }),
   );
-  assert.deepEqual(result, expectedRules(rulesInput(), '1000000'));
+  assert.deepEqual(result, expectedRules(rulesInput(), '1000000', false));
   assert.equal(h.calls.length, 0);
 });
 
@@ -2617,7 +2658,10 @@ test('large finite bound preserves T-068 transport guard', async () => {
       price: h.globals.lib.execution.priceRules(instrument.PriceFormat),
     }),
   );
-  assert.deepEqual(ready, expectedRules(rulesInput(), '9007199254740992'));
+  assert.deepEqual(
+    ready,
+    expectedRules(rulesInput(), '9007199254740992', false),
+  );
   const data = input();
   data.intent.quantity = 9007199254740992;
   assert.equal((await h.invoke('submit', data)).state, 'rejected');
@@ -3232,4 +3276,739 @@ test('rules source errors and expired evidence fail closed', async () => {
     accessUpdate: { refresh_token: 'rotated-refresh' },
   });
   assert.equal(expired.time.pending(), 0);
+});
+
+const relationInput = (relation = 'BRK') => {
+  const data = input();
+  const entry = {
+    ...data.intent,
+    symbol: 'MSFT',
+    type: 'limit',
+    tif: 'gtc',
+    limitPrice: 225,
+  };
+  const limit = {
+    ...entry,
+    quantity: -2,
+    type: 'limit',
+    tif: 'gtc',
+    limitPrice: 230,
+  };
+  const stop = {
+    ...entry,
+    quantity: -2,
+    type: 'stop',
+    tif: 'gtc',
+    limitPrice: null,
+    stopPrice: 215,
+  };
+  data.intent =
+    relation === 'BRK'
+      ? { ...entry, relation, related: [limit, stop] }
+      : { ...limit, relation, related: [stop] };
+  return data;
+};
+// Brokerage Order/OrderLeg fields from the official v3 specification, rather
+// than a request echo. Placement OrderResponse provides IDs and Message only.
+const relationRows = (data) =>
+  [data.intent, ...data.intent.related].map((leg, index) => {
+    const row = {
+      AccountID: data.account,
+      OrderID: `G-${index}`,
+      OrderType: { market: 'Market', limit: 'Limit', stop: 'StopMarket' }[
+        leg.type
+      ],
+      Duration: leg.tif === 'day' ? 'DAY' : 'GTC',
+      Routing: 'Intelligent',
+      Status: index === 0 ? 'ACK' : 'OSO',
+      Legs: [
+        {
+          AssetType: 'STOCK',
+          Symbol: 'MSFT',
+          QuantityOrdered: '2.00',
+          BuyOrSell: leg.quantity > 0 ? 'Buy' : 'Sell',
+          OpenOrClose: leg.quantity > 0 ? 'Open' : 'Close',
+        },
+      ],
+      Message: 'private-secret non-authoritative message OrderID=FAKE',
+      StatusDescription: 'private-refresh',
+    };
+    if (leg.type === 'limit') row.LimitPrice = `${leg.limitPrice}.00`;
+    if (leg.type === 'stop') row.StopPrice = '215.00';
+    return row;
+  });
+const prepareRelation = (h, data) => {
+  h.state.account = data.account;
+  if (data.intent.relation === 'OCO') {
+    h.state.responses.positions = {
+      Positions: [{ AccountID: data.account, Symbol: 'MSFT', Quantity: '5' }],
+    };
+  }
+  h.state.responses.place = {
+    Orders: relationRows(data).map(({ OrderID, Message }) => ({
+      OrderID,
+      Message,
+    })),
+    Errors: [],
+  };
+  h.state.responses.current = {
+    Orders: relationRows(data).reverse(),
+    Errors: [],
+  };
+  h.state.responses.historical = { Orders: [], Errors: [] };
+};
+const safeRelation = (h, data, result) => {
+  const receipt = h.globals.domain.execution.attempts.get(data);
+  for (const value of [result.broker, receipt, h.logs]) {
+    const serialized = JSON.stringify(value);
+    for (const secret of [
+      'private-secret',
+      'private-refresh',
+      'private-access',
+      'non-authoritative',
+      'FAKE',
+      'Message',
+      'StatusDescription',
+    ]) {
+      assert.equal(serialized.includes(secret), false, secret);
+    }
+  }
+  assert.equal(
+    h.calls.some(
+      (call) =>
+        call.options.method === 'DELETE' || call.options.method === 'PUT',
+    ),
+    false,
+  );
+};
+
+test('native BRK/OCO with both credential sources', async () => {
+  for (const relation of ['BRK', 'OCO']) {
+    for (const connector of [false, true]) {
+      const h = connector ? await connectorHarness() : harness();
+      const data = connector ? connectorInput('submit') : input();
+      data.intent = relationInput(relation).intent;
+      prepareRelation(h, data);
+      h.state.rotate = true;
+      const result = await h.invoke('submit', data);
+      assert.equal(result.state, 'acknowledged');
+      assert.equal(result.broker.mapping, 'verified');
+      assert.deepEqual(
+        plain(result.broker.orders),
+        relationRows(data).map((row, leg) => ({
+          terminal_id: row.OrderID,
+          state: leg === 0 ? 'accepted' : 'pending',
+          leg,
+        })),
+      );
+      assert.equal(h.postCount(), 1);
+      const placed = h.calls.find((call) => call.stage === 'place');
+      assert.equal(placed.options.method, 'POST');
+      assert.equal(
+        placed.url,
+        `https://${data.live ? 'api' : 'sim-api'}.tradestation.com/v3/orderexecution/${relation === 'BRK' ? 'orders' : 'ordergroups'}`,
+      );
+      const payload = JSON.parse(placed.options.body);
+      const exits =
+        relation === 'BRK' ? payload.OSOs[0].Orders : payload.Orders;
+      const limit = exits.find((order) => order.OrderType === 'Limit');
+      const stop = exits.find((order) => order.OrderType === 'StopMarket');
+      assert.deepEqual(limit, {
+        AccountID: data.account,
+        Symbol: 'MSFT',
+        Quantity: '2',
+        OrderType: 'Limit',
+        TimeInForce: { Duration: 'GTC' },
+        TradeAction: 'SELL',
+        Route: 'Intelligent',
+        OrderConfirmID: relation === 'BRK' ? 'm17-1' : 'm17-0',
+        LimitPrice: '230',
+      });
+      assert.deepEqual(stop, {
+        AccountID: data.account,
+        Symbol: 'MSFT',
+        Quantity: '2',
+        OrderType: 'StopMarket',
+        TimeInForce: { Duration: 'GTC' },
+        TradeAction: 'SELL',
+        Route: 'Intelligent',
+        OrderConfirmID: relation === 'BRK' ? 'm17-2' : 'm17-1',
+        StopPrice: '215',
+      });
+      if (relation === 'BRK') {
+        assert.deepEqual(payload, {
+          AccountID: data.account,
+          Symbol: 'MSFT',
+          Quantity: '2',
+          OrderType: 'Limit',
+          TimeInForce: { Duration: 'GTC' },
+          TradeAction: 'BUY',
+          Route: 'Intelligent',
+          LimitPrice: '225',
+          OrderConfirmID: 'meta-17',
+          OSOs: [{ Type: 'BRK', Orders: [limit, stop] }],
+        });
+      } else {
+        assert.deepEqual(payload, { Type: 'OCO', Orders: [limit, stop] });
+      }
+      const before = h.calls.length;
+      const replay = await h.invoke('submit', { ...data, credentials: null });
+      assert.equal(replay.state, 'acknowledged');
+      assert.equal(replay.accessUpdate, undefined);
+      assert.equal(h.calls.length, before);
+      safeRelation(h, data, result);
+      if (connector) safeConnector(h, result);
+    }
+  }
+});
+
+test('relation rejects before authorization', async () => {
+  for (const relation of ['BRK', 'OCO']) {
+    const h = harness();
+    const data = relationInput(relation);
+    const variants = [
+      { ...data.intent, related: null },
+      { ...data.intent, related: [] },
+      {
+        ...data.intent,
+        related: [...data.intent.related, data.intent.related[0]],
+      },
+      { ...data.intent, extended: true },
+      { ...data.intent, tif: 'ioc' },
+      { ...data.intent, quantity: 0 },
+      { ...data.intent, assetCategory: 'OPT' },
+      { ...data.intent, account: 'OTHER' },
+      { ...data.intent, route: 'ARCA' },
+      { ...data.intent, live: false },
+      ...[
+        { symbol: 'AAPL' },
+        { account: 'OTHER' },
+        { live: false },
+        { route: 'ARCA' },
+        { quantity: 1 },
+        { quantity: -3 },
+        { quantity: '-2' },
+        { quantity: 1.5 },
+        { type: 'stop_limit', limitPrice: 230, stopPrice: 215 },
+        { extended: true },
+        { tif: 'day' },
+        { assetCategory: 'OPT' },
+        { relation: 'OCO', related: [{}] },
+        { type: 'limit', limitPrice: 0, stopPrice: null },
+        { type: 'stop', limitPrice: null, stopPrice: NaN },
+        { type: 'limit', limitPrice: 230, stopPrice: 215 },
+      ].map((change) => ({
+        ...data.intent,
+        related: data.intent.related.map((leg, index) =>
+          index === 0 ? { ...leg, ...change } : leg,
+        ),
+      })),
+    ];
+    if (relation === 'BRK') {
+      variants.push({
+        ...data.intent,
+        related: [data.intent.related[0], data.intent.related[0]],
+      });
+    }
+    for (const intent of variants) {
+      assert.equal(
+        (await h.invoke('submit', { ...data, intent })).state,
+        'rejected',
+      );
+      assert.equal(h.globals.domain.execution.attempts.get(data), null);
+    }
+    assert.equal(h.calls.length, 0);
+  }
+});
+
+test('relation requires broker proof', async () => {
+  for (const relation of ['BRK', 'OCO']) {
+    for (const change of [
+      {
+        stage: 'accounts',
+        modify: (body) => {
+          body.Accounts[0].Status = 'Closed';
+        },
+      },
+      {
+        stage: 'details',
+        modify: (body) => {
+          body.Symbols[0].Country = 'Canada';
+        },
+      },
+      {
+        stage: 'details',
+        modify: (body) => {
+          body.Symbols[0].Exchange = 'OTC';
+        },
+      },
+      {
+        stage: 'details',
+        modify: (body) => {
+          body.Symbols[0].QuantityFormat.MinimumTradeQuantity = '3';
+        },
+      },
+      {
+        stage: 'details',
+        modify: (body) => {
+          body.Symbols[0].QuantityFormat.Increment = '3';
+        },
+      },
+      {
+        stage: 'details',
+        modify: (body) => {
+          delete body.Symbols[0].PriceFormat;
+        },
+      },
+      {
+        stage: 'routes',
+        modify: (body) => {
+          body.Routes[0].Id = 'ARCA';
+        },
+      },
+      {
+        stage: 'positions',
+        modify: (body) => {
+          body.Positions = [
+            {
+              AccountID: 'EXT-1',
+              Symbol: 'MSFT',
+              Quantity: relation === 'BRK' ? '1' : '0',
+            },
+          ];
+        },
+      },
+      {
+        stage: 'positions',
+        modify: (body) => {
+          body.Positions = [
+            {
+              AccountID: 'EXT-1',
+              Symbol: 'MSFT',
+              Quantity: relation === 'BRK' ? '-1' : '1',
+            },
+          ];
+        },
+      },
+    ]) {
+      const h = harness();
+      const data = relationInput(relation);
+      prepareRelation(h, data);
+      const bodies = {
+        accounts: {
+          Accounts: [
+            {
+              AccountID: 'EXT-1',
+              Status: 'Active',
+              AccountType: 'Cash',
+              Currency: 'USD',
+            },
+          ],
+        },
+        details: symbolDetails(),
+        routes: { Routes: [{ Id: 'Intelligent', AssetTypes: ['STOCK'] }] },
+        positions: { Positions: [] },
+      };
+      change.modify(bodies[change.stage]);
+      h.state.responses[change.stage] = bodies[change.stage];
+      assert.equal(
+        (await h.invoke('submit', data)).state,
+        'rejected',
+        change.stage,
+      );
+      assert.equal(h.postCount(), 0);
+      const before = h.calls.length;
+      assert.equal((await h.invoke('submit', data)).state, 'rejected');
+      assert.equal(h.calls.length, before);
+    }
+  }
+});
+
+test('partial placement retains IDs without retry', async () => {
+  for (const relation of ['BRK', 'OCO']) {
+    const h = harness();
+    const data = relationInput(relation);
+    prepareRelation(h, data);
+    h.state.responses.place = {
+      Orders: [
+        { OrderID: 'G-0', Message: 'private-secret' },
+        { OrderID: 'G-1', Message: 'OrderID=FAKE' },
+      ],
+      Errors: [
+        { OrderID: 'E-1', Error: 'private-refresh', Message: 'private-access' },
+        { OrderID: 'E-2', Error: 'FAILED' },
+      ],
+    };
+    const result = await h.invoke('submit', data);
+    assert.equal(result.state, 'ambiguous');
+    assert.deepEqual(
+      plain(result.broker.orders.map((order) => order.terminal_id)),
+      ['E-1', 'E-2', 'G-0', 'G-1'],
+    );
+    assert.equal(
+      h.calls.some((call) => call.stage === 'current'),
+      false,
+    );
+    const before = h.calls.length;
+    assert.deepEqual(plain(await h.invoke('submit', data)), plain(result));
+    for (const intent of [
+      { ...data.intent, quantity: 3 },
+      {
+        ...data.intent,
+        related: data.intent.related.map((leg) => ({ ...leg, stopPrice: 200 })),
+      },
+      { ...data.intent, relation: 'NORMAL', related: [] },
+      null,
+    ]) {
+      assert.equal(
+        (await h.invoke('submit', { ...data, intent })).state,
+        'ambiguous',
+      );
+    }
+    assert.equal(h.calls.length, before);
+    assert.equal(h.postCount(), 1);
+    safeRelation(h, data, result);
+  }
+});
+
+test('unproven group evidence fails closed', async () => {
+  const data = relationInput();
+  for (const placement of [
+    null,
+    [],
+    {},
+    { Message: 'OrderID=FAKE' },
+    { Orders: [{}] },
+    { Orders: [{ OrderID: 'invalid/id' }] },
+    { Orders: [{ OrderID: 'G-0' }, { OrderID: 'G-0' }] },
+    { Orders: [{ OrderID: 'G-0', AccountID: 'OTHER' }] },
+    { Orders: [{ OrderID: 'G-0' }], Errors: {} },
+    { Orders: [{ OrderID: 'G-0' }], Error: 'FAILED' },
+    { Orders: [{ OrderID: 'G-0' }], NextToken: 'more' },
+    {
+      Orders: relationRows(data).map((row) => ({ ...row, Status: 'UNKNOWN' })),
+    },
+  ]) {
+    const h = harness();
+    prepareRelation(h, data);
+    h.state.responses.place = placement;
+    h.state.responses.current = {
+      Orders: relationRows(data).map((row) => ({ ...row, Status: 'UNKNOWN' })),
+    };
+    const result = await h.invoke('submit', data);
+    assert.equal(result.state, 'ambiguous');
+    const before = h.calls.length;
+    assert.equal((await h.invoke('submit', data)).state, 'ambiguous');
+    assert.equal(h.calls.length, before);
+    assert.equal(h.postCount(), 1);
+    safeRelation(h, data, result);
+  }
+  for (const change of [
+    (rows) => {
+      delete rows[1].Legs;
+    },
+    (rows) => {
+      rows[1].Legs[0].Symbol = 'AAPL';
+    },
+    (rows) => {
+      rows[1].Legs[0].QuantityOrdered = '3';
+    },
+    (rows) => {
+      rows[1].Legs[0].BuyOrSell = 'Buy';
+    },
+    (rows) => {
+      rows[1].Legs[0].OpenOrClose = 'Open';
+    },
+    (rows) => {
+      rows[1].Duration = 'GCP';
+    },
+    (rows) => {
+      rows[1].LimitPrice = '231';
+    },
+    (rows) => {
+      rows[2] = { ...rows[1], OrderID: rows[2].OrderID };
+    },
+    (rows) => {
+      rows.push({ ...rows[0], OrderID: 'EXTRA' });
+    },
+  ]) {
+    const h = harness();
+    prepareRelation(h, data);
+    const rows = relationRows(data);
+    change(rows);
+    h.state.responses.current = { Orders: rows };
+    const result = await h.invoke('submit', data);
+    assert.equal(result.state, 'ambiguous');
+    assert.equal(result.broker.mapping, 'ambiguous');
+    assert.equal(
+      (
+        await h.invoke('submit', {
+          ...data,
+          intent: relationInput('OCO').intent,
+        })
+      ).state,
+      'ambiguous',
+    );
+    assert.equal(h.postCount(), 1);
+    safeRelation(h, data, result);
+  }
+});
+
+test('group current/history returns factual states', async () => {
+  for (const relation of ['BRK', 'OCO']) {
+    const h = harness();
+    const data = relationInput(relation);
+    prepareRelation(h, data);
+    await h.invoke('submit', data);
+    const rows = relationRows(data);
+    rows[0].Status = 'FLL';
+    rows[1].Status = 'CAN';
+    if (rows[2]) rows[2].Status = 'FPR';
+    h.state.responses.current = { Orders: rows.slice(1) };
+    h.state.responses.historical = { Orders: rows.slice(0, 1) };
+    const before = h.calls.length;
+    const result = await h.invoke('lookup', data);
+    assert.equal(result.state, 'found');
+    assert.equal(result.broker.mapping, 'verified');
+    assert.deepEqual(
+      plain(result.broker.orders),
+      rows.map((row, leg) => ({
+        terminal_id: row.OrderID,
+        state: ['filled', 'cancelled', 'part_filled'][leg],
+        leg,
+      })),
+    );
+    const reads = h.calls
+      .slice(before)
+      .filter((call) => ['current', 'historical'].includes(call.stage));
+    assert.equal(reads.length, 2);
+    assert.ok(
+      reads[0].url.endsWith(
+        `/orders/${rows.map((row) => row.OrderID).join(',')}`,
+      ),
+    );
+    assert.match(
+      reads[1].url,
+      /historicalorders\/G-0\?since=\d{4}-\d{2}-\d{2}$/,
+    );
+    assert.equal(h.postCount(), 1);
+    safeRelation(h, data, result);
+    h.restart();
+    const restart = await h.invoke('lookup', {
+      ...data,
+      relation,
+      brokerIds: rows.map((row) => row.OrderID),
+    });
+    assert.equal(restart.state, 'found');
+    assert.equal(restart.broker.mapping, 'ambiguous');
+    assert.deepEqual(
+      plain(restart.broker.orders),
+      plain(result.broker.orders).map(({ leg, ...order }) => {
+        assert.ok(Number.isInteger(leg));
+        return order;
+      }),
+    );
+    assert.equal(h.postCount(), 1);
+  }
+});
+
+test('group lookup preserves uncertainty', async () => {
+  for (const change of [
+    { current: { Orders: [] }, historical: { Orders: [] } },
+    {
+      current: { Orders: [order({ OrderID: 'G-0', Status: 'UNKNOWN' })] },
+      historical: { Orders: [] },
+    },
+    {
+      current: { Orders: [order({ OrderID: 'G-0', Status: 'FLL' })] },
+      historical: { Orders: [] },
+    },
+    {
+      current: { Orders: [order({ OrderID: 'G-0', Status: 'FLL' })] },
+      historical: {
+        Orders: [],
+        Errors: [{ OrderID: 'G-1', Error: 'private-secret' }],
+      },
+    },
+    { current: { Orders: [order({ OrderID: 'G-0', AccountID: 'OTHER' })] } },
+    { current: { Orders: [order({ OrderID: 'EXTRA' })] } },
+    {
+      current: {
+        Orders: [order({ OrderID: 'G-0' }), order({ OrderID: 'G-0' })],
+      },
+    },
+    { current: { Orders: [order({ OrderID: 'G-0' })], NextToken: 'more' } },
+  ]) {
+    const h = harness();
+    const data = relationInput('OCO');
+    prepareRelation(h, data);
+    await h.invoke('submit', data);
+    Object.assign(h.state.responses, change);
+    const result = await h.invoke('lookup', data);
+    assert.equal(result.state, 'source_unavailable');
+    assert.equal(result.broker.orders.length, 2);
+    assert.equal(result.broker.mapping, 'ambiguous');
+    assert.notEqual(result.state, 'not_found');
+    assert.equal(h.postCount(), 1);
+    safeRelation(h, data, result);
+  }
+});
+
+test('group lookup rejects conflicts before OAuth', async () => {
+  const h = harness();
+  const data = relationInput();
+  prepareRelation(h, data);
+  await h.invoke('submit', data);
+  const before = h.calls.length;
+  for (const change of [
+    { brokerIds: [] },
+    { brokerIds: ['G-0'] },
+    { brokerIds: ['G-0', 'G-0'] },
+    { brokerIds: ['G-0', 'G-1', '../G-2'] },
+    { brokerIds: ['G-0', 'G-1', 'OTHER'] },
+    { brokerIds: 'G-0,G-1,G-2' },
+    { brokerId: 'G-0' },
+    { relation: 'OCO' },
+  ]) {
+    assert.equal(
+      (await h.invoke('lookup', { ...data, ...change })).state,
+      'source_unavailable',
+    );
+  }
+  assert.equal(h.calls.length, before);
+  const exact = await h.invoke('lookup', {
+    ...data,
+    brokerIds: ['G-2', 'G-1', 'G-0'],
+  });
+  assert.equal(exact.state, 'found');
+  h.restart();
+  const restartedBefore = h.calls.length;
+  for (const change of [
+    {},
+    { brokerIds: ['G-0'] },
+    { relation: 'NORMAL', brokerIds: ['G-0'] },
+    { relation: 'BRK', brokerIds: ['G-0', 'G-0'] },
+    {
+      relation: 'BRK',
+      brokerIds: Array.from({ length: 51 }, (_, i) => `G-${i}`),
+    },
+  ]) {
+    assert.equal(
+      (await h.invoke('lookup', { ...data, ...change })).state,
+      'source_unavailable',
+    );
+  }
+  assert.equal(h.calls.length, restartedBefore);
+  assert.equal(h.postCount(), 1);
+});
+
+test('group barrier blocks replay after timeout/loss', async () => {
+  for (const relation of ['BRK', 'OCO']) {
+    for (const failure of ['hang', 'jsonHang', 'loss']) {
+      const h = harness({ clock: true });
+      const data = relationInput(relation);
+      prepareRelation(h, data);
+      if (failure === 'loss') h.state.loss = true;
+      else h.state[failure] = 'place';
+      const pending = h.invoke('submit', data);
+      for (let i = 0; i < 20 && !h.postCount(); i++) await flush();
+      assert.equal(h.postCount(), 1);
+      const before = h.calls.length;
+      for (const changed of [
+        data,
+        { ...data, intent: null },
+        { ...data, credentials: null },
+        { ...data, account: 'OTHER' },
+        { ...data, live: false },
+        { ...data, intent: { ...data.intent, related: [{}] } },
+      ]) {
+        assert.equal((await h.invoke('submit', changed)).state, 'ambiguous');
+      }
+      assert.equal(h.calls.length, before);
+      h.time.advance(12000);
+      await flush();
+      const result = await pending;
+      assert.equal(result.state, 'ambiguous');
+      assert.equal((await h.invoke('submit', data)).state, 'ambiguous');
+      assert.equal(
+        (await h.invoke('lookup', data)).state,
+        'source_unavailable',
+      );
+      assert.equal(h.postCount(), 1);
+      safeRelation(h, data, result);
+    }
+  }
+});
+
+test('mapping timeout retains IDs without retry', async () => {
+  const h = harness({ clock: true });
+  const data = relationInput();
+  prepareRelation(h, data);
+  h.state.hang = 'current';
+  const pending = h.invoke('submit', data);
+  for (
+    let i = 0;
+    i < 20 && !h.calls.some((call) => call.stage === 'current');
+    i++
+  ) {
+    await flush();
+  }
+  assert.ok(h.calls.some((call) => call.stage === 'current'));
+  h.time.advance(12000);
+  await flush();
+  const result = await pending;
+  assert.equal(result.state, 'ambiguous');
+  assert.deepEqual(
+    plain(result.broker.orders.map((order) => order.terminal_id)),
+    ['G-0', 'G-1', 'G-2'],
+  );
+  assert.equal((await h.invoke('submit', data)).state, 'ambiguous');
+  assert.equal(h.postCount(), 1);
+  safeRelation(h, data, result);
+});
+
+test('relation confirm IDs are unique and bounded', () => {
+  const h = harness();
+  for (const relation of ['BRK', 'OCO']) {
+    const data = relationInput(relation);
+    data.orderId = Number.MAX_SAFE_INTEGER;
+    const projected = h.globals.lib.execution.relation({ data });
+    const ids = projected.orders.map((order) => order.OrderConfirmID);
+    assert.equal(new Set(ids).size, projected.orders.length);
+    assert.ok(ids.every((id) => id.length <= 22));
+  }
+});
+
+test('relation mapping preserves reordered legs', async () => {
+  for (const relation of ['BRK', 'OCO']) {
+    const h = harness();
+    const data = relationInput(relation);
+    if (relation === 'BRK') {
+      data.intent.related.reverse();
+    } else {
+      const { related, ...base } = data.intent;
+      data.intent = {
+        ...related[0],
+        relation,
+        related: [{ ...base, relation: 'NORMAL', related: [] }],
+      };
+    }
+    prepareRelation(h, data);
+    const result = await h.invoke('submit', data);
+    assert.equal(result.state, 'acknowledged');
+    assert.equal(result.broker.mapping, 'verified');
+    assert.deepEqual(
+      plain(result.broker.orders.map((order) => order.leg)),
+      relation === 'BRK' ? [0, 1, 2] : [0, 1],
+    );
+    const placed = JSON.parse(
+      h.calls.find((call) => call.stage === 'place').options.body,
+    );
+    const orders = relation === 'BRK' ? placed.OSOs[0].Orders : placed.Orders;
+    assert.deepEqual(
+      orders.map((order) => order.OrderType),
+      ['StopMarket', 'Limit'],
+    );
+    assert.equal(h.postCount(), 1);
+  }
 });

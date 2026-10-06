@@ -96,22 +96,13 @@
   const maximum = lib.execution.intelligentMaximum({
     instrument,
     route: intelligent.Id,
-    orders: [
-      { type: 'market', tif: 'day', sessions: ['regular'] },
-      { type: 'limit', tif: 'gtc', sessions: ['regular', 'pre_market', 'post_market'] },
-    ].map((order) => ({
-      ...order,
-      relation: 'NORMAL',
-      orderClass: 'simple',
-      quantityMode: 'whole',
-      side: 'buy',
-      positionEffect: 'open',
-    })),
+    orders: lib.execution.ruleRows({ relations: true }),
   });
   return lib.execution.rulesReady({
     data,
     instrument,
     quantity: { fractional: false, minimum: minimum.text, step: step.text, maximum, minimumNotional: null },
     price,
+    relations: true,
   });
 };

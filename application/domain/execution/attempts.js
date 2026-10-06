@@ -13,7 +13,16 @@
       return { owner: false, conflict, attempt: existing };
     }
     if (attempts.size >= 10000) return { owner: false, conflict: true, attempt: null };
-    const attempt = { account: data.account, live: data.live, fingerprint, brokerId: null, result: null };
+    const attempt = {
+      account: data.account,
+      live: data.live,
+      fingerprint,
+      brokerId: null,
+      brokerIds: [],
+      relation: null,
+      orders: [],
+      result: null,
+    };
     attempts.set(data.orderId, attempt); // synchronous, before the first await
     return { owner: true, conflict: false, attempt };
   };
