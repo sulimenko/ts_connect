@@ -6,12 +6,18 @@
     return Number.isFinite(number) ? number.toFixed(digits) : null;
   };
 
-  if (!message || !message.Legs || message.Legs.length === 0) return null;
+  if (!message || !message.Legs || message.Legs.length === 0) {
+    return null;
+  }
 
   const leg = message.Legs[0];
-  if (!leg.Symbol || !leg.Expiration || !leg.OptionType) return null;
+  if (!leg.Symbol || !leg.Expiration || !leg.OptionType) {
+    return null;
+  }
   const option = lib.utils.makeSymbol(leg.Symbol);
-  if (!option || option.type !== 'OPT') return null;
+  if (!option || option.type !== 'OPT') {
+    return null;
+  }
 
   const expiration = leg.Expiration.split('T')[0];
 
