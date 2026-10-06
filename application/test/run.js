@@ -1456,6 +1456,12 @@ test('readOptionChain and positions share the same canonical option symbol contr
   assert.ok(option);
   assert.equal(option.symbol_raw, 'CRWV280121C00080000');
   assert.equal(option.strike, '00080000');
+  assert.equal(option.symbol_external, 'CRWV 280121C80');
+  assert.equal(option.source, 'TS');
+  assert.equal(option.underlying_symbol, 'CRWV');
+  assert.equal(option.strike_price, 80);
+  assert.equal(option.option_metadata.Symbol, 'CRWV 280121C80');
+  assert.equal(option.option_metadata.StrikePrice, 80);
 
   positions.setPosition({
     account: 'A1',
