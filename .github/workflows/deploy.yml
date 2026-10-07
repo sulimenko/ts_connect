@@ -6,51 +6,7 @@ on:
       - "*"
 
 jobs:
-  deploy-test:
-    if: contains(github.ref_name, '-')
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Add SSH key (base64)
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.TEST_DEPLOY_SSH_KEY_B64 }}" | base64 -d > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          eval "$(ssh-agent -s)"
-          ssh-add ~/.ssh/id_rsa
-
-      - name: Trust host key
-        run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan -H "${{ vars.TEST_DEPLOY_HOST }}" >> ~/.ssh/known_hosts
-
-      - name: Ensure remote deploy directory exists
-        run: |
-          ssh "${{ vars.TEST_DEPLOY_USER }}@${{ vars.TEST_DEPLOY_HOST }}" "mkdir -p '${{ vars.TEST_DEPLOY_PATH }}'"
-
-      - name: Show remote deploy directory
-        run: |
-          ssh "${{ vars.TEST_DEPLOY_USER }}@${{ vars.TEST_DEPLOY_HOST }}" "ls -la '${{ vars.TEST_DEPLOY_PATH }}'"
-
-      - name: Sync source to server
-        run: |
-          rsync -az --delete \
-            `# --exclude "/.git"` \
-            --exclude "/.github" \
-            --exclude "/.vscode" \
-            --exclude "/node_modules" \
-            --exclude "/log" \
-            --exclude "/.env" \
-            ./ "${{ vars.TEST_DEPLOY_USER }}@${{ vars.TEST_DEPLOY_HOST }}:${{ vars.TEST_DEPLOY_PATH }}/"
-
-      - name: Build and run on server
-        run: |
-          ssh "${{ vars.TEST_DEPLOY_USER }}@${{ vars.TEST_DEPLOY_HOST }}" "cd '${{ vars.TEST_DEPLOY_PATH }}' && docker compose build && docker compose up -d --remove-orphans"
-
   deploy-prod:
-    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
