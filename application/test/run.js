@@ -3715,12 +3715,20 @@ test('orders REST helper normalizes empty nullable fields and rejects malformed 
   await assert.rejects(helper({ account: 'A1', live: true, token: 'token' }), /Orders/);
 });
 
-test('exact orders 404 reaches RPC as empty only for current or explicit historical range', async () => {
+test('exact orders 404 reaches RPC as empty with receiver-sensitive console only for current or explicit historical range', async () => {
   for (const historical of [false, true]) {
     for (const body of [{ Message: 'Order not found' }, { Error: 'NotFound', Message: 'Order not found', StatusCode: 404 }]) {
       const calls = [];
       const globals = {
-        console: { log: () => {}, error: () => {} },
+        console: {
+          entries: [],
+          log(...args) {
+            this.entries.push(args);
+          },
+          error(...args) {
+            this.entries.push(args);
+          },
+        },
         fetch: async (url) => {
           calls.push(url);
           return new Response(JSON.stringify(body), { status: 404, headers: { 'content-type': 'application/json; charset=utf-8' } });
@@ -3740,6 +3748,7 @@ test('exact orders 404 reaches RPC as empty only for current or explicit histori
       const api = loadExpressionModule(`application/api/account/${historical ? 'historicalorders' : 'orders'}.js`, globals);
       const input = { contracts: [{ account: 'A1', live: false }], orders: ['O1'], start: '2020-01-01' };
       assert.deepEqual(JSON.parse(JSON.stringify(await api.method(input))), []);
+      assert.equal(globals.console.entries.filter(([, entry]) => entry.state === 'miss').length, 1);
       assert.equal(calls.length, 1);
       assert.ok(calls[0].includes(`/accounts/A1/${historical ? 'historicalorders' : 'orders'}/O1`));
       assert.equal(calls[0].includes('since=2020-01-01'), historical);
