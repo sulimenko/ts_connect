@@ -136,7 +136,7 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
       const miss = lookupMiss && !signal?.aborted && !timedOut && !malformed && !timeout && !network;
       const retryable = !signal?.aborted && !malformed && error.status !== 404 && (timeout || network || transient.has(error.status));
       const log = miss ? console.log : console.error;
-      log('TradeStation orders read:', {
+      log.call(console, 'TradeStation orders read:', {
         endpoint: endpointName,
         account: accountId,
         mode,
