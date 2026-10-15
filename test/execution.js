@@ -229,6 +229,120 @@ function fakeClock() {
     pending: () => timers.size,
   };
 }
+
+test('historical batch bounds slow bodies and read failures', async () => {
+  for (const mode of ['success', 'body', 'headers']) {
+    const time = fakeClock();
+    const started = time.Date.now();
+    const logs = [];
+    const calls = new Map();
+    const lib = {
+      utils: {
+        constructDomain: () => 'local',
+        constructURL: (method, domain, endpoint) => endpoint.join('/'),
+      },
+      ts: {},
+    };
+    const wait = (ms, signal) =>
+      new Promise((resolve, reject) => {
+        let timer = null;
+        const abort = () => {
+          time.clearTimeout(timer);
+          reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+        };
+        timer = Number.isFinite(ms)
+          ? time.setTimeout(() => {
+              signal.removeEventListener('abort', abort);
+              resolve();
+            }, ms)
+          : null;
+        signal.addEventListener('abort', abort, { once: true });
+      });
+    const globals = {
+      ...time,
+      Error,
+      AbortController,
+      URLSearchParams,
+      lib,
+      console: {
+        log: (...args) => logs.push(args[1]),
+        error: (...args) => logs.push(args[1]),
+      },
+      fetch: async (url, { signal }) => {
+        const account = url.split('/')[3];
+        const attempt = (calls.get(account) ?? 0) + 1;
+        calls.set(account, attempt);
+        const read = async () => {
+          if (account === 'A6') {
+            const delay = mode === 'success' ? 8000 : Infinity;
+            await wait(attempt === 1 ? 500 : delay, signal);
+            if (attempt === 1) {
+              throw Object.assign(new TypeError('fetch failed'), {
+                cause: {
+                  code:
+                    mode === 'headers'
+                      ? 'UND_ERR_HEADERS_TIMEOUT'
+                      : 'UND_ERR_BODY_TIMEOUT',
+                },
+              });
+            }
+          } else {
+            await wait(mode === 'success' ? 8000 : 100, signal);
+          }
+          return { Orders: [{ AccountID: account, OrderID: `O-${account}` }] };
+        };
+        if (account === 'A6' && mode === 'headers') await read();
+        return { ok: true, status: 200, json: read };
+      },
+    };
+    lib.ts.send = load('lib/ts/send.js', globals);
+    lib.ts.orderError = load('lib/ts/orderError.js', globals);
+    lib.ts.orders = load('lib/ts/orders.js', globals);
+    const batch = load('lib/ts/ordersBatch.js', globals);
+    let result = null;
+    let failure = null;
+    const pending = batch({
+      contracts: ['A1', 'A2', 'A3', 'A4', 'A5', 'A6'].map((account) => ({
+        account,
+        live: true,
+      })),
+      token: 'test-only',
+      historical: true,
+    }).then(
+      (value) => {
+        result = value;
+      },
+      (error) => {
+        failure = error;
+      },
+    );
+    await flush();
+    for (let elapsed = 0; elapsed < 18000; elapsed += 100) {
+      if (result || failure) break;
+      time.advance(100);
+      await flush();
+    }
+    await pending;
+    assert.equal(calls.get('A6'), 2);
+    assert.equal(time.pending(), 0);
+    assert.ok(time.Date.now() - started <= 18000);
+    if (mode === 'success') {
+      assert.equal(failure, null);
+      assert.equal(result.length, 6);
+      assert.ok(time.Date.now() - started > 14000);
+    } else {
+      assert.equal(result, null);
+      assert.equal(failure.code, 'ETIMEOUT');
+      assert.equal(failure.phase, mode);
+      assert.equal(failure.httpStatus, mode === 'body' ? 200 : null);
+      const diagnostic = logs.find((entry) => entry.failedAccount === 'A6');
+      assert.equal(diagnostic.state, 'error');
+      assert.equal(diagnostic.completedAccounts, 5);
+      assert.equal(diagnostic.phase, mode);
+    }
+  }
+});
+
 function harness({ clock = false } = {}) {
   const calls = [];
   const logs = [];

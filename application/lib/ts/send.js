@@ -10,6 +10,10 @@ async ({
   signal = null,
   meta = null,
 }) => {
+  const started = Date.now();
+  let phase = 'request';
+  let headersAt = null;
+  let httpStatus = null;
   try {
     if (domain === null) domain = lib.utils.constructDomain(live);
     const ep = [ver, ...endpoint];
@@ -30,22 +34,38 @@ async ({
       }
     }
 
+    phase = 'headers';
+    if (meta) meta.phase = phase;
     const res = await fetch(url, options);
+    headersAt = Date.now();
+    httpStatus = res.status;
+    phase = 'body';
     const retryAfter = res.headers?.get?.('retry-after') ?? null;
     if (meta && typeof meta === 'object') {
       meta.status = res.status;
       meta.retryAfter = retryAfter;
+      meta.phase = phase;
+      meta.headersDurationMs = headersAt - started;
     }
     if (res.ok) {
       try {
-        return await res.json();
+        const result = await res.json();
+        if (meta) {
+          meta.phase = 'complete';
+          meta.bodyDurationMs = Date.now() - headersAt;
+        }
+        return result;
       } catch (error) {
-        error.code = 'ERESPONSE';
-        error.retryable = false;
+        // An interrupted body is a transport failure, not malformed JSON.
+        if (error.name === 'SyntaxError' && !signal?.aborted) {
+          error.code = 'ERESPONSE';
+          error.retryable = false;
+        }
         throw error;
       }
     } else {
       const errorText = await res.text();
+      phase = 'response';
       const responseText = errorText.trim();
       const values = [responseText];
       let brokerError = null;
@@ -120,11 +140,21 @@ async ({
       throw error;
     }
   } catch (error) {
+    error.phase = phase;
+    error.httpStatus = httpStatus;
+    error.headersDurationMs = headersAt === null ? null : headersAt - started;
+    error.bodyDurationMs = headersAt === null ? null : Date.now() - headersAt;
+    if (meta) {
+      meta.phase = phase;
+      meta.bodyDurationMs = error.bodyDurationMs;
+    }
     console.error('Error in send function:', {
       name: error.name,
       status: error.status,
       statusText: error.statusText,
       code: error.code,
+      phase,
+      httpStatus,
       ...error.upstream,
     });
     throw error;

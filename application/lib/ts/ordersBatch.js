@@ -55,7 +55,10 @@ async ({ contracts, token, orderIds = [], start = null, limit = null, historical
         completed += 1;
       } catch (error) {
         if (!failure) {
-          failure = controller.signal.aborted && controller.signal.reason instanceof Error ? controller.signal.reason : error;
+          failure =
+            controller.signal.aborted && controller.signal.reason instanceof Error
+              ? Object.assign(new Error(controller.signal.reason.message), error, controller.signal.reason)
+              : error;
           failedAccount = account;
           controller.abort(failure);
         }
@@ -72,6 +75,7 @@ async ({ contracts, token, orderIds = [], start = null, limit = null, historical
       if (controller.signal.reason instanceof Error) throw controller.signal.reason;
       throw new Error('TradeStation orders batch aborted');
     }
+    if (Date.now() >= deadline) throw timeout;
     console.log('TradeStation orders batch:', {
       endpoint: historical ? 'account/historicalorders' : 'account/orders',
       accountsCount: contracts.length,
@@ -91,6 +95,10 @@ async ({ contracts, token, orderIds = [], start = null, limit = null, historical
       completedAccounts: completed,
       failedAccount,
       state: 'error',
+      code: error.code ?? null,
+      phase: error.phase ?? null,
+      httpStatus: error.httpStatus ?? error.status ?? null,
+      timeoutSource: error.timeoutSource ?? null,
     });
     throw error;
   } finally {

@@ -20,23 +20,66 @@
       extra: { symbolCount: instruments.length },
     });
 
-    const extractQuotes = (response) => {
-      if (!response || typeof response !== 'object') return [];
+    const readSnapshot = (response) => {
+      const invalid = () => {
+        throw Object.assign(new Error('Unexpected TradeStation QuoteSnapshot response'), { code: 'ERESPONSE' });
+      };
+      const object = (value) => value && typeof value === 'object' && !Array.isArray(value);
+      if (!object(response)) invalid();
       const payload = response.result ?? response;
-      if (Array.isArray(payload)) return payload;
-      if (Array.isArray(payload?.Quotes)) return payload.Quotes;
-      if (Array.isArray(payload?.quotes)) return payload.quotes;
-      return [];
-    };
-
-    const extractErrors = (response) => {
-      if (!response || typeof response !== 'object') return [];
-      const payload = response.result ?? response;
-      const errors = payload?.Errors ?? payload?.errors ?? payload?.Error ?? payload?.error ?? null;
-      if (Array.isArray(errors)) return errors;
-      if (errors && typeof errors === 'object') return [errors];
-      if (typeof errors === 'string' && errors.trim()) return [errors];
-      return [];
+      if (!object(payload)) invalid();
+      if (payload.Error !== undefined || payload.Message !== undefined) invalid();
+      const errors = payload.Errors ?? [];
+      if (payload.Errors !== undefined && !Array.isArray(payload.Errors)) invalid();
+      if (payload.Quotes !== undefined && !Array.isArray(payload.Quotes)) invalid();
+      if (!Array.isArray(payload.Quotes) && errors.length === 0) invalid();
+      for (const error of errors) {
+        if (
+          !object(error) ||
+          typeof error.Error !== 'string' ||
+          !error.Error.trim() ||
+          !lib.utils.makeSymbol(error.Symbol) ||
+          (error.Message !== undefined && error.Message !== null && typeof error.Message !== 'string')
+        ) {
+          invalid();
+        }
+      }
+      const numeric = [
+        'Ask',
+        'AskSize',
+        'Bid',
+        'BidSize',
+        'Last',
+        'LastSize',
+        'PreviousClose',
+        'Volume',
+        'Close',
+        'PreviousVolume',
+        'DailyOpenInterest',
+        'NetChange',
+        'NetChangePct',
+      ];
+      const quotes = (payload.Quotes ?? []).map((quote) => {
+        if (!object(quote) || !lib.utils.makeSymbol(quote.Symbol) || quote.Error !== undefined) invalid();
+        const result = { ...quote };
+        for (const field of numeric) {
+          const value = quote[field];
+          if (value === null || value === '') {
+            result[field] = ['Ask', 'Bid', 'PreviousClose'].includes(field) ? undefined : null;
+          } else if (
+            value !== undefined &&
+            (!['string', 'number'].includes(typeof value) || !`${value}`.trim() || !Number.isFinite(Number(value)))
+          ) {
+            invalid();
+          }
+        }
+        for (const field of ['TradeTime', 'LastTradingDate']) {
+          const value = quote[field];
+          if (value !== undefined && value !== null && (typeof value !== 'string' || !Number.isFinite(Date.parse(value)))) invalid();
+        }
+        return result;
+      });
+      return { quotes, errors };
     };
 
     const buildEmptyRow = ({ instrument, symbol }) => {
@@ -111,18 +154,41 @@
       const requestSnapshot = async (batch, batchIndex = 0) => {
         const endpoint = ['marketdata', 'quotes', batch.join(',')];
         const requestStartedAt = Date.now();
-        const response = await lib.ts.send({ method: 'GET', live: true, endpoint, token: client.tokens.access });
-        quotes.push(...extractQuotes(response));
-        errorCount += extractErrors(response).length;
-        lib.utils.traceLog({
-          scope: 'marketdata/quotes',
-          phase: 'ts.request.done',
-          traceId: trace,
-          symbol: batch.join(','),
-          durationMs: Date.now() - requestStartedAt,
-          extra: { batchIndex, batchSize: batch.length },
-        });
-        return response;
+        const meta = {};
+        let requestStatus = 'error';
+        let failures = 0;
+        let code = null;
+        try {
+          const response = await lib.ts.send({ method: 'GET', live: true, endpoint, token: client.tokens.access, meta });
+          const snapshot = readSnapshot(response);
+          quotes.push(...snapshot.quotes);
+          failures = snapshot.errors.length;
+          errorCount += failures;
+          requestStatus = 'ok';
+          if (snapshot.quotes.length === 0) requestStatus = 'no_data';
+          else if (failures > 0 || snapshot.quotes.length < batch.length) requestStatus = 'partial';
+        } catch (error) {
+          failures = 1;
+          errorCount += failures;
+          code = error.code ?? null;
+          throw error;
+        } finally {
+          lib.utils.traceLog({
+            scope: 'marketdata/quotes',
+            phase: 'ts.request.done',
+            traceId: trace,
+            symbol: batch.join(','),
+            durationMs: Date.now() - requestStartedAt,
+            extra: {
+              batchIndex,
+              batchSize: batch.length,
+              status: requestStatus,
+              errorCount: failures,
+              httpStatus: meta.status ?? null,
+              code,
+            },
+          });
+        }
       };
 
       for (let index = 0, batchIndex = 0; index < tsSymbols.length; index += 100, batchIndex += 1) {
@@ -144,7 +210,13 @@
       });
 
       rowCount = rows.length;
+      if (quoteMap.size === 0) status = 'no_data';
+      else if (errorCount > 0 || normalizedInputs.some(({ symbol }) => !quoteMap.has(symbol))) status = 'partial';
       return rows;
+    } catch (error) {
+      status = 'error';
+      if (errorCount === 0) errorCount = 1;
+      throw error;
     } finally {
       lib.utils.traceLog({
         scope: 'marketdata/quotes',
