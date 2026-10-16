@@ -132,12 +132,10 @@
 
   classifyPacketError(packet) {
     const matrix = this.currentParams.endpoint.slice(0, 3).join('/') === 'stream/matrix/changes';
-    if (
-      matrix &&
-      /^Failed$/i.test(packet.Error) &&
-      /InvalidArgument/i.test(packet.Message ?? '') &&
-      /no data available/i.test(packet.Message ?? '')
-    ) {
+    const charts = this.currentParams.endpoint.slice(0, 3).join('/') === 'marketdata/stream/barcharts';
+    const noData =
+      /^Failed$/i.test(packet.Error) && /InvalidArgument/i.test(packet.Message ?? '') && /no data available/i.test(packet.Message ?? '');
+    if ((matrix && noData) || (charts && (noData || /^NO_DATA$/i.test(packet.Error)))) {
       return {
         code: 'NO_DATA',
         classification: 'no_data',

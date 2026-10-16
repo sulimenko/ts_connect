@@ -2503,11 +2503,28 @@ test('stream addBarchart normalizes symbol contract and rejects empty symbol', a
   assert.ok(streamChartsArgs);
   assert.equal(streamChartsArgs.endpoint.join('/'), 'marketdata/stream/barcharts/CRWV 280121C80');
   assert.equal(streamChartsArgs.symbol, 'CRWV 280121C80');
+  assert.equal(streamChartsArgs.data.interval, '60');
+  assert.equal(streamChartsArgs.data.unit, 'Minute');
+  assert.equal(streamChartsArgs.data.barsback, '100');
+  assert.equal(streamChartsArgs.data.sessiontemplate, 'USEQ24Hour');
+  assert.equal((await barchartApi.method({ symbol: 'CRWV280121C00080000', streamKey: 'another-subscription' })).code, 'ESTREAMKEY');
 });
 
-test('stream addBarchart emits canonical symbol for TS-style input', async () => {
+test('stream addBarchart preserves raw TS bars and rejects malformed and control packets', async () => {
   const utils = loadUtils();
-  let emitted = null;
+  const events = [];
+  let onData = null;
+  const bar = Object.freeze({
+    Open: '1.25',
+    High: '1.50',
+    Low: '1.10',
+    Close: '1.40',
+    Epoch: 1792159200000,
+    TimeStamp: '2026-10-16T14:00:00Z',
+    IsRealtime: true,
+    IsEndOfHistory: false,
+    OpenInterest: '17',
+  });
 
   const barchartApi = loadExpressionModule('application/api/stream/addBarchart.js', {
     DomainError: class DomainError extends Error {
@@ -2524,7 +2541,7 @@ test('stream addBarchart emits canonical symbol for TS-style input', async () =>
           getClient: async () => ({
             buildStreamKey: () => 'charts-key',
             streamCharts: async (args) => {
-              await args.onData({ Open: 1 });
+              onData = args.onData;
               return 'charts-registered-key';
             },
             stopStoredStream: async () => {},
@@ -2535,7 +2552,7 @@ test('stream addBarchart emits canonical symbol for TS-style input', async () =>
             await start({
               notifyError: () => {},
               emit: (eventName, payload) => {
-                emitted = { eventName, payload };
+                events.push({ eventName, payload });
               },
             });
             return { ok: true };
@@ -2549,20 +2566,180 @@ test('stream addBarchart emits canonical symbol for TS-style input', async () =>
   });
 
   const result = await barchartApi.method({
-    symbol: 'CRWV 280121C80',
-    period: 3600,
+    symbol: 'RDW 270115C10',
+    period: '3600',
     limit: 100,
   });
 
   assert.deepEqual(result, { ok: true });
+  onData(bar);
+  const emitted = events[0];
   assert.ok(emitted);
   assert.equal(emitted.eventName, 'stream/barchart');
-  assert.equal(emitted.payload.instrument.symbol, 'CRWV280121C00080000');
+  assert.equal(emitted.payload.streamKey, 'charts-key');
+  assert.equal(emitted.payload.period, 3600);
+  assert.equal(emitted.payload.bar, bar);
+  assert.equal(Object.hasOwn(emitted.payload.bar, 'TotalVolume'), false);
+  assert.equal(emitted.payload.instrument.symbol, 'RDW270115C00010000');
   assert.equal(emitted.payload.instrument.asset_category, 'OPT');
   assert.equal(emitted.payload.instrument.source, 'TS');
   assert.equal(emitted.payload.instrument.listing_exchange, 'TS');
   assert.equal(emitted.payload.instrument.currency, 'USD');
   assert.equal(emitted.payload.symbol, undefined);
+  const zeroVolumeBar = Object.freeze({ ...bar, Open: 0, High: 0, Low: 0, Close: 0, TotalVolume: '0' });
+  onData(zeroVolumeBar);
+  assert.equal(events[1].payload.bar, zeroVolumeBar);
+
+  for (const packet of [null, [], 'bar', {}, { Open: 1 }, { StreamStatus: 'GoAway' }, { Heartbeat: 1 }]) onData(packet);
+  for (const field of ['Open', 'High', 'Low', 'Close', 'Epoch']) {
+    const missing = { ...bar };
+    delete missing[field];
+    onData(missing);
+    for (const value of [null, '', ' ', true, [], {}, 'NaN', NaN, Infinity]) onData({ ...bar, [field]: value });
+  }
+  for (const Epoch of [0, -1, 1.5, '1792159200000', Number.MAX_SAFE_INTEGER + 1]) onData({ ...bar, Epoch });
+  for (const control of [{ StreamStatus: 'Unknown' }, { Error: 'NO_DATA' }, { Heartbeat: 0 }, { Status: 'Unknown' }]) {
+    onData({ ...bar, ...control });
+  }
+  assert.equal(events.length, 2);
+});
+
+test('stream addBarchart owns exact keys and manages recovery and permanent errors', async () => {
+  const utils = loadUtils();
+  const timers = new Map();
+  const connections = [];
+  let clock = 0;
+  const globals = {
+    setTimeout: (fn, delay) => {
+      const timer = { fn, at: clock + delay };
+      timers.set(timer, timer);
+      return timer;
+    },
+    clearTimeout: (timer) => timers.delete(timer),
+  };
+  const flush = async () => {
+    for (let turn = 0; turn < 30; turn += 1) await Promise.resolve();
+  };
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+    ...globals,
+    lib: { utils },
+    fetch: async (url, { signal }) => {
+      const connection = { url, signal, deliver: null };
+      connections.push(connection);
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: () =>
+              new Promise((resolve) => {
+                connection.deliver = (packet) => resolve({ done: false, value: new TextEncoder().encode(`${JSON.stringify(packet)}\n`) });
+              }),
+          }),
+        },
+      };
+    },
+  });
+  const factory = loadExpressionModule('application/domain/ts/client.js', { lib: { utils, ts: { stream: streamFactory } } });
+  const tsClient = await factory();
+  const streams = loadExpressionModule('application/domain/ts/streams.js', { ...globals, lib: makeLib() });
+  const client = new EventEmitter();
+  const otherClient = new EventEmitter();
+  const errors = [];
+  const statuses = [];
+  const bars = [];
+  client.on('stream/error', (payload) => errors.push(payload));
+  client.on('stream/status', (payload) => statuses.push(payload));
+  client.on('stream/barchart', (payload) => bars.push(payload));
+  const apiFor = (subscriber) =>
+    loadExpressionModule('application/api/stream/addBarchart.js', {
+      DomainError: class DomainError extends Error {
+        constructor(code) {
+          super(code);
+          this.code = code;
+        }
+      },
+      context: { client: subscriber },
+      domain: { ts: { clients: { getClient: async () => tsClient }, streams } },
+      lib: { utils },
+    });
+  const api = apiFor(client);
+  const otherApi = apiFor(otherClient);
+  try {
+    const first = await api.method({ symbol: 'RDW 270115C10', period: 3600 });
+    const key = first.streamKey;
+    const duplicate = await api.method({ symbol: 'RDW270115C00010000', period: '3600', streamKey: key });
+    await otherApi.method({ symbol: 'RDW 270115C10', period: 3600 });
+    assert.equal(duplicate.streamKey, key);
+    assert.equal(duplicate.created, false);
+    assert.equal(connections.length, 1);
+    assert.equal((await api.method({ symbol: 'RDW 270115C10', period: 60, streamKey: key })).code, 'ESTREAMKEY');
+    const second = await api.method({ symbol: 'TSLA 270115C400', period: 60 });
+    assert.notEqual(second.streamKey, key);
+    assert.equal(connections.length, 2);
+    assert.equal((await otherApi.method({ action: 'unsubscribe', streamKey: key })).removed, true);
+    assert.equal(connections[0].signal.aborted, false);
+    assert.equal((await otherApi.method({ action: 'unsubscribe', streamKey: key })).removed, false);
+    assert.equal((await api.method({ action: 'touch', streamKey: key })).active, true);
+
+    connections[0].deliver({ StreamStatus: 'GoAway' });
+    await flush();
+    const recovering = await api.method({ action: 'touch', streamKey: key });
+    assert.equal(recovering.recovering, true);
+    assert.equal(recovering.resubscribeRequired, false);
+    assert.equal(statuses.at(-1).terminal, false);
+    assert.equal(errors.length, 0);
+    clock += 10000;
+    for (const timer of Array.from(timers.values())) {
+      if (timer.at <= clock && timers.delete(timer)) await timer.fn();
+    }
+    assert.equal(connections.length, 3);
+    assert.equal((await api.method({ action: 'touch', streamKey: key })).active, true);
+    assert.equal(statuses.at(-1).state, 'active');
+    const bar = { Open: '10', High: '12', Low: '9', Close: '11', Epoch: 1792159200000, TotalVolume: '0' };
+    connections[1].deliver(bar);
+    connections[2].deliver(bar);
+    await flush();
+    assert.equal(bars.length, 2);
+    assert.equal(bars.find((event) => event.streamKey === key).period, 3600);
+    const tsla = bars.find((event) => event.streamKey === second.streamKey);
+    assert.equal(tsla.period, 60);
+    assert.equal(tsla.instrument.symbol, 'TSLA270115C00400000');
+    assert.equal(tsla.instrument.source, 'TS');
+    assert.deepEqual(tsla.bar, bar);
+
+    for (const packet of [
+      { Error: 'NO_DATA' },
+      { Error: 'Failed', Message: 'rpc error: code = InvalidArgument desc = no data available' },
+      { Error: 'INVALID SYMBOL', Message: 'bad symbol' },
+    ]) {
+      const subscription = await api.method({ symbol: 'RDW 270115C10', period: 3600 });
+      connections.at(-1).deliver(packet);
+      await flush();
+      assert.equal(errors.at(-1).streamKey, subscription.streamKey);
+      assert.equal(errors.at(-1).terminal, true);
+      assert.equal(errors.at(-1).error.reconnectable, false);
+      assert.equal(errors.at(-1).error.code, packet.Error === 'INVALID SYMBOL' ? 'INVALID SYMBOL' : 'NO_DATA');
+      assert.equal((await api.method({ action: 'touch', streamKey: subscription.streamKey })).active, false);
+      assert.equal((await api.method({ action: 'unsubscribe', streamKey: subscription.streamKey })).removed, false);
+      assert.equal((await api.method({ action: 'touch', streamKey: second.streamKey })).active, true);
+      const count = connections.length;
+      clock += 10000;
+      for (const timer of Array.from(timers.values())) {
+        if (timer.at <= clock && timers.delete(timer)) await timer.fn();
+      }
+      assert.equal(connections.length, count);
+    }
+    assert.equal(errors.length, 3);
+    assert.equal((await api.method({ action: 'unsubscribe', streamKey: second.streamKey })).removed, true);
+    assert.equal((await api.method({ action: 'unsubscribe', streamKey: second.streamKey })).removed, false);
+    assert.equal(connections[1].signal.aborted, true);
+  } finally {
+    await streams.unsubscribeAll({ client });
+    await streams.unsubscribeAll({ client: otherClient });
+  }
+  assert.equal(timers.size, 0);
+  assert.equal(client.listenerCount('close'), 0);
+  assert.equal(otherClient.listenerCount('close'), 0);
 });
 
 test('stream optionChain emits root instrument payload while preserving chain symbols', async () => {

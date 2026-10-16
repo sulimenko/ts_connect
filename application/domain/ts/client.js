@@ -734,11 +734,11 @@ async () => ({
     }
   },
 
-  async streamCharts({ endpoint, symbol, data, onData, onError }) {
+  async streamCharts({ endpoint, symbol, data, onData, onError, onStatus }) {
     try {
       const key = this.buildStreamKey({ group: 'charts', symbol, data });
 
-      const stream = lib.ts.stream({ live: true, endpoint, tokens: this.tokens, data, onData, onError });
+      const stream = lib.ts.stream({ live: true, endpoint, tokens: this.tokens, data, onData, onError, onStatus });
       await stream.initiateStream();
       await this.setStoredStream({ group: 'charts', key, stream });
       return key;
