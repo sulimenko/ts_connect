@@ -35,7 +35,7 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
     return error;
   };
   const abortError = () => {
-    if (signal?.reason instanceof Error) return signal.reason;
+    if (signal?.reason instanceof Error) return Object.assign(new Error(signal.reason.message), signal.reason);
     const error = new Error(`TradeStation ${mode} orders aborted for ${accountId}`);
     error.name = 'AbortError';
     return error;
@@ -60,12 +60,17 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
   const timeoutCodes = new Set(['ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT']);
   const networkCodes = new Set(['ECONNRESET', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_SOCKET']);
   const transient = new Set([429, 502, 503, 504]);
+  // Preserve the standalone two-attempt envelope; batches supply their shared deadline.
+  const readDeadline = deadline ?? Date.now() + 14100;
   let response = null;
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     if (signal?.aborted) throw abortError();
-    const remaining = deadline === null ? 7000 : deadline - Date.now();
+    const remaining = readDeadline - Date.now();
     if (remaining <= 0) throw timeoutError();
+    // A live batch read can use the remaining deadline. Retry only an actual
+    // failure while budget remains; reserving half would abort a viable slow body.
+    const attemptTimeoutMs = deadline === null ? Math.min(7000, remaining) : remaining;
 
     const controller = new AbortController();
     const meta = {};
@@ -73,13 +78,10 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
     let timedOut = false;
     const abort = () => controller.abort(signal?.reason);
     signal?.addEventListener('abort', abort, { once: true });
-    const timer = setTimeout(
-      () => {
-        timedOut = true;
-        controller.abort();
-      },
-      Math.min(7000, remaining),
-    );
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, attemptTimeoutMs);
     console.log('TradeStation orders read:', {
       endpoint: endpointName,
       account: accountId,
@@ -95,6 +97,8 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
 
     try {
       response = await lib.ts.send({ method: 'GET', live, endpoint, token, data, signal: controller.signal, meta });
+      if (signal?.aborted) throw abortError();
+      if (timedOut || Date.now() >= readDeadline) throw timeoutError();
       if (!response || typeof response !== 'object' || Array.isArray(response)) {
         throw Object.assign(new Error('Unexpected TradeStation orders response'), { code: 'ERESPONSE' });
       }
@@ -121,6 +125,9 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
         ordersCount: response.Orders?.length ?? 0,
         retryable: false,
         retryAttempt: attempt - 1,
+        phase: meta.phase ?? 'complete',
+        headersDurationMs: meta.headersDurationMs ?? null,
+        bodyDurationMs: meta.bodyDurationMs ?? null,
       });
       break;
     } catch (caught) {
@@ -133,6 +140,16 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
       const timeout = error.status === 408 || error.code === 'ETIMEOUT' || codes.some((code) => timeoutCodes.has(code));
       const network = codes.some((code) => networkCodes.has(code));
       if (timeout && !malformed) error.code = 'ETIMEOUT';
+      error.phase = caught.phase ?? meta.phase ?? 'headers';
+      error.httpStatus = caught.httpStatus ?? meta.status ?? caught.status ?? null;
+      error.headersDurationMs = caught.headersDurationMs ?? meta.headersDurationMs ?? null;
+      error.bodyDurationMs = caught.bodyDurationMs ?? meta.bodyDurationMs ?? null;
+      if (timeout) {
+        error.timeoutSource = 'transport';
+        if (signal?.aborted) error.timeoutSource = 'parent';
+        else if (Date.now() >= readDeadline) error.timeoutSource = 'deadline';
+        else if (timedOut) error.timeoutSource = 'attempt';
+      }
       const miss = lookupMiss && !signal?.aborted && !timedOut && !malformed && !timeout && !network;
       const retryable = !signal?.aborted && !malformed && error.status !== 404 && (timeout || network || transient.has(error.status));
       const log = miss ? console.log : console.error;
@@ -143,19 +160,26 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
         attempt,
         state: miss ? 'miss' : 'error',
         durationMs: Date.now() - started,
-        httpStatus: error.status ?? meta.status ?? null,
+        httpStatus: error.httpStatus,
         ordersCount: miss ? 0 : null,
         retryable,
         retryAttempt: attempt - 1,
         brokerMessage,
         requestId,
+        code: error.code ?? null,
+        phase: error.phase,
+        timeoutSource: error.timeoutSource ?? null,
+        attemptTimeoutMs,
+        remainingMs: Math.max(0, readDeadline - Date.now()),
+        headersDurationMs: error.headersDurationMs,
+        bodyDurationMs: error.bodyDurationMs,
       });
       if (miss) return { errors: [], orders: [] };
       if (!retryable || attempt === 2) {
         throw error;
       }
       const delay = 100 * attempt;
-      if (deadline !== null && delay >= deadline - Date.now()) throw error;
+      if (delay >= readDeadline - Date.now()) throw error;
       await wait(delay);
     } finally {
       clearTimeout(timer);

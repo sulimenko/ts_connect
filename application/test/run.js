@@ -379,6 +379,11 @@ test('unknown packet errors stay transient without bounded retry exhaustion', as
   assert.equal(statuses[0].terminal, false);
   assert.equal(statuses[0].retryable, true);
   assert.equal(JSON.stringify(statuses[0]).includes('SHOULD_NOT_LEAK'), false);
+  instance.handlePacket({ Error: 'Failed', Message: 'Failed to retrieve quotes for positions' }, null, (error) => errors.push(error));
+  assert.equal(reconnectCalls, 2);
+  assert.equal(errors.length, 0);
+  assert.equal(statuses[1].state, 'recovering');
+  assert.equal(statuses[1].terminal, false);
 });
 
 test('stream bounded packet retry uses real reconnect flow', async () => {
@@ -448,9 +453,10 @@ test('stream bounded packet retry uses real reconnect flow', async () => {
     await Promise.resolve();
     await Promise.resolve();
   };
-  const runReconnect = async () => {
+  const runReconnect = async (expectedDelay) => {
     const timer = timers.find((item) => !item.cleared);
     assert.ok(timer);
+    assert.equal(timer.delay, expectedDelay);
     timer.cleared = true;
     await timer.fn();
     await flush();
@@ -464,14 +470,14 @@ test('stream bounded packet retry uses real reconnect flow', async () => {
   assert.equal(statusEvents[0].maxRetries, 2);
   assert.equal(terminalErrors.length, 0);
 
-  await runReconnect();
+  await runReconnect(5000);
   assert.equal(connectionCount, 2);
   assert.equal(statusEvents.length, 2);
   assert.equal(statusEvents[1].retryAttempt, 2);
   assert.equal(statusEvents[1].maxRetries, 2);
   assert.equal(terminalErrors.length, 0);
 
-  await runReconnect();
+  await runReconnect(10000);
   assert.equal(connectionCount, 3);
   assert.equal(statusEvents.length, 2);
   assert.equal(terminalErrors.length, 1);
@@ -807,11 +813,15 @@ test('successful reconnect returns stream status to active', async () => {
     onStatus: (status) => statuses.push(status),
   });
   instance.processStream = async () => {};
+  instance.reconnectDelay = 40000;
 
   await instance.initiateStream({ reconnect: true, generation: 0 });
 
   assert.equal(statuses.length, 1);
   assert.equal(statuses[0].state, 'active');
+  assert.equal(instance.reconnectDelay, 40000);
+  instance.handlePacket({ Heartbeat: 1 });
+  assert.equal(instance.reconnectDelay, 5000);
   instance.stopStream('test.cleanup');
 });
 
@@ -1545,6 +1555,60 @@ test('readOptionChain keeps structurally valid rows with missing quotes and gree
   assert.equal(option.vega, null);
 });
 
+test('quote snapshots reject failed or malformed responses and preserve partial null quotes', async () => {
+  const traces = [];
+  const utils = { ...loadUtils(), traceLog: (entry) => traces.push(entry) };
+  let fetchResponse;
+  const send = loadExpressionModule('application/lib/ts/send.js', { lib: { utils }, fetch: () => fetchResponse() });
+  const readQuote = loadExpressionModule('application/lib/ts/readQuote.js', { lib: { utils } });
+  const api = loadExpressionModule('application/api/marketdata/quotes.js', {
+    DomainError: class DomainError extends Error {},
+    domain: { ts: { clients: { getClient: async () => ({ tokens: { access: 'test' } }) } } },
+    lib: { utils, ts: { send, readQuote } },
+  });
+  const request = { instruments: [{ symbol: 'MSFT' }, { symbol: 'AAPL' }] };
+  for (const response of [
+    new Response('gateway timeout', { status: 504 }),
+    new TypeError('fetch failed'),
+    {},
+    { Quotes: [{ Symbol: 'MSFT', Bid: {} }] },
+    { Quotes: [], Errors: [{ Symbol: 'MSFT' }] },
+  ]) {
+    traces.length = 0;
+    fetchResponse = async () => {
+      if (response instanceof Error) throw response;
+      return response instanceof Response ? response : new Response(JSON.stringify(response));
+    };
+    await assert.rejects(api.method(request));
+    for (const phase of ['ts.request.done', 'api.done']) {
+      const trace = traces.find((entry) => entry.phase === phase);
+      assert.equal(trace.extra.status, 'error');
+      assert.ok(trace.extra.errorCount > 0);
+    }
+  }
+  for (const partial of [true, false]) {
+    traces.length = 0;
+    fetchResponse = async () =>
+      new Response(
+        JSON.stringify({
+          Quotes: partial ? [{ Symbol: 'MSFT', Bid: null, Ask: '0', PreviousClose: null }] : [],
+          Errors: [{ Symbol: 'AAPL', Error: 'NoData', Message: 'no data available' }],
+        }),
+      );
+    const rows = await api.method(request);
+    assert.equal(Array.isArray(rows), true);
+    assert.deepEqual(Object.keys(rows[0]), ['symbol', 'instrument', 'data', 'quote']);
+    assert.equal(rows[0].quote.bid, null);
+    assert.equal(rows[0].data.prev_close_price, null);
+    assert.equal(rows[0].quote.ask, partial ? '0.00' : null);
+    assert.equal(rows[1].quote.ask, null);
+    assert.equal(rows[1].data.lp, null);
+    const done = traces.find((entry) => entry.phase === 'api.done');
+    assert.equal(done.extra.status, partial ? 'partial' : 'no_data');
+    assert.equal(done.extra.errorCount, 1);
+  }
+});
+
 test('marketdata quotes and order execution use the shared symbol formatter', async () => {
   const utils = loadUtils();
   const limitKey = 'limit_price';
@@ -2141,6 +2205,75 @@ test('stream matrix emits canonical levelII packets while routing by tsSymbol', 
   assert.equal(emitted.payload.symbol, undefined);
   assert.equal(emitted.payload.type, 'ask');
   assert.equal(emitted.payload.size, 2);
+});
+
+test('matrix NO_DATA reaches subscribers and cleans startup and active upstreams', async () => {
+  for (const [symbol, startup] of [
+    ['NBIS 261023P190', true],
+    ['PINS 270115C22', false],
+  ]) {
+    const timers = new Set();
+    const globals = {
+      setTimeout: (fn) => {
+        const timer = { fn };
+        timers.add(timer);
+        return timer;
+      },
+      clearTimeout: (timer) => timers.delete(timer),
+    };
+    const utils = loadUtils();
+    let deliver = null;
+    const packet = { Error: 'Failed', Message: 'rpc error: code = InvalidArgument desc = no data available', Symbol: symbol };
+    const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+      ...globals,
+      lib: { utils },
+      fetch: async () => ({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: () =>
+              new Promise((resolve) => {
+                deliver = () => resolve({ done: false, value: new TextEncoder().encode(`${JSON.stringify(packet)}\n`) });
+                if (startup) deliver();
+              }),
+          }),
+        },
+      }),
+    });
+    const factory = loadExpressionModule('application/domain/ts/client.js', { lib: { utils, ts: { stream: streamFactory } } });
+    const tsClient = await factory();
+    const streams = loadExpressionModule('application/domain/ts/streams.js', { ...globals, lib: makeLib() });
+    const client = new EventEmitter();
+    const events = [];
+    client.on('stream/error', (payload) => events.push(payload));
+    const matrixApi = loadExpressionModule('application/api/stream/matrix.js', {
+      DomainError: class DomainError extends Error {},
+      context: { client },
+      domain: { ts: { clients: { getClient: async () => tsClient }, streams } },
+      lib: { utils },
+    });
+    const result = await matrixApi.method({ instruments: [{ symbol }] });
+    if (!startup) deliver();
+    for (let turn = 0; turn < 30; turn += 1) await Promise.resolve();
+    assert.equal(events.length, 1);
+    const event = events[0];
+    assert.equal(event.streamKey, result.streamKey);
+    assert.equal(event.kind, 'matrix');
+    assert.equal(event.metadata.symbol, symbol);
+    assert.equal(event.state, 'failed');
+    assert.equal(event.active, false);
+    assert.equal(event.resubscribeRequired, true);
+    assert.equal(event.terminal, true);
+    assert.equal(event.retryable, false);
+    assert.equal(event.error.code, 'NO_DATA');
+    assert.equal(event.error.classification, 'no_data');
+    assert.equal(event.error.streamStopped, true);
+    assert.equal(streams.getBucket({ kind: 'matrix' }).size, 0);
+    assert.equal(Object.keys(tsClient.streams.matrix).length, 0);
+    assert.equal(streams.clients.size, 0);
+    assert.equal(client.listenerCount('close'), 0);
+    assert.equal(timers.size, 0);
+  }
 });
 
 test('stream matrix permanent reconnect error cleans managed and stored state', async () => {
@@ -3673,7 +3806,11 @@ test('generic TradeStation send treats 404 equally across endpoints without clas
         assert.deepEqual(Object.keys(error.upstream), ['brokerMessage', 'requestId']);
         return true;
       });
-      assert.deepEqual(meta, { status: 404, retryAfter: '2' });
+      assert.equal(meta.status, 404);
+      assert.equal(meta.retryAfter, '2');
+      assert.equal(meta.phase, 'response');
+      assert.ok(meta.headersDurationMs >= 0);
+      assert.ok(meta.bodyDurationMs >= 0);
       assert.equal(attempts, 1);
     }
   }

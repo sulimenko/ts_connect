@@ -131,6 +131,24 @@
   },
 
   classifyPacketError(packet) {
+    const matrix = this.currentParams.endpoint.slice(0, 3).join('/') === 'stream/matrix/changes';
+    if (
+      matrix &&
+      /^Failed$/i.test(packet.Error) &&
+      /InvalidArgument/i.test(packet.Message ?? '') &&
+      /no data available/i.test(packet.Message ?? '')
+    ) {
+      return {
+        code: 'NO_DATA',
+        classification: 'no_data',
+        terminal: true,
+        retryable: false,
+        bounded: false,
+        streamStopped: true,
+        reconnectable: false,
+        maxRetries: 0,
+      };
+    }
     const internal = /Failed/i.test(packet.Error) && /Internal server error/i.test(packet.Message ?? '');
     const policy = internal ? this.retryPolicy?.packetErrors?.failedInternalServerError : null;
     if (/INVALID/i.test(packet.Error)) {
@@ -152,7 +170,8 @@
   buildPacketError(packet, classification) {
     const errorText = `${packet.Error} ${packet.Message ?? ''}`.trim();
     const error = new Error(errorText);
-    error.code = packet.Error;
+    error.code = classification.code ?? packet.Error;
+    if (classification.classification) error.classification = classification.classification;
     error.upstreamMessage = packet.Message ?? null;
     error.details = packet.Message ?? null;
     error.symbol = packet.Symbol ?? null;
@@ -167,6 +186,7 @@
   },
 
   notifyRecovered() {
+    this.reconnectDelay = 5000;
     if (this.packetRetryAttempt <= 0) return;
     this.onStatus?.({
       state: 'active',
@@ -235,7 +255,6 @@
       this.connected = true;
       this.state = 'active';
       this.traceLog('stream.connect.done', { startedAt });
-      this.reconnectDelay = 5000;
       this.checkTimeout();
       this.traceLog('stream.subscribe.done', { startedAt });
       if (reconnect && this.packetRetryAttempt === 0) {
@@ -300,9 +319,8 @@
   },
 
   handlePacket(packet, onData, onError) {
+    if (!packet || typeof packet !== 'object' || Array.isArray(packet) || Object.keys(packet).length === 0) return true;
     this.checkTimeout();
-
-    if (packet.Heartbeat !== undefined) return true;
 
     if (packet.StreamStatus === 'GoAway' || packet.Error === 'GoAway') {
       console.log('Stream termination requested by server.', this.endpointName());
@@ -377,18 +395,20 @@
         return false;
       }
 
-      if (onError) onError(error);
       if (error.permanent || error.streamStopped) {
         this.stopStream('permanent-error');
         this.state = 'failed';
+        if (onError) onError(error);
         return false;
       }
+      if (onError) onError(error);
       console.warn('Stream error classification:', this.endpointName(), 'TRANSIENT -> reconnect');
       void this.scheduleReconnect({ reason: `upstream.${packet.Error}` });
       return false;
     }
 
     this.notifyRecovered();
+    if (packet.Heartbeat !== undefined) return true;
     if (onData) onData(packet);
     return true;
   },
@@ -400,6 +420,7 @@
     try {
       while (this.shouldReconnect && !signal.aborted) {
         const { done, value } = await reader.read();
+        if (signal.aborted || !this.shouldReconnect) return;
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
@@ -407,6 +428,7 @@
         buffer = lines.pop() ?? '';
 
         for (const line of lines.map((line) => line.trim()).filter(Boolean)) {
+          if (signal.aborted || !this.shouldReconnect) return;
           try {
             const packet = JSON.parse(line);
             const shouldContinue = this.handlePacket(packet, onData, onError);
