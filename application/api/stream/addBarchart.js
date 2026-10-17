@@ -7,6 +7,7 @@
     EACTION: 'Invalid action: expected "subscribe", "unsubscribe", or "touch"',
     ELIMIT: 'Limit must be a positive number of bars from 1 to 57600',
     EPERIOD: 'Period must be aligned to supported minute, day, week, or month intervals',
+    ESTREAMKEY: 'Stream key must match the requested barchart subscription',
     ESYMBOL: 'Symbol is required for barchart subscribe requests',
   },
 
@@ -74,7 +75,9 @@
         sessiontemplate: 'USEQ24Hour',
       };
       const tsClient = await domain.ts.clients.getClient({});
-      const key = chartKey || tsClient.buildStreamKey({ group: 'charts', symbol: chartSymbol, data: chartData });
+      const subscriptionKey = symbolRequired ? tsClient.buildStreamKey({ group: 'charts', symbol: chartSymbol, data: chartData }) : null;
+      if (symbolRequired && chartKey && chartKey !== subscriptionKey) return new DomainError('ESTREAMKEY');
+      const key = chartKey || subscriptionKey || tsClient.buildStreamKey({ group: 'charts', symbol: chartSymbol, data: chartData });
 
       if (actionValue === 'unsubscribe') {
         return domain.ts.streams.unsubscribe({ kind: 'charts', key, client: context.client });
@@ -91,13 +94,29 @@
         client: context.client,
         idleMs,
         metadata: { symbol: chartSymbol, period: periodValue, limit: Math.floor(limitValue) },
-        start: async ({ notifyError, emit }) => {
+        start: async ({ notifyError, notifyStatus, emit }) => {
           const onData = (message) => {
-            emit('stream/barchart', { streamKey: key, instrument: outboundInstrument, bar: message });
+            if (!message || typeof message !== 'object' || Array.isArray(message)) return;
+            if (['Heartbeat', 'StreamStatus', 'Error', 'Status'].some((field) => Object.hasOwn(message, field))) return;
+            // TS v3 prices may be numeric strings; validate without changing the raw bar.
+            const prices = ['Open', 'High', 'Low', 'Close'].map((field) => {
+              const value = message[field];
+              if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return NaN;
+              return Number(value);
+            });
+            if (!prices.every(Number.isFinite)) return;
+            if (!Number.isSafeInteger(message.Epoch) || message.Epoch <= 0) return;
+            emit('stream/barchart', { streamKey: key, instrument: outboundInstrument, period: periodValue, bar: message });
           };
           const onError = (error) => {
             console.error('stream chart error:', error);
             notifyError(error);
+            if (error?.permanent || error?.streamStopped) {
+              const reason = error?.code ? `upstream.${error.code}` : 'upstream.permanent-error';
+              void domain.ts.streams.stopEntry({ kind: 'charts', key, reason }).catch((cleanupError) => {
+                console.error('Failed to stop failed chart managed stream:', key, cleanupError);
+              });
+            }
           };
           const registeredKey = await tsClient.streamCharts({
             endpoint,
@@ -105,6 +124,7 @@
             data: chartData,
             onData,
             onError,
+            onStatus: notifyStatus,
           });
           return {
             stop: async ({ reason = 'unknown' } = {}) => {
