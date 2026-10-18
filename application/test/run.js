@@ -4914,6 +4914,175 @@ test('orders batch deadline aborts active reads with ETIMEOUT', async () => {
   assert.equal(signals[0].aborted, true);
 });
 
+test('opt-in orders API retains five accounts when the sixth body reaches the shared deadline', async () => {
+  let expire;
+  let active = 0;
+  let maximum = 0;
+  let finished = 0;
+  const globals = {
+    setTimeout: (fn) => {
+      expire ??= fn;
+      return {};
+    },
+    clearTimeout: () => {},
+    domain: { ts: { clients: { getClient: async () => ({ tokens: { access: 'access-secret' } }) } } },
+    lib: {
+      ts: {
+        orderError,
+        send: async ({ endpoint, live, signal, meta }) => {
+          active += 1;
+          maximum = Math.max(maximum, active);
+          meta.phase = 'body';
+          meta.status = 200;
+          if (endpoint[2] === 'A1' && !live) {
+            await new Promise((resolve, reject) => {
+              signal.addEventListener('abort', () => reject(new Error('access-secret https://private.example')), { once: true });
+            });
+          }
+          await Promise.resolve();
+          active -= 1;
+          finished += 1;
+          return { Orders: [{ AccountID: endpoint[2], OrderID: `O-${endpoint[2]}`, Legs: [{ Symbol: 'TSLA' }] }] };
+        },
+      },
+    },
+  };
+  globals.lib.ts.orders = loadExpressionModule('application/lib/ts/orders.js', globals);
+  globals.lib.ts.ordersBatch = loadExpressionModule('application/lib/ts/ordersBatch.js', globals);
+  const api = loadExpressionModule('application/api/account/historicalorders.js', globals);
+  const contracts = ['A1', 'A2', 'A1', 'A4', 'A5', 'A6'].map((account, index) => ({ account, live: index % 2 === 0 && index > 0 }));
+  const pending = api.method({ contracts, start: '2026-07-01', withOutcomes: true });
+  for (let turn = 0; turn < 40; turn += 1) await Promise.resolve();
+  assert.equal(finished, 5);
+  expire();
+  const result = JSON.parse(JSON.stringify(await pending));
+  assert.equal(maximum, 3);
+  assert.equal(result.complete, false);
+  assert.deepEqual(
+    result.outcomes.map(({ account, live }) => ({ account, live })),
+    contracts,
+  );
+  assert.deepEqual(
+    result.outcomes.map(({ state }) => state),
+    ['timeout', ...Array(5).fill('complete')],
+  );
+  assert.ok(result.outcomes.every(({ source }) => source === 'historical'));
+  assert.equal(result.outcomes.slice(1).flatMap(({ orders }) => orders).length, 5);
+  assert.deepEqual(result.outcomes[0].error, { code: 'ETIMEOUT', phase: 'body', httpStatus: 200 });
+  assert.equal(result.outcomes[0].complete, false);
+  assert.doesNotMatch(JSON.stringify(result), /access-secret|https:|NextToken/);
+});
+
+test('opt-in batch isolates transport errors and retains success across global abort with queued accounts', async () => {
+  for (const stop of ['local_error', 'deadline', 'caller_abort']) {
+    let expire;
+    const controller = new AbortController();
+    const started = [];
+    const batch = loadExpressionModule('application/lib/ts/ordersBatch.js', {
+      setTimeout: (fn) => {
+        expire = fn;
+        return {};
+      },
+      clearTimeout: () => {},
+      lib: {
+        ts: {
+          orders: async ({ account, signal }) => {
+            started.push(account);
+            if (account === 'A1') {
+              return { orders: [{ OrderID: 'O1' }], outcome: { state: 'complete', complete: true, hasMore: false } };
+            }
+            if (stop === 'local_error') {
+              throw Object.assign(new Error('access-secret https://private.example'), {
+                cause: { code: 'ECONNRESET' },
+                phase: 'body',
+                httpStatus: 502,
+              });
+            }
+            return await new Promise((resolve, reject) => {
+              signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+            });
+          },
+        },
+      },
+    });
+    const pending = batch({
+      contracts: Array.from({ length: 6 }, (_, index) => ({ account: `A${index + 1}`, live: true })),
+      token: 'access-secret',
+      withOutcomes: true,
+      signal: controller.signal,
+    });
+    for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+    if (stop === 'caller_abort') {
+      controller.abort(new Error('caller cancelled'));
+      await assert.rejects(pending, /caller cancelled/);
+      continue;
+    }
+    if (stop === 'deadline') expire();
+    const result = JSON.parse(JSON.stringify(await pending));
+    assert.equal(result.complete, false);
+    assert.deepEqual(result.outcomes[0].orders, [{ OrderID: 'O1' }]);
+    assert.equal(result.outcomes[0].state, 'complete');
+    if (stop === 'deadline') {
+      assert.deepEqual(
+        result.outcomes.map(({ state }) => state),
+        ['complete', 'timeout', 'timeout', 'timeout', 'not_started', 'not_started'],
+      );
+      assert.equal(started.length, 4);
+    } else {
+      assert.equal(started.length, 6);
+      assert.ok(result.outcomes.slice(1).every(({ state, error }) => state === 'error' && error.code === 'ECONNRESET'));
+    }
+    assert.doesNotMatch(JSON.stringify(result), /access-secret|https:/);
+  }
+});
+
+test('opt-in orders APIs validate positive rows and completeness metadata without exposing continuation tokens', async () => {
+  const row = { AccountID: 'A1', OrderID: 'O1', Legs: [{ Symbol: 'TSLA' }] };
+  const cases = [
+    [{ Orders: [] }, 'complete', false, 0],
+    [{ Orders: [row] }, 'complete', false, 1],
+    [{ Orders: [row], NextToken: 'cursor-secret' }, 'partial', true, 1],
+    [{ Orders: [], NextToken: 'cursor-secret' }, 'partial', true, 0],
+    [{ Orders: [row], Errors: [{ Error: 'FAILED', Message: 'access-secret https://private.example' }] }, 'partial', false, 1],
+    [{ Orders: [row, null, { ...row, AccountID: 'OTHER' }, { OrderID: 'O2' }] }, 'partial', false, 1],
+    [{ Orders: [row], Errors: {} }, 'partial', false, 1],
+    [{ Orders: [row], Errors: null }, 'partial', false, 1],
+    [{ Orders: [row], NextToken: {} }, 'partial', undefined, 1],
+    [{ Orders: [row], Page: { NextToken: 'cursor-secret' } }, 'partial', undefined, 1],
+    [{}, 'error', false, 0],
+    [{ Orders: null }, 'error', false, 0],
+    [{ Orders: {} }, 'error', false, 0],
+    [{ Orders: [null] }, 'error', false, 0],
+    [{ Errors: [{ Error: 'FAILED' }] }, 'error', false, 0],
+  ];
+  for (const historical of [false, true]) {
+    let response;
+    const globals = {
+      domain: { ts: { clients: { getClient: async () => ({ tokens: { access: 'access-secret' } }) } } },
+      lib: { ts: { orderError, send: async () => response } },
+    };
+    globals.lib.ts.orders = loadExpressionModule('application/lib/ts/orders.js', globals);
+    globals.lib.ts.ordersBatch = loadExpressionModule('application/lib/ts/ordersBatch.js', globals);
+    const api = loadExpressionModule(`application/api/account/${historical ? 'historicalorders' : 'orders'}.js`, globals);
+    const input = { contracts: [{ account: 'A1', live: true }], start: '2026-07-01', orders: ['O1'], withOutcomes: true };
+    for (const [body, state, hasMore, count] of cases) {
+      response = body;
+      const result = JSON.parse(JSON.stringify(await api.method(input)));
+      const outcome = result.outcomes[0];
+      assert.equal(outcome.state, state);
+      assert.equal(outcome.hasMore, hasMore);
+      assert.equal(outcome.orders.length, count);
+      assert.equal(outcome.complete, state === 'complete');
+      assert.equal(result.complete, state === 'complete');
+      assert.equal(outcome.source, historical ? 'historical' : 'current');
+      assert.doesNotMatch(JSON.stringify(result), /cursor-secret|access-secret|https:|NextToken/);
+      if (outcome.error) assert.deepEqual(Object.keys(outcome.error), ['code', 'phase', 'httpStatus']);
+    }
+    response = {};
+    assert.deepEqual(JSON.parse(JSON.stringify(await api.method({ ...input, orders: [], withOutcomes: 'true' }))), []);
+  }
+});
+
 test('orders APIs use token-ready clients and the shared batch policy', async () => {
   for (const file of ['application/api/account/orders.js', 'application/api/account/historicalorders.js']) {
     const clientCalls = [];

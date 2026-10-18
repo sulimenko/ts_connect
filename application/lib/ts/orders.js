@@ -1,4 +1,15 @@
-async ({ account, live, token, orderIds = [], start = null, limit = null, historical = false, signal = null, deadline = null }) => {
+async ({
+  account,
+  live,
+  token,
+  orderIds = [],
+  start = null,
+  limit = null,
+  historical = false,
+  signal = null,
+  deadline = null,
+  withOutcomes = false,
+}) => {
   const accountId = `${account ?? ''}`.trim();
   if (!accountId) throw new Error('TradeStation orders account is required');
 
@@ -63,6 +74,8 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
   // Preserve the standalone two-attempt envelope; batches supply their shared deadline.
   const readDeadline = deadline ?? Date.now() + 14100;
   let response = null;
+  let outcome = null;
+  let validatedOrders = null;
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     if (signal?.aborted) throw abortError();
@@ -102,17 +115,68 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
       if (!response || typeof response !== 'object' || Array.isArray(response)) {
         throw Object.assign(new Error('Unexpected TradeStation orders response'), { code: 'ERESPONSE' });
       }
-      if (response.Errors !== undefined && response.Errors !== null && !Array.isArray(response.Errors)) {
-        throw Object.assign(new Error('Unexpected TradeStation orders Errors shape'), { code: 'ERESPONSE' });
+      if (withOutcomes === true) {
+        const record = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+        const text = (value) => typeof value === 'string' && value.trim().length > 0;
+        const seen = new Set();
+        validatedOrders = Array.isArray(response.Orders)
+          ? response.Orders.filter((order) => {
+              const valid =
+                record(order) &&
+                text(order.OrderID) &&
+                order.AccountID === accountId &&
+                (!exact || orderIds.includes(order.OrderID)) &&
+                !seen.has(order.OrderID) &&
+                order.Error === undefined &&
+                Array.isArray(order.Legs) &&
+                order.Legs.length > 0 &&
+                order.Legs.every((leg) => record(leg) && text(leg.Symbol));
+              if (valid) seen.add(order.OrderID);
+              return valid;
+            })
+          : [];
+        const errorsValid =
+          response.Errors === undefined ||
+          (Array.isArray(response.Errors) && response.Errors.every((error) => record(error) && text(error.Error)));
+        const tokenValid = response.NextToken === undefined || typeof response.NextToken === 'string';
+        const hasMore = tokenValid && Boolean(response.NextToken?.length);
+        // Page is not requested by this reader. Without a verified page schema,
+        // it cannot certify a complete snapshot, even when NextToken is absent.
+        const pagePresent = response.Page !== undefined;
+        const malformed =
+          !Array.isArray(response.Orders) ||
+          validatedOrders.length !== response.Orders.length ||
+          !errorsValid ||
+          !tokenValid ||
+          pagePresent ||
+          response.Error !== undefined ||
+          (response.AccountID !== undefined && response.AccountID !== accountId) ||
+          (response.OrderID !== undefined && (!exact || !orderIds.includes(response.OrderID)));
+        const brokerError = errorsValid && (response.Errors?.length ?? 0) > 0;
+        const complete = !malformed && !brokerError && !hasMore;
+        outcome = {
+          state: 'complete',
+          complete,
+        };
+        if (!complete) outcome.state = validatedOrders.length > 0 || hasMore ? 'partial' : 'error';
+        if ((tokenValid && !pagePresent) || hasMore) outcome.hasMore = hasMore;
+        if (malformed || brokerError) {
+          outcome.error = { code: malformed ? 'ERESPONSE' : 'EBROKER', phase: 'complete', httpStatus: meta.status ?? 200 };
+        }
       }
-      if (response.Orders !== undefined && response.Orders !== null && !Array.isArray(response.Orders)) {
-        throw Object.assign(new Error('Unexpected TradeStation orders Orders shape'), { code: 'ERESPONSE' });
-      }
-      if (exact && !Array.isArray(response.Orders) && !(response.Errors?.length > 0)) {
-        throw Object.assign(new Error('Missing TradeStation exact orders Orders array'), { code: 'ERESPONSE' });
-      }
-      if (exact && response.Orders?.some((order) => !order || typeof order.OrderID !== 'string' || !order.OrderID.trim())) {
-        throw Object.assign(new Error('Unexpected TradeStation exact orders entry'), { code: 'ERESPONSE' });
+      if (withOutcomes !== true) {
+        if (response.Errors !== undefined && response.Errors !== null && !Array.isArray(response.Errors)) {
+          throw Object.assign(new Error('Unexpected TradeStation orders Errors shape'), { code: 'ERESPONSE' });
+        }
+        if (response.Orders !== undefined && response.Orders !== null && !Array.isArray(response.Orders)) {
+          throw Object.assign(new Error('Unexpected TradeStation orders Orders shape'), { code: 'ERESPONSE' });
+        }
+        if (exact && !Array.isArray(response.Orders) && !(response.Errors?.length > 0)) {
+          throw Object.assign(new Error('Missing TradeStation exact orders Orders array'), { code: 'ERESPONSE' });
+        }
+        if (exact && response.Orders?.some((order) => !order || typeof order.OrderID !== 'string' || !order.OrderID.trim())) {
+          throw Object.assign(new Error('Unexpected TradeStation exact orders entry'), { code: 'ERESPONSE' });
+        }
       }
       console.log('TradeStation orders read:', {
         endpoint: endpointName,
@@ -150,7 +214,7 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
         else if (Date.now() >= readDeadline) error.timeoutSource = 'deadline';
         else if (timedOut) error.timeoutSource = 'attempt';
       }
-      const miss = lookupMiss && !signal?.aborted && !timedOut && !malformed && !timeout && !network;
+      const miss = withOutcomes !== true && lookupMiss && !signal?.aborted && !timedOut && !malformed && !timeout && !network;
       const retryable = !signal?.aborted && !malformed && error.status !== 404 && (timeout || network || transient.has(error.status));
       const log = miss ? console.log : console.error;
       log.call(console, 'TradeStation orders read:', {
@@ -187,6 +251,7 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
     }
   }
 
+  if (withOutcomes === true) return { orders: validatedOrders, outcome };
   return {
     errors: response.Errors ?? [],
     orders: response.Orders ?? [],
