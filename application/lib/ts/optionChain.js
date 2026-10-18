@@ -127,6 +127,7 @@ async ({ endpoint, symbol, data }) => {
     let lastPacketAt = null;
     let timerId = null;
     let settled = false;
+    const controller = new AbortController();
 
     const updateMeta = (reason) => {
       const keys = Object.keys(response.chain);
@@ -157,6 +158,7 @@ async ({ endpoint, symbol, data }) => {
     const finalize = async (result, error = null, reason = 'complete') => {
       if (settled) return;
       settled = true;
+      controller.abort();
       updateMeta(reason);
 
       if (timerId) {
@@ -247,7 +249,7 @@ async ({ endpoint, symbol, data }) => {
       timerId = setTimeout(() => schedule(reason), delay);
     };
 
-    const stream = client.streamChains({ endpoint, symbol, data, onData, onError });
+    const stream = client.streamChains({ endpoint, symbol, data, onData, onError, signal: controller.signal });
     schedule();
 
     stream
