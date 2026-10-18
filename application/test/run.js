@@ -3122,6 +3122,205 @@ test('marketdata barcharts returns EINSTRUMENT for null or empty instrument inpu
   assert.equal(emptyResult.code, 'EINSTRUMENT');
 });
 
+async function makeChainLifecycle() {
+  const requests = [];
+  const timers = [];
+  const globals = {
+    console: { debug() {}, log() {}, warn() {}, error() {} },
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+  };
+  const lib = { utils: loadUtils(), ts: {} };
+  lib.ts.readOptionChain = loadExpressionModule('application/lib/ts/readOptionChain.js', { lib });
+  lib.ts.stream = loadExpressionModule('application/lib/ts/stream.js', {
+    ...globals,
+    lib,
+    fetch: (url, { signal }) =>
+      new Promise((resolve, reject) => {
+        let controller;
+        const request = { signal, opened: false, closed: false };
+        const body = new ReadableStream({
+          start: (value) => {
+            controller = value;
+          },
+          cancel: () => {
+            request.closed = true;
+          },
+        });
+        signal.addEventListener(
+          'abort',
+          () => {
+            if (request.opened && !request.closed) {
+              controller.close();
+              request.closed = true;
+            }
+          },
+          { once: true },
+        );
+        request.reject = reject;
+        request.respond = () => {
+          request.opened = true;
+          resolve({ ok: true, body });
+        };
+        request.packet = (
+          message = {
+            Legs: [{ Symbol: 'CRWV280121C00080000', Expiration: '2028-01-21T00:00:00Z', OptionType: 'Call' }],
+          },
+        ) => controller.enqueue(new TextEncoder().encode(`${JSON.stringify(message)}\n`));
+        requests.push(request);
+      }),
+  });
+  const client = await loadExpressionModule('application/domain/ts/client.js', { ...globals, lib })();
+  const streams = loadExpressionModule('application/domain/ts/streams.js', { ...globals, lib });
+  const domain = { ts: { clients: { getClient: async () => client }, streams } };
+  const args = {
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'CRWV'],
+    symbol: 'CRWV',
+    data: { expiration: '2028-01-21', strikeProximity: 1, optionType: 'Call' },
+  };
+  const managed = loadExpressionModule('application/lib/stream/optionChain.js', { ...globals, domain, lib });
+  const snapshot = loadExpressionModule('application/lib/ts/optionChain.js', { ...globals, domain, lib });
+  return {
+    client,
+    streams,
+    requests,
+    timers,
+    managed: (consumer, action = 'subscribe') => managed({ ...args, client: consumer, action }),
+    snapshot: () => snapshot(args),
+    flush: async () => {
+      for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    },
+    active: () => requests.filter((request) => request.opened && !request.closed).length,
+  };
+}
+
+test('managed chains multiplex while same-parameter snapshots complete or fail independently', async () => {
+  const h = await makeChainLifecycle();
+  const first = new EventEmitter();
+  const second = new EventEmitter();
+  const events = [];
+  second.on('stream/chain', (packet) => events.push(packet));
+  const subscribing = Promise.all([h.managed(first), h.managed(second)]);
+  await h.flush();
+  assert.equal(h.requests.length, 1);
+  h.requests[0].respond();
+  const [a, b] = await subscribing;
+  assert.equal(a.streamKey, b.streamKey);
+  assert.equal(b.subscribers, 2);
+  assert.equal(h.streams.entries.chains.size, 1);
+
+  for (const fail of [false, true]) {
+    const pending = h.snapshot();
+    const outcome = pending.catch((error) => error);
+    await h.flush();
+    const request = h.requests.at(-1);
+    request.respond();
+    await h.flush();
+    assert.equal(h.active(), 2);
+    if (fail) {
+      request.packet({ Error: 'INVALID SYMBOL', Message: 'bad symbol' });
+    } else {
+      request.packet();
+      await h.flush();
+      request.packet({
+        Legs: [{ Symbol: 'CRWV280121C00075000', Expiration: '2028-01-21T00:00:00Z', OptionType: 'Call' }],
+      });
+    }
+    const result = await outcome;
+    if (fail) {
+      assert.equal(result.code, 'INVALID SYMBOL');
+    } else {
+      assert.equal(result.strikes, 2);
+      assert.equal(result.metadata.reason, 'complete');
+    }
+    assert.equal(request.closed, true);
+    assert.equal(h.active(), 1);
+    const delivered = events.length;
+    h.requests[0].packet();
+    await h.flush();
+    assert.equal(events.length, delivered + 1);
+    assert.equal(events.at(-1).streamKey, a.streamKey);
+  }
+  await h.managed(first, 'unsubscribe');
+  const touched = await h.managed(second, 'touch');
+  assert.equal(touched.active, true);
+  assert.equal(touched.subscribers, 1);
+  assert.equal(touched.streamKey, a.streamKey);
+  assert.equal(h.active(), 1);
+  await h.managed(second, 'unsubscribe');
+  assert.equal(h.active(), 0);
+  assert.equal(h.streams.entries.chains.size, 0);
+  assert.equal(Object.keys(h.client.streams.chains).length, 0);
+});
+
+test('snapshot timeout and client close release pending and late HTTP chain responses', async () => {
+  const h = await makeChainLifecycle();
+  const pending = h.snapshot();
+  await h.flush();
+  const request = h.requests[0];
+  h.timers.find((timer) => timer.delay === 5000).fn();
+  assert.equal((await pending).metadata.reason, 'timeout');
+  assert.equal(request.signal.aborted, true);
+  request.respond();
+  await h.flush();
+  assert.equal(h.active(), 0);
+  assert.equal(Object.keys(h.client.streams.chains).length, 0);
+
+  const failure = new Error('connection failed');
+  const failed = h.snapshot();
+  const rejected = assert.rejects(failed, (error) => error === failure);
+  await h.flush();
+  h.requests[1].reject(failure);
+  await rejected;
+  assert.equal(Object.keys(h.client.streams.chains).length, 0);
+
+  const consumer = new EventEmitter();
+  const subscribing = h.managed(consumer);
+  await h.flush();
+  const late = h.requests[2];
+  await h.client.close();
+  assert.equal(late.signal.aborted, true);
+  late.respond();
+  await assert.rejects(subscribing, /cancelled/);
+  assert.equal(h.active(), 0);
+  assert.equal(Object.keys(h.client.streams.chains).length, 0);
+  assert.equal(h.streams.entries.chains.size, 0);
+  await assert.rejects(h.snapshot(), /closed/);
+  assert.equal(h.requests.length, 3);
+});
+
+test('late managed startup cleanup cannot close a newer subscription with the same streamKey', async () => {
+  const h = await makeChainLifecycle();
+  const consumer = new EventEmitter();
+  const events = [];
+  consumer.on('stream/chain', (packet) => events.push(packet));
+  const old = h.managed(consumer);
+  await h.flush();
+  await h.managed(consumer, 'unsubscribe');
+  const newer = h.managed(consumer);
+  await h.flush();
+  h.requests[1].respond();
+  const subscribed = await newer;
+  h.requests[0].respond();
+  await old;
+  assert.equal(h.requests[0].closed, true);
+  assert.equal(h.active(), 1);
+  h.requests[1].packet();
+  await h.flush();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].streamKey, subscribed.streamKey);
+  assert.equal((await h.managed(consumer, 'touch')).active, true);
+  await h.managed(consumer, 'unsubscribe');
+  assert.equal(h.active(), 0);
+  assert.equal(Object.keys(h.client.streams.chains).length, 0);
+});
+
 test('optionChain rejects object errors with a readable message', async () => {
   const helper = loadExpressionModule('application/lib/ts/optionChain.js', {
     lib: makeLib({
