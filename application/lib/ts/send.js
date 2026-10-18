@@ -148,12 +148,56 @@ async ({
       meta.phase = phase;
       meta.bodyDurationMs = error.bodyDurationMs;
     }
+    // Log fixed categories only, never dynamic path segments or arbitrary cause text.
+    let operation = 'unknown';
+    if (Array.isArray(endpoint)) {
+      if (endpoint[0] === 'brokerage' && endpoint[1] === 'accounts') {
+        operation = 'account';
+        if (endpoint[3] === 'positions') operation = 'account_positions';
+        else if (endpoint[3] === 'balances') operation = 'account_balances';
+      } else if (endpoint[0] === 'marketdata') {
+        operation = 'market_data';
+      } else if (endpoint[0] === 'orderexecution') {
+        operation = 'order_execution';
+      } else if (endpoint[0] === 'oauth' && endpoint[1] === 'token') {
+        operation = 'oauth_token';
+      }
+    }
+    const logMethod = typeof method === 'string' ? method.toUpperCase() : null;
+    const causeCode = error.cause?.code;
+    const causeCodes = [
+      'EAI_AGAIN',
+      'ENOTFOUND',
+      'ECONNRESET',
+      'ECONNREFUSED',
+      'EHOSTUNREACH',
+      'ENETUNREACH',
+      'ETIMEDOUT',
+      'EPIPE',
+      'UND_ERR_CONNECT_TIMEOUT',
+      'UND_ERR_HEADERS_TIMEOUT',
+      'UND_ERR_BODY_TIMEOUT',
+      'UND_ERR_SOCKET',
+      'UND_ERR_ABORTED',
+      'ERR_TLS_CERT_ALTNAME_INVALID',
+      'CERT_HAS_EXPIRED',
+      'DEPTH_ZERO_SELF_SIGNED_CERT',
+      'SELF_SIGNED_CERT_IN_CHAIN',
+      'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+      'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+    ];
     console.error('Error in send function:', {
       name: error.name,
       status: error.status,
       statusText: error.statusText,
       code: error.code,
+      method: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].includes(logMethod) ? logMethod : null,
+      operation,
+      causeCode: causeCodes.includes(causeCode) ? causeCode : null,
       phase,
+      durationMs: Date.now() - started,
+      headersDurationMs: error.headersDurationMs,
+      bodyDurationMs: error.bodyDurationMs,
       httpStatus,
       ...error.upstream,
     });
