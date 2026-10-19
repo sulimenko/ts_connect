@@ -250,7 +250,9 @@ test('stream helper builds stream key from cleaned option chain payload', async 
 });
 
 test('option chain Failed/Internal server error is retryable before terminal cleanup', async () => {
-  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {});
+  const lib = { utils: loadUtils(), ts: {} };
+  lib.ts.readOptionChain = loadExpressionModule('application/lib/ts/readOptionChain.js', { lib });
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', { lib });
   let reconnectCalls = 0;
   const stopReasons = [];
   const errors = [];
@@ -302,11 +304,24 @@ test('option chain Failed/Internal server error is retryable before terminal cle
   assert.equal(statuses[0].retryAttempt, 1);
   assert.equal(statuses[0].maxRetries, 2);
 
+  for (const control of [{ Heartbeat: 1 }, { StreamStatus: 'EndSnapshot' }, { Status: 'OK' }, { Legs: [] }]) {
+    instance.handlePacket(
+      control,
+      () => {},
+      () => {},
+    );
+  }
+  assert.equal(statuses.length, 1);
+  assert.equal(instance.packetRetryAttempt, 1);
+
+  const delivered = [];
+  const option = { Legs: [{ Symbol: 'TSLA280121C00100000', Expiration: '2028-01-21T00:00:00Z', OptionType: 'Call' }] };
   instance.handlePacket(
-    { Legs: [] },
-    () => {},
+    option,
+    (packet) => delivered.push(packet),
     () => {},
   );
+  assert.equal(delivered[0], option);
   assert.equal(statuses[1].state, 'active');
   assert.equal(instance.packetRetryAttempt, 0);
 
@@ -333,6 +348,7 @@ test('option chain Failed/Internal server error is retryable before terminal cle
   assert.equal(errors[0].code, 'Failed');
   assert.equal(errors[0].permanent, true);
   assert.equal(errors[0].retryable, false);
+  assert.equal(errors[0].exhausted, true);
 });
 
 test('unknown packet errors stay transient without bounded retry exhaustion', async () => {
@@ -386,108 +402,102 @@ test('unknown packet errors stay transient without bounded retry exhaustion', as
   assert.equal(statuses[1].terminal, false);
 });
 
-test('stream bounded packet retry uses real reconnect flow', async () => {
-  const timers = [];
-  const retryPolicy = { packetErrors: { failedInternalServerError: { retryable: true, maxRetries: 2 } } };
-  const packets = [
-    { Error: 'Failed', Message: 'Internal server error', Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }], Bid: '1.20', Ask: '1.30' },
-    { Error: 'Failed', Message: 'Internal server error', Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }], Bid: '1.20', Ask: '1.30' },
-    { Error: 'Failed', Message: 'Internal server error', Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }], Bid: '1.20', Ask: '1.30' },
-  ];
-  let connectionCount = 0;
+test('managed chain control packets exhaust bounded retries without closing an independent physical stream', async () => {
+  const h = await makeChainLifecycle();
+  const consumers = [new EventEmitter(), new EventEmitter()];
+  const statuses = [];
+  const errors = [[], []];
+  consumers[0].on('stream/status', (event) => statuses.push(event));
+  consumers.forEach((consumer, index) => consumer.on('stream/error', (event) => errors[index].push(event)));
+  const subscribing = Promise.all(consumers.map((consumer) => h.managed(consumer)));
+  await h.flush();
+  h.requests[0].respond();
+  const [first, second] = await subscribing;
+  assert.equal(first.streamKey, second.streamKey);
+  assert.equal(second.subscribers, 2);
 
-  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
-    fetch: async () => {
-      const packet = packets[connectionCount];
-      connectionCount += 1;
-      let read = false;
-      return {
-        ok: true,
-        body: {
-          getReader: () => ({
-            read: async () => {
-              if (read) return { done: true };
-              read = true;
-              return { done: false, value: new TextEncoder().encode(`${JSON.stringify(packet)}\n`) };
-            },
-          }),
-        },
-      };
-    },
-    lib: {
-      utils: {
-        constructURL: () => 'https://live.example/v3/marketdata/stream/options/chains/TSLA',
-        traceLog: () => {},
-      },
-    },
-    setTimeout: (fn, delay) => {
-      const timer = { fn, delay, cleared: false };
-      timers.push(timer);
-      return timer;
-    },
-    clearTimeout: (timer) => {
-      if (timer) timer.cleared = true;
-    },
-  });
+  const snapshot = h.snapshot();
+  await h.flush();
+  const independent = h.requests[1];
+  independent.respond();
+  await h.flush();
+  assert.equal(h.active(), 2);
 
-  const statusEvents = [];
-  const terminalErrors = [];
-  const stopReasons = [];
-  const instance = streamFactory({
-    domain: 'https://live.example',
-    live: true,
-    endpoint: ['marketdata', 'stream', 'options', 'chains', 'TSLA'],
-    tokens: { access: 'token' },
-    onData: () => {},
-    onError: (error) => terminalErrors.push(error),
-    onStatus: (status) => statusEvents.push(status),
-    retryPolicy,
-  });
-  const originalStop = instance.stopStream;
-  instance.stopStream = function stop(reason = 'unknown') {
-    stopReasons.push(reason);
-    return originalStop.call(this, reason);
-  };
+  let request = h.requests[0];
+  let reconnects = 0;
+  for (const attempt of [1, 2, 3]) {
+    if (attempt > 1) {
+      for (const control of [{ Heartbeat: attempt }, { StreamStatus: 'EndSnapshot' }, { Status: 'OK' }, { Legs: [] }]) {
+        request.packet(control);
+      }
+      await h.flush();
+      assert.equal(statuses.length, attempt - 1);
+      assert.equal((await h.managed(consumers[0], 'touch')).recovering, true);
+    }
+    request.packet({
+      Error: 'Failed',
+      Message: 'Internal server error',
+      Legs: [{ Symbol: 'SHOULD_NOT_LEAK' }],
+      Bid: '1.20',
+      Ask: '1.30',
+    });
+    await h.flush();
+    assert.equal(request.signal.aborted, true);
+    assert.equal(independent.signal.aborted, false);
+    assert.equal(independent.closed, false);
+    if (attempt === 3) break;
 
-  const flush = async () => {
-    await Promise.resolve();
-    await Promise.resolve();
-  };
-  const runReconnect = async (expectedDelay) => {
-    const timer = timers.find((item) => !item.cleared);
+    assert.equal(errors[0].length, 0);
+    assert.equal(statuses.at(-1).retryAttempt, attempt);
+    assert.equal(statuses.at(-1).maxRetries, 2);
+    assert.equal(statuses.at(-1).streamKey, first.streamKey);
+    const touched = await h.managed(consumers[1], 'touch');
+    assert.equal(touched.subscribers, 2);
+    assert.equal(touched.streamKey, first.streamKey);
+    const timer = h.timers.findLast((item) => !item.cleared && item.delay === 5000 * attempt);
     assert.ok(timer);
-    assert.equal(timer.delay, expectedDelay);
     timer.cleared = true;
-    await timer.fn();
-    await flush();
-  };
+    const connecting = timer.fn();
+    reconnects += 1;
+    await h.flush();
+    request = h.requests.at(-1);
+    request.respond();
+    await connecting;
+    await h.flush();
+  }
 
-  await instance.initiateStream();
-  await flush();
-  assert.equal(connectionCount, 1);
-  assert.equal(statusEvents.length, 1);
-  assert.equal(statusEvents[0].retryAttempt, 1);
-  assert.equal(statusEvents[0].maxRetries, 2);
-  assert.equal(terminalErrors.length, 0);
+  assert.equal(reconnects, 2);
+  assert.deepEqual(
+    statuses.map((status) => status.retryAttempt),
+    [1, 2],
+  );
+  for (const events of errors) {
+    assert.equal(events.length, 1);
+    assert.equal(events[0].terminal, true);
+    assert.equal(events[0].retryable, false);
+    assert.equal(events[0].resubscribeRequired, true);
+    assert.equal(events[0].error.permanent, true);
+    assert.equal(events[0].error.reconnectable, false);
+    assert.equal(events[0].error.streamStopped, true);
+  }
+  assert.equal(h.streams.entries.chains.size, 0);
+  assert.equal(Object.keys(h.client.streams.chains).length, 1);
+  assert.equal((await h.managed(consumers[0], 'touch')).resubscribeRequired, true);
+  assert.equal(h.timers.filter((timer) => !timer.cleared && timer.delay === 10000).length, 0);
+  assert.equal(JSON.stringify({ statuses, errors }).includes('SHOULD_NOT_LEAK'), false);
+  const cleanups = h.logs.filter(([event]) => event === 'stream/chains terminal cleanup done').length;
+  assert.equal(cleanups, 1);
+  console.log(
+    `T-211 synthetic replay: reconnects=${reconnects}, terminal=${errors[0].length}, managed cleanup=${cleanups}, unrelated aborts=0`,
+  );
 
-  await runReconnect(5000);
-  assert.equal(connectionCount, 2);
-  assert.equal(statusEvents.length, 2);
-  assert.equal(statusEvents[1].retryAttempt, 2);
-  assert.equal(statusEvents[1].maxRetries, 2);
-  assert.equal(terminalErrors.length, 0);
-
-  await runReconnect(10000);
-  assert.equal(connectionCount, 3);
-  assert.equal(statusEvents.length, 2);
-  assert.equal(terminalErrors.length, 1);
-  assert.equal(terminalErrors[0].exhausted, true);
-  assert.equal(terminalErrors[0].terminal, true);
-  assert.equal(terminalErrors[0].retryable, false);
-  assert.equal(stopReasons[0], 'permanent-error');
-  assert.equal(timers.filter((timer) => !timer.cleared).length, 0);
-  assert.equal(JSON.stringify(statusEvents).includes('SHOULD_NOT_LEAK'), false);
-  assert.equal(JSON.stringify(terminalErrors).includes('SHOULD_NOT_LEAK'), false);
+  independent.packet();
+  independent.packet({
+    Legs: [{ Symbol: 'CRWV280121C00075000', Expiration: '2028-01-21T00:00:00Z', OptionType: 'Call' }],
+  });
+  assert.equal((await snapshot).strikes, 2);
+  assert.equal(h.active(), 0);
+  assert.equal(Object.keys(h.client.streams.chains).length, 0);
 });
 
 test('stream read terminated by socket close is transient and does not log unexpected error', async () => {
@@ -3125,8 +3135,9 @@ test('marketdata barcharts returns EINSTRUMENT for null or empty instrument inpu
 async function makeChainLifecycle() {
   const requests = [];
   const timers = [];
+  const logs = [];
   const globals = {
-    console: { debug() {}, log() {}, warn() {}, error() {} },
+    console: { debug: (...args) => logs.push(args), log() {}, warn() {}, error() {} },
     setTimeout: (fn, delay) => {
       const timer = { fn, delay, cleared: false };
       timers.push(timer);
@@ -3191,6 +3202,7 @@ async function makeChainLifecycle() {
     streams,
     requests,
     timers,
+    logs,
     managed: (consumer, action = 'subscribe') => managed({ ...args, client: consumer, action }),
     snapshot: () => snapshot(args),
     flush: async () => {
