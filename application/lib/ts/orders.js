@@ -1,4 +1,15 @@
-async ({ account, live, token, orderIds = [], start = null, limit = null, historical = false, signal = null, deadline = null }) => {
+async ({
+  account,
+  live,
+  token,
+  orderIds = [],
+  start = null,
+  limit = null,
+  historical = false,
+  signal = null,
+  deadline = null,
+  withOutcomes = false,
+}) => {
   const accountId = `${account ?? ''}`.trim();
   if (!accountId) throw new Error('TradeStation orders account is required');
 
@@ -63,6 +74,8 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
   // Preserve the standalone two-attempt envelope; batches supply their shared deadline.
   const readDeadline = deadline ?? Date.now() + 14100;
   let response = null;
+  let outcome = null;
+  let validatedOrders = null;
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     if (signal?.aborted) throw abortError();
@@ -102,17 +115,128 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
       if (!response || typeof response !== 'object' || Array.isArray(response)) {
         throw Object.assign(new Error('Unexpected TradeStation orders response'), { code: 'ERESPONSE' });
       }
-      if (response.Errors !== undefined && response.Errors !== null && !Array.isArray(response.Errors)) {
-        throw Object.assign(new Error('Unexpected TradeStation orders Errors shape'), { code: 'ERESPONSE' });
+      if (withOutcomes === true) {
+        const record = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+        const text = (value) => typeof value === 'string' && value.trim().length > 0;
+        const numeric = (value) =>
+          (typeof value === 'number' || (text(value) && /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value))) &&
+          Number.isFinite(Number(value));
+        const quantity = (value) => numeric(value) && Number(value) >= 0;
+        const timestamp = (value) =>
+          text(value) &&
+          /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) &&
+          Number.isFinite(Date.parse(value));
+        // Only statuses explicitly mapped by the Back reconciliation consumer.
+        // FLP cancels the remainder; retain its reported executed quantity.
+        const statuses = new Set(['DON', 'OPN', 'ACK', 'FPR', 'FLL', 'OUT', 'CAN', 'FLP', 'REJ', 'FAILED']);
+        const fills = new Set(['FLL', 'FLP', 'FPR']);
+        // The opt-in reconciliation consumer supports these asset types only.
+        const assets = new Set(['STOCK', 'STOCKOPTION', 'IDX']);
+        const actions = new Set(['BUY', 'SELL', 'SELLSHORT', 'BUYTOCOVER', 'BUYTOOPEN', 'BUYTOCLOSE', 'SELLTOOPEN', 'SELLTOCLOSE']);
+        const counts = new Map();
+        if (Array.isArray(response.Orders)) {
+          for (const order of response.Orders) {
+            if (record(order) && order.AccountID === accountId && text(order.OrderID)) {
+              counts.set(order.OrderID, (counts.get(order.OrderID) ?? 0) + 1);
+            }
+          }
+        }
+        validatedOrders = Array.isArray(response.Orders)
+          ? response.Orders.filter(
+              (order) =>
+                record(order) &&
+                text(order.OrderID) &&
+                order.AccountID === accountId &&
+                (!exact || orderIds.includes(order.OrderID)) &&
+                counts.get(order.OrderID) === 1 &&
+                order.Error === undefined &&
+                statuses.has(order.Status) &&
+                ['Market', 'Limit', 'StopMarket', 'StopLimit'].includes(order.OrderType) &&
+                text(order.Currency) &&
+                ['DAY', 'DAY+', 'GTC', 'GTC+'].includes(order.Duration) &&
+                timestamp(order.OpenedDateTime) &&
+                // An absent optional close time does not invalidate positive evidence.
+                (order.ClosedDateTime === undefined ||
+                  order.ClosedDateTime === null ||
+                  (timestamp(order.ClosedDateTime) && Date.parse(order.ClosedDateTime) >= Date.parse(order.OpenedDateTime))) &&
+                ['FilledPrice', 'LimitPrice', 'StopPrice'].every(
+                  (field) => order[field] === undefined || order[field] === null || numeric(order[field]),
+                ) &&
+                (!['StopMarket', 'StopLimit'].includes(order.OrderType) || numeric(order.StopPrice)) &&
+                Array.isArray(order.Legs) &&
+                order.Legs.length > 0 &&
+                order.Legs.every(
+                  (leg) =>
+                    record(leg) &&
+                    text(leg.Symbol) &&
+                    text(leg.BuyOrSell) &&
+                    actions.has(leg.BuyOrSell.toUpperCase()) &&
+                    assets.has(leg.AssetType) &&
+                    quantity(leg.QuantityOrdered) &&
+                    (leg.ExecQuantity === undefined
+                      ? !fills.has(order.Status)
+                      : quantity(leg.ExecQuantity) && Number(leg.ExecQuantity) <= Number(leg.QuantityOrdered)) &&
+                    (leg.QuantityRemaining === undefined || quantity(leg.QuantityRemaining)) &&
+                    (leg.ExecutionPrice === undefined || leg.ExecutionPrice === null || numeric(leg.ExecutionPrice)) &&
+                    (!['Limit', 'StopLimit'].includes(order.OrderType) || numeric(leg.ExecutionPrice ?? order.LimitPrice)),
+                ) &&
+                (!fills.has(order.Status) || order.Legs.some((leg) => Number(leg.ExecQuantity) > 0)),
+            )
+          : [];
+        const errorsValid =
+          response.Errors === undefined ||
+          (Array.isArray(response.Errors) && response.Errors.every((error) => record(error) && text(error.Error)));
+        const tokenValid = response.NextToken === undefined || typeof response.NextToken === 'string';
+        const hasMore = tokenValid && Boolean(response.NextToken?.length);
+        // Page is not requested by this reader. Without a verified page schema,
+        // it cannot certify a complete snapshot, even when NextToken is absent.
+        const pagePresent = response.Page !== undefined;
+        const malformed =
+          !Array.isArray(response.Orders) ||
+          validatedOrders.length !== response.Orders.length ||
+          !errorsValid ||
+          !tokenValid ||
+          pagePresent ||
+          response.Error !== undefined ||
+          (response.AccountID !== undefined && response.AccountID !== accountId) ||
+          (response.OrderID !== undefined && (!exact || !orderIds.includes(response.OrderID)));
+        const brokerError = errorsValid && (response.Errors?.length ?? 0) > 0;
+        // Preserve a proven fill without inventing the close timestamp Back would
+        // otherwise supply. Its final temporal evidence is still incomplete.
+        const missingClose = validatedOrders.some(
+          (order) => ['FLL', 'FLP'].includes(order.Status) && (order.ClosedDateTime === undefined || order.ClosedDateTime === null),
+        );
+        const complete = !malformed && !brokerError && !hasMore && !missingClose;
+        outcome = {
+          state: 'complete',
+          complete,
+        };
+        if (!complete) outcome.state = validatedOrders.length > 0 || hasMore ? 'partial' : 'error';
+        if ((tokenValid && !pagePresent) || hasMore) outcome.hasMore = hasMore;
+        if (malformed || brokerError || missingClose) {
+          let code = 'EINCOMPLETE';
+          if (brokerError) code = 'EBROKER';
+          if (malformed) code = 'ERESPONSE';
+          outcome.error = {
+            code,
+            phase: 'complete',
+            httpStatus: meta.status ?? 200,
+          };
+        }
       }
-      if (response.Orders !== undefined && response.Orders !== null && !Array.isArray(response.Orders)) {
-        throw Object.assign(new Error('Unexpected TradeStation orders Orders shape'), { code: 'ERESPONSE' });
-      }
-      if (exact && !Array.isArray(response.Orders) && !(response.Errors?.length > 0)) {
-        throw Object.assign(new Error('Missing TradeStation exact orders Orders array'), { code: 'ERESPONSE' });
-      }
-      if (exact && response.Orders?.some((order) => !order || typeof order.OrderID !== 'string' || !order.OrderID.trim())) {
-        throw Object.assign(new Error('Unexpected TradeStation exact orders entry'), { code: 'ERESPONSE' });
+      if (withOutcomes !== true) {
+        if (response.Errors !== undefined && response.Errors !== null && !Array.isArray(response.Errors)) {
+          throw Object.assign(new Error('Unexpected TradeStation orders Errors shape'), { code: 'ERESPONSE' });
+        }
+        if (response.Orders !== undefined && response.Orders !== null && !Array.isArray(response.Orders)) {
+          throw Object.assign(new Error('Unexpected TradeStation orders Orders shape'), { code: 'ERESPONSE' });
+        }
+        if (exact && !Array.isArray(response.Orders) && !(response.Errors?.length > 0)) {
+          throw Object.assign(new Error('Missing TradeStation exact orders Orders array'), { code: 'ERESPONSE' });
+        }
+        if (exact && response.Orders?.some((order) => !order || typeof order.OrderID !== 'string' || !order.OrderID.trim())) {
+          throw Object.assign(new Error('Unexpected TradeStation exact orders entry'), { code: 'ERESPONSE' });
+        }
       }
       console.log('TradeStation orders read:', {
         endpoint: endpointName,
@@ -150,7 +274,7 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
         else if (Date.now() >= readDeadline) error.timeoutSource = 'deadline';
         else if (timedOut) error.timeoutSource = 'attempt';
       }
-      const miss = lookupMiss && !signal?.aborted && !timedOut && !malformed && !timeout && !network;
+      const miss = withOutcomes !== true && lookupMiss && !signal?.aborted && !timedOut && !malformed && !timeout && !network;
       const retryable = !signal?.aborted && !malformed && error.status !== 404 && (timeout || network || transient.has(error.status));
       const log = miss ? console.log : console.error;
       log.call(console, 'TradeStation orders read:', {
@@ -187,6 +311,7 @@ async ({ account, live, token, orderIds = [], start = null, limit = null, histor
     }
   }
 
+  if (withOutcomes === true) return { orders: validatedOrders, outcome };
   return {
     errors: response.Errors ?? [],
     orders: response.Orders ?? [],
