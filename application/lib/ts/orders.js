@@ -126,47 +126,13 @@ async ({
           text(value) &&
           /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) &&
           Number.isFinite(Date.parse(value));
-        // Broker Status enum, excluding OTHER (explicitly unmapped upstream).
-        const statuses = new Set([
-          'ACK',
-          'ASS',
-          'BRC',
-          'BRF',
-          'BRO',
-          'CHG',
-          'CND',
-          'COR',
-          'DIS',
-          'DOA',
-          'DON',
-          'ECN',
-          'EXE',
-          'FPR',
-          'LAT',
-          'OPN',
-          'OSO',
-          'PLA',
-          'REC',
-          'RJC',
-          'RPD',
-          'RSN',
-          'STP',
-          'STT',
-          'SUS',
-          'UCN',
-          'CAN',
-          'EXP',
-          'OUT',
-          'RJR',
-          'SCN',
-          'TSC',
-          'UCH',
-          'REJ',
-          'FLL',
-          'FLP',
-        ]);
+        // Only statuses explicitly mapped by the Back reconciliation consumer.
+        // FLP cancels the remainder; retain its reported executed quantity.
+        const statuses = new Set(['DON', 'OPN', 'ACK', 'FPR', 'FLL', 'OUT', 'CAN', 'FLP', 'REJ', 'FAILED']);
         const fills = new Set(['FLL', 'FLP', 'FPR']);
-        const assets = new Set(['STOCK', 'STOCKOPTION', 'FUTURE', 'FUTUREOPTION', 'FOREX', 'CURRENCYOPTION', 'INDEX', 'INDEXOPTION']);
+        // The opt-in reconciliation consumer supports these asset types only.
+        const assets = new Set(['STOCK', 'STOCKOPTION', 'IDX']);
+        const actions = new Set(['BUY', 'SELL', 'SELLSHORT', 'BUYTOCOVER', 'BUYTOOPEN', 'BUYTOCLOSE', 'SELLTOOPEN', 'SELLTOCLOSE']);
         const counts = new Map();
         if (Array.isArray(response.Orders)) {
           for (const order of response.Orders) {
@@ -187,27 +153,32 @@ async ({
                 statuses.has(order.Status) &&
                 ['Market', 'Limit', 'StopMarket', 'StopLimit'].includes(order.OrderType) &&
                 text(order.Currency) &&
-                text(order.Duration) &&
+                ['DAY', 'DAY+', 'GTC', 'GTC+'].includes(order.Duration) &&
                 timestamp(order.OpenedDateTime) &&
-                // Open orders need no close time; a terminal fill must have one.
-                (order.ClosedDateTime === undefined
-                  ? !['FLL', 'FLP'].includes(order.Status)
-                  : timestamp(order.ClosedDateTime) && Date.parse(order.ClosedDateTime) >= Date.parse(order.OpenedDateTime)) &&
-                ['FilledPrice', 'LimitPrice', 'StopPrice'].every((field) => order[field] === undefined || numeric(order[field])) &&
+                // An absent optional close time does not invalidate positive evidence.
+                (order.ClosedDateTime === undefined ||
+                  order.ClosedDateTime === null ||
+                  (timestamp(order.ClosedDateTime) && Date.parse(order.ClosedDateTime) >= Date.parse(order.OpenedDateTime))) &&
+                ['FilledPrice', 'LimitPrice', 'StopPrice'].every(
+                  (field) => order[field] === undefined || order[field] === null || numeric(order[field]),
+                ) &&
+                (!['StopMarket', 'StopLimit'].includes(order.OrderType) || numeric(order.StopPrice)) &&
                 Array.isArray(order.Legs) &&
                 order.Legs.length > 0 &&
                 order.Legs.every(
                   (leg) =>
                     record(leg) &&
                     text(leg.Symbol) &&
-                    ['Buy', 'Sell', 'SellShort', 'BuyToCover'].includes(leg.BuyOrSell) &&
+                    text(leg.BuyOrSell) &&
+                    actions.has(leg.BuyOrSell.toUpperCase()) &&
                     assets.has(leg.AssetType) &&
                     quantity(leg.QuantityOrdered) &&
                     (leg.ExecQuantity === undefined
                       ? !fills.has(order.Status)
                       : quantity(leg.ExecQuantity) && Number(leg.ExecQuantity) <= Number(leg.QuantityOrdered)) &&
                     (leg.QuantityRemaining === undefined || quantity(leg.QuantityRemaining)) &&
-                    (leg.ExecutionPrice === undefined || numeric(leg.ExecutionPrice)),
+                    (leg.ExecutionPrice === undefined || leg.ExecutionPrice === null || numeric(leg.ExecutionPrice)) &&
+                    (!['Limit', 'StopLimit'].includes(order.OrderType) || numeric(leg.ExecutionPrice ?? order.LimitPrice)),
                 ) &&
                 (!fills.has(order.Status) || order.Legs.some((leg) => Number(leg.ExecQuantity) > 0)),
             )
@@ -230,15 +201,27 @@ async ({
           (response.AccountID !== undefined && response.AccountID !== accountId) ||
           (response.OrderID !== undefined && (!exact || !orderIds.includes(response.OrderID)));
         const brokerError = errorsValid && (response.Errors?.length ?? 0) > 0;
-        const complete = !malformed && !brokerError && !hasMore;
+        // Preserve a proven fill without inventing the close timestamp Back would
+        // otherwise supply. Its final temporal evidence is still incomplete.
+        const missingClose = validatedOrders.some(
+          (order) => ['FLL', 'FLP'].includes(order.Status) && (order.ClosedDateTime === undefined || order.ClosedDateTime === null),
+        );
+        const complete = !malformed && !brokerError && !hasMore && !missingClose;
         outcome = {
           state: 'complete',
           complete,
         };
         if (!complete) outcome.state = validatedOrders.length > 0 || hasMore ? 'partial' : 'error';
         if ((tokenValid && !pagePresent) || hasMore) outcome.hasMore = hasMore;
-        if (malformed || brokerError) {
-          outcome.error = { code: malformed ? 'ERESPONSE' : 'EBROKER', phase: 'complete', httpStatus: meta.status ?? 200 };
+        if (malformed || brokerError || missingClose) {
+          let code = 'EINCOMPLETE';
+          if (brokerError) code = 'EBROKER';
+          if (malformed) code = 'ERESPONSE';
+          outcome.error = {
+            code,
+            phase: 'complete',
+            httpStatus: meta.status ?? 200,
+          };
         }
       }
       if (withOutcomes !== true) {

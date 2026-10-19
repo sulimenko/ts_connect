@@ -5051,9 +5051,11 @@ test('opt-in batch isolates transport errors and retains success across global a
 test('opt-in orders APIs validate positive rows and completeness metadata without exposing continuation tokens', async () => {
   const row = ordersOutcomeRow;
   const filled = { ...row, Status: 'FLL', ClosedDateTime: '2026-07-01T15:31:00Z', Legs: [{ ...row.Legs[0], ExecQuantity: '2' }] };
+  const option = { ...row, Legs: [{ ...row.Legs[0], Symbol: 'TSLA 261218C300', AssetType: 'STOCKOPTION', BuyOrSell: 'BuyToOpen' }] };
   const invalidRows = [
     { AccountID: 'A1', OrderID: 'O1', Legs: [{ Symbol: 'TSLA' }] },
-    ...[undefined, '', 'UNKNOWN', 'OTHER'].map((Status) => ({ ...row, Status })),
+    ...[undefined, '', 'UNKNOWN', 'OTHER', 'ASS', 'BRC'].map((Status) => ({ ...row, Status })),
+    { ...row, Duration: 'DYP' },
     ...['OrderType', 'Currency', 'Duration', 'OpenedDateTime'].map((field) => ({ ...row, [field]: undefined })),
     ...[
       { Symbol: '' },
@@ -5061,6 +5063,7 @@ test('opt-in orders APIs validate positive rows and completeness metadata withou
       { BuyOrSell: 'invalid' },
       { AssetType: undefined },
       { AssetType: 'UNKNOWN' },
+      ...['FUTURE', 'FUTUREOPTION', 'FOREX', 'CURRENCYOPTION', 'INDEX', 'INDEXOPTION'].map((AssetType) => ({ AssetType })),
       { QuantityOrdered: undefined },
       { QuantityOrdered: '' },
       { QuantityOrdered: null },
@@ -5074,15 +5077,67 @@ test('opt-in orders APIs validate positive rows and completeness metadata withou
       { ExecQuantity: '-1' },
       { ExecQuantity: '3' },
     ].map((leg) => ({ ...row, Legs: [{ ...row.Legs[0], ...leg }] })),
-    { ...filled, ClosedDateTime: undefined },
+    { ...row, OpenedDateTime: 'today' },
+    { ...row, ClosedDateTime: 'tomorrow' },
     { ...filled, ClosedDateTime: 'not-a-date' },
     { ...filled, ClosedDateTime: '2026-06-30T15:30:00Z' },
+    { ...row, OrderType: 'Limit' },
+    { ...row, OrderType: 'Limit', LimitPrice: '210', Legs: [{ ...row.Legs[0], ExecutionPrice: 'not-a-number' }] },
+    { ...row, OrderType: 'StopMarket' },
+    { ...row, OrderType: 'StopLimit', LimitPrice: '210' },
+    { ...row, OrderType: 'StopLimit', StopPrice: '200' },
+    { ...row, OrderType: 'StopLimit', Legs: [{ ...row.Legs[0], ExecutionPrice: '210' }] },
+    { ...row, OrderType: 'Limit', Legs: [{ ...row.Legs[0], ExecutionPrice: '210' }, row.Legs[0]] },
     ...[undefined, 'not-a-number', '0'].map((ExecQuantity) => ({ ...filled, Legs: [{ ...filled.Legs[0], ExecQuantity }] })),
   ];
   const cases = [
     [{ Orders: [] }, 'complete', false, 0],
     [{ Orders: [row] }, 'complete', false, 1],
     [{ Orders: [filled] }, 'complete', false, 1],
+    ...[undefined, null, filled.ClosedDateTime].map((ClosedDateTime) => [
+      { Orders: [{ ...filled, Status: 'FLP', ClosedDateTime, Legs: [{ ...filled.Legs[0], ExecQuantity: '1', QuantityRemaining: '1' }] }] },
+      ClosedDateTime === undefined || ClosedDateTime === null ? 'partial' : 'complete',
+      false,
+      1,
+    ]),
+    ...['DON', 'OPN', 'OUT', 'REJ', 'FAILED'].map((Status) => [{ Orders: [{ ...row, Status }] }, 'complete', false, 1]),
+    ...['DAY+', 'GTC', 'GTC+'].map((Duration) => [{ Orders: [{ ...row, Duration }] }, 'complete', false, 1]),
+    ...[undefined, null].flatMap((ClosedDateTime) => [
+      [{ Orders: [{ ...row, ClosedDateTime }] }, 'complete', false, 1],
+      [{ Orders: [{ ...filled, ClosedDateTime }] }, 'partial', false, 1],
+    ]),
+    ...['Buy', 'Sell', 'SellShort', 'BuyToCover'].map((BuyOrSell) => [
+      { Orders: [{ ...row, Legs: [{ ...row.Legs[0], BuyOrSell }] }] },
+      'complete',
+      false,
+      1,
+    ]),
+    ...['BuyToOpen', 'BuyToClose', 'SellToOpen', 'SellToClose'].flatMap((action) =>
+      [action, action.toUpperCase(), action.toLowerCase()].map((BuyOrSell) => [
+        { Orders: [row, { ...option, OrderID: 'O2', Legs: [{ ...option.Legs[0], BuyOrSell }] }] },
+        'complete',
+        false,
+        2,
+      ]),
+    ),
+    ...[
+      { OrderType: 'Limit', LimitPrice: '210' },
+      { OrderType: 'Limit', LimitPrice: '210', Legs: [{ ...row.Legs[0], ExecutionPrice: null }] },
+      { OrderType: 'Limit', Legs: [{ ...row.Legs[0], ExecutionPrice: '210' }] },
+      { OrderType: 'StopMarket', StopPrice: '200' },
+      { OrderType: 'StopLimit', StopPrice: '200', LimitPrice: '210' },
+      { OrderType: 'StopLimit', StopPrice: '200', Legs: [{ ...row.Legs[0], ExecutionPrice: '210' }] },
+    ].map((prices) => [{ Orders: [{ ...row, ...prices }] }, 'complete', false, 1]),
+    [{ Orders: [{ ...row, Status: 'CAN' }] }, 'complete', false, 1],
+    [{ Orders: [{ ...option, Status: 'CAN' }] }, 'complete', false, 1],
+    [{ Orders: [{ ...filled, Legs: [{ ...option.Legs[0], ExecQuantity: '2' }] }] }, 'complete', false, 1],
+    [
+      { Orders: [{ ...filled, Status: 'FPR', ClosedDateTime: null, Legs: [{ ...option.Legs[0], ExecQuantity: '1' }] }] },
+      'complete',
+      false,
+      1,
+    ],
+    [{ Orders: [{ ...row, Legs: [{ ...row.Legs[0], Symbol: '$SPX.X', AssetType: 'IDX' }] }] }, 'complete', false, 1],
     [{ Orders: [{ ...row, Legs: [{ ...row.Legs[0], QuantityOrdered: '0', ExecQuantity: 0 }] }] }, 'complete', false, 1],
     [{ Orders: [{ ...row, Legs: [{ ...row.Legs[0], ExecQuantity: undefined }] }] }, 'complete', false, 1],
     [{ Orders: [{ ...filled, Status: 'FPR', ClosedDateTime: undefined, Legs: [filled.Legs[0], row.Legs[0]] }] }, 'complete', false, 1],
@@ -5133,25 +5188,29 @@ test('opt-in orders APIs validate positive rows and completeness metadata withou
       if (outcome.error) assert.deepEqual(Object.keys(outcome.error), ['code', 'phase', 'httpStatus']);
     }
     const contracts = Array.from({ length: 6 }, (_, index) => ({ account: `A${index + 1}`, live: index % 2 === 0 }));
-    globals.lib.ts.send = async ({ endpoint }) => ({
-      Orders: [{ ...row, AccountID: endpoint[2], OrderID: `O-${endpoint[2]}`, Status: endpoint[2] === 'A6' ? undefined : row.Status }],
-    });
-    const mixed = JSON.parse(JSON.stringify(await api.method({ ...input, contracts, orders: [] })));
-    assert.equal(mixed.complete, false);
-    assert.deepEqual(
-      mixed.outcomes.map(({ state }) => state),
-      [...Array(5).fill('complete'), 'error'],
-    );
-    assert.ok(
-      mixed.outcomes.every(
-        ({ account, live, source }, index) =>
-          account === contracts[index].account && live === contracts[index].live && source === (historical ? 'historical' : 'current'),
-      ),
-    );
-    assert.deepEqual(
-      mixed.outcomes.flatMap(({ orders }) => orders.map(({ OrderID }) => OrderID)),
-      ['O-A1', 'O-A2', 'O-A3', 'O-A4', 'O-A5'],
-    );
+    for (const invalid of [invalidRows[0], ...['ASS', 'BRC'].map((Status) => ({ ...row, Status })), { ...row, OrderType: 'Limit' }]) {
+      globals.lib.ts.send = async ({ endpoint }) => {
+        const evidence = endpoint[2] === 'A6' ? invalid : option;
+        return { Orders: [{ ...evidence, AccountID: endpoint[2], OrderID: `O-${endpoint[2]}` }] };
+      };
+      const mixed = JSON.parse(JSON.stringify(await api.method({ ...input, contracts, orders: [] })));
+      assert.equal(mixed.complete, false);
+      assert.deepEqual(
+        mixed.outcomes.map(({ state }) => state),
+        [...Array(5).fill('complete'), 'error'],
+      );
+      assert.ok(
+        mixed.outcomes.every(
+          ({ account, live, source }, index) =>
+            account === contracts[index].account && live === contracts[index].live && source === (historical ? 'historical' : 'current'),
+        ),
+      );
+      assert.deepEqual(
+        mixed.outcomes.flatMap(({ orders }) => orders.map(({ OrderID }) => OrderID)),
+        ['O-A1', 'O-A2', 'O-A3', 'O-A4', 'O-A5'],
+      );
+      assert.doesNotMatch(JSON.stringify(mixed), /cursor-secret|access-secret|https:|NextToken/);
+    }
     globals.lib.ts.send = async () => response;
     response = { Orders: invalidRows };
     assert.deepEqual(
