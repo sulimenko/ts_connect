@@ -405,7 +405,9 @@
       return false;
     }
 
-    this.notifyRecovered();
+    const chains = this.currentParams.endpoint.slice(0, 4).join('/') === 'marketdata/stream/options/chains';
+    // Chain control packets do not prove that option data delivery has recovered.
+    if (!chains || (packet.Heartbeat === undefined && lib.ts.readOptionChain({ message: packet }))) this.notifyRecovered();
     if (packet.Heartbeat !== undefined) return true;
     if (onData) onData(packet);
     return true;
