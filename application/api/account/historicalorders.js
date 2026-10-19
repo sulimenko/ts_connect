@@ -6,7 +6,7 @@
     EACCOUNT: 'At least one brokerage account contract is required',
   },
   validate: ({ contracts }) => Array.isArray(contracts) && contracts.length > 0,
-  method: async ({ contracts, orders = [], start = null, limit = null }) => {
+  method: async ({ contracts, orders = [], start = null, limit = null, withOutcomes = false }) => {
     const client = await domain.ts.clients.getClient({ sync: false });
     return await lib.ts.ordersBatch({
       contracts,
@@ -15,6 +15,7 @@
       start,
       limit,
       historical: true,
+      withOutcomes: withOutcomes === true,
     });
   },
 });

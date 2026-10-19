@@ -379,6 +379,11 @@ test('unknown packet errors stay transient without bounded retry exhaustion', as
   assert.equal(statuses[0].terminal, false);
   assert.equal(statuses[0].retryable, true);
   assert.equal(JSON.stringify(statuses[0]).includes('SHOULD_NOT_LEAK'), false);
+  instance.handlePacket({ Error: 'Failed', Message: 'Failed to retrieve quotes for positions' }, null, (error) => errors.push(error));
+  assert.equal(reconnectCalls, 2);
+  assert.equal(errors.length, 0);
+  assert.equal(statuses[1].state, 'recovering');
+  assert.equal(statuses[1].terminal, false);
 });
 
 test('stream bounded packet retry uses real reconnect flow', async () => {
@@ -448,9 +453,10 @@ test('stream bounded packet retry uses real reconnect flow', async () => {
     await Promise.resolve();
     await Promise.resolve();
   };
-  const runReconnect = async () => {
+  const runReconnect = async (expectedDelay) => {
     const timer = timers.find((item) => !item.cleared);
     assert.ok(timer);
+    assert.equal(timer.delay, expectedDelay);
     timer.cleared = true;
     await timer.fn();
     await flush();
@@ -464,14 +470,14 @@ test('stream bounded packet retry uses real reconnect flow', async () => {
   assert.equal(statusEvents[0].maxRetries, 2);
   assert.equal(terminalErrors.length, 0);
 
-  await runReconnect();
+  await runReconnect(5000);
   assert.equal(connectionCount, 2);
   assert.equal(statusEvents.length, 2);
   assert.equal(statusEvents[1].retryAttempt, 2);
   assert.equal(statusEvents[1].maxRetries, 2);
   assert.equal(terminalErrors.length, 0);
 
-  await runReconnect();
+  await runReconnect(10000);
   assert.equal(connectionCount, 3);
   assert.equal(statusEvents.length, 2);
   assert.equal(terminalErrors.length, 1);
@@ -807,11 +813,15 @@ test('successful reconnect returns stream status to active', async () => {
     onStatus: (status) => statuses.push(status),
   });
   instance.processStream = async () => {};
+  instance.reconnectDelay = 40000;
 
   await instance.initiateStream({ reconnect: true, generation: 0 });
 
   assert.equal(statuses.length, 1);
   assert.equal(statuses[0].state, 'active');
+  assert.equal(instance.reconnectDelay, 40000);
+  instance.handlePacket({ Heartbeat: 1 });
+  assert.equal(instance.reconnectDelay, 5000);
   instance.stopStream('test.cleanup');
 });
 
@@ -1456,6 +1466,12 @@ test('readOptionChain and positions share the same canonical option symbol contr
   assert.ok(option);
   assert.equal(option.symbol_raw, 'CRWV280121C00080000');
   assert.equal(option.strike, '00080000');
+  assert.equal(option.symbol_external, 'CRWV 280121C80');
+  assert.equal(option.source, 'TS');
+  assert.equal(option.underlying_symbol, 'CRWV');
+  assert.equal(option.strike_price, 80);
+  assert.equal(option.option_metadata.Symbol, 'CRWV 280121C80');
+  assert.equal(option.option_metadata.StrikePrice, 80);
 
   positions.setPosition({
     account: 'A1',
@@ -1537,6 +1553,60 @@ test('readOptionChain keeps structurally valid rows with missing quotes and gree
   assert.equal(option.gamma, null);
   assert.equal(option.theta, null);
   assert.equal(option.vega, null);
+});
+
+test('quote snapshots reject failed or malformed responses and preserve partial null quotes', async () => {
+  const traces = [];
+  const utils = { ...loadUtils(), traceLog: (entry) => traces.push(entry) };
+  let fetchResponse;
+  const send = loadExpressionModule('application/lib/ts/send.js', { lib: { utils }, fetch: () => fetchResponse() });
+  const readQuote = loadExpressionModule('application/lib/ts/readQuote.js', { lib: { utils } });
+  const api = loadExpressionModule('application/api/marketdata/quotes.js', {
+    DomainError: class DomainError extends Error {},
+    domain: { ts: { clients: { getClient: async () => ({ tokens: { access: 'test' } }) } } },
+    lib: { utils, ts: { send, readQuote } },
+  });
+  const request = { instruments: [{ symbol: 'MSFT' }, { symbol: 'AAPL' }] };
+  for (const response of [
+    new Response('gateway timeout', { status: 504 }),
+    new TypeError('fetch failed'),
+    {},
+    { Quotes: [{ Symbol: 'MSFT', Bid: {} }] },
+    { Quotes: [], Errors: [{ Symbol: 'MSFT' }] },
+  ]) {
+    traces.length = 0;
+    fetchResponse = async () => {
+      if (response instanceof Error) throw response;
+      return response instanceof Response ? response : new Response(JSON.stringify(response));
+    };
+    await assert.rejects(api.method(request));
+    for (const phase of ['ts.request.done', 'api.done']) {
+      const trace = traces.find((entry) => entry.phase === phase);
+      assert.equal(trace.extra.status, 'error');
+      assert.ok(trace.extra.errorCount > 0);
+    }
+  }
+  for (const partial of [true, false]) {
+    traces.length = 0;
+    fetchResponse = async () =>
+      new Response(
+        JSON.stringify({
+          Quotes: partial ? [{ Symbol: 'MSFT', Bid: null, Ask: '0', PreviousClose: null }] : [],
+          Errors: [{ Symbol: 'AAPL', Error: 'NoData', Message: 'no data available' }],
+        }),
+      );
+    const rows = await api.method(request);
+    assert.equal(Array.isArray(rows), true);
+    assert.deepEqual(Object.keys(rows[0]), ['symbol', 'instrument', 'data', 'quote']);
+    assert.equal(rows[0].quote.bid, null);
+    assert.equal(rows[0].data.prev_close_price, null);
+    assert.equal(rows[0].quote.ask, partial ? '0.00' : null);
+    assert.equal(rows[1].quote.ask, null);
+    assert.equal(rows[1].data.lp, null);
+    const done = traces.find((entry) => entry.phase === 'api.done');
+    assert.equal(done.extra.status, partial ? 'partial' : 'no_data');
+    assert.equal(done.extra.errorCount, 1);
+  }
 });
 
 test('marketdata quotes and order execution use the shared symbol formatter', async () => {
@@ -2137,6 +2207,75 @@ test('stream matrix emits canonical levelII packets while routing by tsSymbol', 
   assert.equal(emitted.payload.size, 2);
 });
 
+test('matrix NO_DATA reaches subscribers and cleans startup and active upstreams', async () => {
+  for (const [symbol, startup] of [
+    ['NBIS 261023P190', true],
+    ['PINS 270115C22', false],
+  ]) {
+    const timers = new Set();
+    const globals = {
+      setTimeout: (fn) => {
+        const timer = { fn };
+        timers.add(timer);
+        return timer;
+      },
+      clearTimeout: (timer) => timers.delete(timer),
+    };
+    const utils = loadUtils();
+    let deliver = null;
+    const packet = { Error: 'Failed', Message: 'rpc error: code = InvalidArgument desc = no data available', Symbol: symbol };
+    const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+      ...globals,
+      lib: { utils },
+      fetch: async () => ({
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: () =>
+              new Promise((resolve) => {
+                deliver = () => resolve({ done: false, value: new TextEncoder().encode(`${JSON.stringify(packet)}\n`) });
+                if (startup) deliver();
+              }),
+          }),
+        },
+      }),
+    });
+    const factory = loadExpressionModule('application/domain/ts/client.js', { lib: { utils, ts: { stream: streamFactory } } });
+    const tsClient = await factory();
+    const streams = loadExpressionModule('application/domain/ts/streams.js', { ...globals, lib: makeLib() });
+    const client = new EventEmitter();
+    const events = [];
+    client.on('stream/error', (payload) => events.push(payload));
+    const matrixApi = loadExpressionModule('application/api/stream/matrix.js', {
+      DomainError: class DomainError extends Error {},
+      context: { client },
+      domain: { ts: { clients: { getClient: async () => tsClient }, streams } },
+      lib: { utils },
+    });
+    const result = await matrixApi.method({ instruments: [{ symbol }] });
+    if (!startup) deliver();
+    for (let turn = 0; turn < 30; turn += 1) await Promise.resolve();
+    assert.equal(events.length, 1);
+    const event = events[0];
+    assert.equal(event.streamKey, result.streamKey);
+    assert.equal(event.kind, 'matrix');
+    assert.equal(event.metadata.symbol, symbol);
+    assert.equal(event.state, 'failed');
+    assert.equal(event.active, false);
+    assert.equal(event.resubscribeRequired, true);
+    assert.equal(event.terminal, true);
+    assert.equal(event.retryable, false);
+    assert.equal(event.error.code, 'NO_DATA');
+    assert.equal(event.error.classification, 'no_data');
+    assert.equal(event.error.streamStopped, true);
+    assert.equal(streams.getBucket({ kind: 'matrix' }).size, 0);
+    assert.equal(Object.keys(tsClient.streams.matrix).length, 0);
+    assert.equal(streams.clients.size, 0);
+    assert.equal(client.listenerCount('close'), 0);
+    assert.equal(timers.size, 0);
+  }
+});
+
 test('stream matrix permanent reconnect error cleans managed and stored state', async () => {
   const utils = loadUtils();
   const streams = loadExpressionModule('application/domain/ts/streams.js', { lib: makeLib() });
@@ -2364,11 +2503,28 @@ test('stream addBarchart normalizes symbol contract and rejects empty symbol', a
   assert.ok(streamChartsArgs);
   assert.equal(streamChartsArgs.endpoint.join('/'), 'marketdata/stream/barcharts/CRWV 280121C80');
   assert.equal(streamChartsArgs.symbol, 'CRWV 280121C80');
+  assert.equal(streamChartsArgs.data.interval, '60');
+  assert.equal(streamChartsArgs.data.unit, 'Minute');
+  assert.equal(streamChartsArgs.data.barsback, '100');
+  assert.equal(streamChartsArgs.data.sessiontemplate, 'USEQ24Hour');
+  assert.equal((await barchartApi.method({ symbol: 'CRWV280121C00080000', streamKey: 'another-subscription' })).code, 'ESTREAMKEY');
 });
 
-test('stream addBarchart emits canonical symbol for TS-style input', async () => {
+test('stream addBarchart preserves raw TS bars and rejects malformed and control packets', async () => {
   const utils = loadUtils();
-  let emitted = null;
+  const events = [];
+  let onData = null;
+  const bar = Object.freeze({
+    Open: '1.25',
+    High: '1.50',
+    Low: '1.10',
+    Close: '1.40',
+    Epoch: 1792159200000,
+    TimeStamp: '2026-10-16T14:00:00Z',
+    IsRealtime: true,
+    IsEndOfHistory: false,
+    OpenInterest: '17',
+  });
 
   const barchartApi = loadExpressionModule('application/api/stream/addBarchart.js', {
     DomainError: class DomainError extends Error {
@@ -2385,7 +2541,7 @@ test('stream addBarchart emits canonical symbol for TS-style input', async () =>
           getClient: async () => ({
             buildStreamKey: () => 'charts-key',
             streamCharts: async (args) => {
-              await args.onData({ Open: 1 });
+              onData = args.onData;
               return 'charts-registered-key';
             },
             stopStoredStream: async () => {},
@@ -2396,7 +2552,7 @@ test('stream addBarchart emits canonical symbol for TS-style input', async () =>
             await start({
               notifyError: () => {},
               emit: (eventName, payload) => {
-                emitted = { eventName, payload };
+                events.push({ eventName, payload });
               },
             });
             return { ok: true };
@@ -2410,20 +2566,180 @@ test('stream addBarchart emits canonical symbol for TS-style input', async () =>
   });
 
   const result = await barchartApi.method({
-    symbol: 'CRWV 280121C80',
-    period: 3600,
+    symbol: 'RDW 270115C10',
+    period: '3600',
     limit: 100,
   });
 
   assert.deepEqual(result, { ok: true });
+  onData(bar);
+  const emitted = events[0];
   assert.ok(emitted);
   assert.equal(emitted.eventName, 'stream/barchart');
-  assert.equal(emitted.payload.instrument.symbol, 'CRWV280121C00080000');
+  assert.equal(emitted.payload.streamKey, 'charts-key');
+  assert.equal(emitted.payload.period, 3600);
+  assert.equal(emitted.payload.bar, bar);
+  assert.equal(Object.hasOwn(emitted.payload.bar, 'TotalVolume'), false);
+  assert.equal(emitted.payload.instrument.symbol, 'RDW270115C00010000');
   assert.equal(emitted.payload.instrument.asset_category, 'OPT');
   assert.equal(emitted.payload.instrument.source, 'TS');
   assert.equal(emitted.payload.instrument.listing_exchange, 'TS');
   assert.equal(emitted.payload.instrument.currency, 'USD');
   assert.equal(emitted.payload.symbol, undefined);
+  const zeroVolumeBar = Object.freeze({ ...bar, Open: 0, High: 0, Low: 0, Close: 0, TotalVolume: '0' });
+  onData(zeroVolumeBar);
+  assert.equal(events[1].payload.bar, zeroVolumeBar);
+
+  for (const packet of [null, [], 'bar', {}, { Open: 1 }, { StreamStatus: 'GoAway' }, { Heartbeat: 1 }]) onData(packet);
+  for (const field of ['Open', 'High', 'Low', 'Close', 'Epoch']) {
+    const missing = { ...bar };
+    delete missing[field];
+    onData(missing);
+    for (const value of [null, '', ' ', true, [], {}, 'NaN', NaN, Infinity]) onData({ ...bar, [field]: value });
+  }
+  for (const Epoch of [0, -1, 1.5, '1792159200000', Number.MAX_SAFE_INTEGER + 1]) onData({ ...bar, Epoch });
+  for (const control of [{ StreamStatus: 'Unknown' }, { Error: 'NO_DATA' }, { Heartbeat: 0 }, { Status: 'Unknown' }]) {
+    onData({ ...bar, ...control });
+  }
+  assert.equal(events.length, 2);
+});
+
+test('stream addBarchart owns exact keys and manages recovery and permanent errors', async () => {
+  const utils = loadUtils();
+  const timers = new Map();
+  const connections = [];
+  let clock = 0;
+  const globals = {
+    setTimeout: (fn, delay) => {
+      const timer = { fn, at: clock + delay };
+      timers.set(timer, timer);
+      return timer;
+    },
+    clearTimeout: (timer) => timers.delete(timer),
+  };
+  const flush = async () => {
+    for (let turn = 0; turn < 30; turn += 1) await Promise.resolve();
+  };
+  const streamFactory = loadExpressionModule('application/lib/ts/stream.js', {
+    ...globals,
+    lib: { utils },
+    fetch: async (url, { signal }) => {
+      const connection = { url, signal, deliver: null };
+      connections.push(connection);
+      return {
+        ok: true,
+        body: {
+          getReader: () => ({
+            read: () =>
+              new Promise((resolve) => {
+                connection.deliver = (packet) => resolve({ done: false, value: new TextEncoder().encode(`${JSON.stringify(packet)}\n`) });
+              }),
+          }),
+        },
+      };
+    },
+  });
+  const factory = loadExpressionModule('application/domain/ts/client.js', { lib: { utils, ts: { stream: streamFactory } } });
+  const tsClient = await factory();
+  const streams = loadExpressionModule('application/domain/ts/streams.js', { ...globals, lib: makeLib() });
+  const client = new EventEmitter();
+  const otherClient = new EventEmitter();
+  const errors = [];
+  const statuses = [];
+  const bars = [];
+  client.on('stream/error', (payload) => errors.push(payload));
+  client.on('stream/status', (payload) => statuses.push(payload));
+  client.on('stream/barchart', (payload) => bars.push(payload));
+  const apiFor = (subscriber) =>
+    loadExpressionModule('application/api/stream/addBarchart.js', {
+      DomainError: class DomainError extends Error {
+        constructor(code) {
+          super(code);
+          this.code = code;
+        }
+      },
+      context: { client: subscriber },
+      domain: { ts: { clients: { getClient: async () => tsClient }, streams } },
+      lib: { utils },
+    });
+  const api = apiFor(client);
+  const otherApi = apiFor(otherClient);
+  try {
+    const first = await api.method({ symbol: 'RDW 270115C10', period: 3600 });
+    const key = first.streamKey;
+    const duplicate = await api.method({ symbol: 'RDW270115C00010000', period: '3600', streamKey: key });
+    await otherApi.method({ symbol: 'RDW 270115C10', period: 3600 });
+    assert.equal(duplicate.streamKey, key);
+    assert.equal(duplicate.created, false);
+    assert.equal(connections.length, 1);
+    assert.equal((await api.method({ symbol: 'RDW 270115C10', period: 60, streamKey: key })).code, 'ESTREAMKEY');
+    const second = await api.method({ symbol: 'TSLA 270115C400', period: 60 });
+    assert.notEqual(second.streamKey, key);
+    assert.equal(connections.length, 2);
+    assert.equal((await otherApi.method({ action: 'unsubscribe', streamKey: key })).removed, true);
+    assert.equal(connections[0].signal.aborted, false);
+    assert.equal((await otherApi.method({ action: 'unsubscribe', streamKey: key })).removed, false);
+    assert.equal((await api.method({ action: 'touch', streamKey: key })).active, true);
+
+    connections[0].deliver({ StreamStatus: 'GoAway' });
+    await flush();
+    const recovering = await api.method({ action: 'touch', streamKey: key });
+    assert.equal(recovering.recovering, true);
+    assert.equal(recovering.resubscribeRequired, false);
+    assert.equal(statuses.at(-1).terminal, false);
+    assert.equal(errors.length, 0);
+    clock += 10000;
+    for (const timer of Array.from(timers.values())) {
+      if (timer.at <= clock && timers.delete(timer)) await timer.fn();
+    }
+    assert.equal(connections.length, 3);
+    assert.equal((await api.method({ action: 'touch', streamKey: key })).active, true);
+    assert.equal(statuses.at(-1).state, 'active');
+    const bar = { Open: '10', High: '12', Low: '9', Close: '11', Epoch: 1792159200000, TotalVolume: '0' };
+    connections[1].deliver(bar);
+    connections[2].deliver(bar);
+    await flush();
+    assert.equal(bars.length, 2);
+    assert.equal(bars.find((event) => event.streamKey === key).period, 3600);
+    const tsla = bars.find((event) => event.streamKey === second.streamKey);
+    assert.equal(tsla.period, 60);
+    assert.equal(tsla.instrument.symbol, 'TSLA270115C00400000');
+    assert.equal(tsla.instrument.source, 'TS');
+    assert.deepEqual(tsla.bar, bar);
+
+    for (const packet of [
+      { Error: 'NO_DATA' },
+      { Error: 'Failed', Message: 'rpc error: code = InvalidArgument desc = no data available' },
+      { Error: 'INVALID SYMBOL', Message: 'bad symbol' },
+    ]) {
+      const subscription = await api.method({ symbol: 'RDW 270115C10', period: 3600 });
+      connections.at(-1).deliver(packet);
+      await flush();
+      assert.equal(errors.at(-1).streamKey, subscription.streamKey);
+      assert.equal(errors.at(-1).terminal, true);
+      assert.equal(errors.at(-1).error.reconnectable, false);
+      assert.equal(errors.at(-1).error.code, packet.Error === 'INVALID SYMBOL' ? 'INVALID SYMBOL' : 'NO_DATA');
+      assert.equal((await api.method({ action: 'touch', streamKey: subscription.streamKey })).active, false);
+      assert.equal((await api.method({ action: 'unsubscribe', streamKey: subscription.streamKey })).removed, false);
+      assert.equal((await api.method({ action: 'touch', streamKey: second.streamKey })).active, true);
+      const count = connections.length;
+      clock += 10000;
+      for (const timer of Array.from(timers.values())) {
+        if (timer.at <= clock && timers.delete(timer)) await timer.fn();
+      }
+      assert.equal(connections.length, count);
+    }
+    assert.equal(errors.length, 3);
+    assert.equal((await api.method({ action: 'unsubscribe', streamKey: second.streamKey })).removed, true);
+    assert.equal((await api.method({ action: 'unsubscribe', streamKey: second.streamKey })).removed, false);
+    assert.equal(connections[1].signal.aborted, true);
+  } finally {
+    await streams.unsubscribeAll({ client });
+    await streams.unsubscribeAll({ client: otherClient });
+  }
+  assert.equal(timers.size, 0);
+  assert.equal(client.listenerCount('close'), 0);
+  assert.equal(otherClient.listenerCount('close'), 0);
 });
 
 test('stream optionChain emits root instrument payload while preserving chain symbols', async () => {
@@ -2804,6 +3120,205 @@ test('marketdata barcharts returns EINSTRUMENT for null or empty instrument inpu
   const emptyResult = await barcharts.method({ instrument: { symbol: '' } });
   assert.ok(emptyResult instanceof DomainError);
   assert.equal(emptyResult.code, 'EINSTRUMENT');
+});
+
+async function makeChainLifecycle() {
+  const requests = [];
+  const timers = [];
+  const globals = {
+    console: { debug() {}, log() {}, warn() {}, error() {} },
+    setTimeout: (fn, delay) => {
+      const timer = { fn, delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearTimeout: (timer) => {
+      if (timer) timer.cleared = true;
+    },
+  };
+  const lib = { utils: loadUtils(), ts: {} };
+  lib.ts.readOptionChain = loadExpressionModule('application/lib/ts/readOptionChain.js', { lib });
+  lib.ts.stream = loadExpressionModule('application/lib/ts/stream.js', {
+    ...globals,
+    lib,
+    fetch: (url, { signal }) =>
+      new Promise((resolve, reject) => {
+        let controller;
+        const request = { signal, opened: false, closed: false };
+        const body = new ReadableStream({
+          start: (value) => {
+            controller = value;
+          },
+          cancel: () => {
+            request.closed = true;
+          },
+        });
+        signal.addEventListener(
+          'abort',
+          () => {
+            if (request.opened && !request.closed) {
+              controller.close();
+              request.closed = true;
+            }
+          },
+          { once: true },
+        );
+        request.reject = reject;
+        request.respond = () => {
+          request.opened = true;
+          resolve({ ok: true, body });
+        };
+        request.packet = (
+          message = {
+            Legs: [{ Symbol: 'CRWV280121C00080000', Expiration: '2028-01-21T00:00:00Z', OptionType: 'Call' }],
+          },
+        ) => controller.enqueue(new TextEncoder().encode(`${JSON.stringify(message)}\n`));
+        requests.push(request);
+      }),
+  });
+  const client = await loadExpressionModule('application/domain/ts/client.js', { ...globals, lib })();
+  const streams = loadExpressionModule('application/domain/ts/streams.js', { ...globals, lib });
+  const domain = { ts: { clients: { getClient: async () => client }, streams } };
+  const args = {
+    endpoint: ['marketdata', 'stream', 'options', 'chains', 'CRWV'],
+    symbol: 'CRWV',
+    data: { expiration: '2028-01-21', strikeProximity: 1, optionType: 'Call' },
+  };
+  const managed = loadExpressionModule('application/lib/stream/optionChain.js', { ...globals, domain, lib });
+  const snapshot = loadExpressionModule('application/lib/ts/optionChain.js', { ...globals, domain, lib });
+  return {
+    client,
+    streams,
+    requests,
+    timers,
+    managed: (consumer, action = 'subscribe') => managed({ ...args, client: consumer, action }),
+    snapshot: () => snapshot(args),
+    flush: async () => {
+      for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    },
+    active: () => requests.filter((request) => request.opened && !request.closed).length,
+  };
+}
+
+test('managed chains multiplex while same-parameter snapshots complete or fail independently', async () => {
+  const h = await makeChainLifecycle();
+  const first = new EventEmitter();
+  const second = new EventEmitter();
+  const events = [];
+  second.on('stream/chain', (packet) => events.push(packet));
+  const subscribing = Promise.all([h.managed(first), h.managed(second)]);
+  await h.flush();
+  assert.equal(h.requests.length, 1);
+  h.requests[0].respond();
+  const [a, b] = await subscribing;
+  assert.equal(a.streamKey, b.streamKey);
+  assert.equal(b.subscribers, 2);
+  assert.equal(h.streams.entries.chains.size, 1);
+
+  for (const fail of [false, true]) {
+    const pending = h.snapshot();
+    const outcome = pending.catch((error) => error);
+    await h.flush();
+    const request = h.requests.at(-1);
+    request.respond();
+    await h.flush();
+    assert.equal(h.active(), 2);
+    if (fail) {
+      request.packet({ Error: 'INVALID SYMBOL', Message: 'bad symbol' });
+    } else {
+      request.packet();
+      await h.flush();
+      request.packet({
+        Legs: [{ Symbol: 'CRWV280121C00075000', Expiration: '2028-01-21T00:00:00Z', OptionType: 'Call' }],
+      });
+    }
+    const result = await outcome;
+    if (fail) {
+      assert.equal(result.code, 'INVALID SYMBOL');
+    } else {
+      assert.equal(result.strikes, 2);
+      assert.equal(result.metadata.reason, 'complete');
+    }
+    assert.equal(request.closed, true);
+    assert.equal(h.active(), 1);
+    const delivered = events.length;
+    h.requests[0].packet();
+    await h.flush();
+    assert.equal(events.length, delivered + 1);
+    assert.equal(events.at(-1).streamKey, a.streamKey);
+  }
+  await h.managed(first, 'unsubscribe');
+  const touched = await h.managed(second, 'touch');
+  assert.equal(touched.active, true);
+  assert.equal(touched.subscribers, 1);
+  assert.equal(touched.streamKey, a.streamKey);
+  assert.equal(h.active(), 1);
+  await h.managed(second, 'unsubscribe');
+  assert.equal(h.active(), 0);
+  assert.equal(h.streams.entries.chains.size, 0);
+  assert.equal(Object.keys(h.client.streams.chains).length, 0);
+});
+
+test('snapshot timeout and client close release pending and late HTTP chain responses', async () => {
+  const h = await makeChainLifecycle();
+  const pending = h.snapshot();
+  await h.flush();
+  const request = h.requests[0];
+  h.timers.find((timer) => timer.delay === 5000).fn();
+  assert.equal((await pending).metadata.reason, 'timeout');
+  assert.equal(request.signal.aborted, true);
+  request.respond();
+  await h.flush();
+  assert.equal(h.active(), 0);
+  assert.equal(Object.keys(h.client.streams.chains).length, 0);
+
+  const failure = new Error('connection failed');
+  const failed = h.snapshot();
+  const rejected = assert.rejects(failed, (error) => error === failure);
+  await h.flush();
+  h.requests[1].reject(failure);
+  await rejected;
+  assert.equal(Object.keys(h.client.streams.chains).length, 0);
+
+  const consumer = new EventEmitter();
+  const subscribing = h.managed(consumer);
+  await h.flush();
+  const late = h.requests[2];
+  await h.client.close();
+  assert.equal(late.signal.aborted, true);
+  late.respond();
+  await assert.rejects(subscribing, /cancelled/);
+  assert.equal(h.active(), 0);
+  assert.equal(Object.keys(h.client.streams.chains).length, 0);
+  assert.equal(h.streams.entries.chains.size, 0);
+  await assert.rejects(h.snapshot(), /closed/);
+  assert.equal(h.requests.length, 3);
+});
+
+test('late managed startup cleanup cannot close a newer subscription with the same streamKey', async () => {
+  const h = await makeChainLifecycle();
+  const consumer = new EventEmitter();
+  const events = [];
+  consumer.on('stream/chain', (packet) => events.push(packet));
+  const old = h.managed(consumer);
+  await h.flush();
+  await h.managed(consumer, 'unsubscribe');
+  const newer = h.managed(consumer);
+  await h.flush();
+  h.requests[1].respond();
+  const subscribed = await newer;
+  h.requests[0].respond();
+  await old;
+  assert.equal(h.requests[0].closed, true);
+  assert.equal(h.active(), 1);
+  h.requests[1].packet();
+  await h.flush();
+  assert.equal(events.length, 1);
+  assert.equal(events[0].streamKey, subscribed.streamKey);
+  assert.equal((await h.managed(consumer, 'touch')).active, true);
+  await h.managed(consumer, 'unsubscribe');
+  assert.equal(h.active(), 0);
+  assert.equal(Object.keys(h.client.streams.chains).length, 0);
 });
 
 test('optionChain rejects object errors with a readable message', async () => {
@@ -3604,6 +4119,79 @@ test('orders state merges partial packets, validates shape and suppresses duplic
   assert.equal(orders.get({ live: true, account: 'A1', orderId: 'O1' }), null);
 });
 
+const orderError = loadExpressionModule('application/lib/ts/orderError.js');
+
+test('orderError classifies confirmed 404 only for exact reads and selects safe diagnostics', () => {
+  for (const exact of [false, true]) {
+    for (const validErrorResponse of [undefined, false, true]) {
+      const error = Object.assign(new Error('HTTP 404'), {
+        status: 404,
+        validErrorResponse,
+        upstream: { brokerMessage: 'Order not found', requestId: 'request-123', debug: 'payload-secret' },
+      });
+      const result = orderError({ error, exact });
+      assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+        miss: exact && validErrorResponse === true,
+        brokerMessage: 'Order not found',
+        requestId: 'request-123',
+      });
+      const malformed = exact && validErrorResponse !== true;
+      assert.equal(error.code, malformed ? 'ERESPONSE' : undefined);
+      assert.equal(error.retryable, malformed ? false : undefined);
+    }
+  }
+  for (const status of [401, 403, 429, 500, 502, undefined]) {
+    const error = Object.assign(new Error('unavailable'), { status, validErrorResponse: true });
+    assert.deepEqual(JSON.parse(JSON.stringify(orderError({ error, exact: true }))), {
+      miss: false,
+      brokerMessage: null,
+      requestId: null,
+    });
+    assert.equal(error.code, undefined);
+    assert.equal(error.retryable, undefined);
+  }
+});
+
+test('generic TradeStation send treats 404 equally across endpoints without classifying an order miss', async () => {
+  const source = fs.readFileSync(path.join(repoRoot, 'application/lib/ts/send.js'), 'utf8');
+  assert.doesNotMatch(source, /\b(exactOrders|readContext|orderLookupMiss|orders|historicalorders|current|historical)\b/);
+  for (const endpoint of [
+    ['brokerage', 'accounts', 'A1', 'orders', 'O1'],
+    ['brokerage', 'accounts', 'A1', 'historicalorders', 'O1'],
+    ['brokerage', 'accounts', 'A1', 'orders'],
+    ['marketdata', 'quotes', 'TSLA'],
+  ]) {
+    for (const body of ['{"Message":"Resource not found","StatusCode":404}', '<html>proxy error</html>']) {
+      let attempts = 0;
+      const send = loadExpressionModule('application/lib/ts/send.js', {
+        console: { error: () => {} },
+        fetch: async () => {
+          attempts += 1;
+          return new Response(body, { status: 404, headers: { 'content-type': 'application/json', 'retry-after': '2' } });
+        },
+        lib: { utils: { constructDomain: () => 'https://sim.example', constructURL: () => 'https://sim.example/resource' } },
+      });
+      const meta = {};
+      await assert.rejects(send({ method: 'GET', endpoint, token: 'access-secret', meta }), (error) => {
+        assert.equal(error.status, 404);
+        assert.equal(error.validErrorResponse, body.startsWith('{'));
+        assert.equal(error.retryAfter, '2');
+        assert.equal(error.code, undefined);
+        assert.equal(error.retryable, undefined);
+        assert.equal(Object.hasOwn(error, 'orderLookupMiss'), false);
+        assert.deepEqual(Object.keys(error.upstream), ['brokerMessage', 'requestId']);
+        return true;
+      });
+      assert.equal(meta.status, 404);
+      assert.equal(meta.retryAfter, '2');
+      assert.equal(meta.phase, 'response');
+      assert.ok(meta.headersDurationMs >= 0);
+      assert.ok(meta.bodyDurationMs >= 0);
+      assert.equal(attempts, 1);
+    }
+  }
+});
+
 test('orders REST helper normalizes empty nullable fields and rejects malformed shapes', async () => {
   const responses = [
     {},
@@ -3615,6 +4203,7 @@ test('orders REST helper normalizes empty nullable fields and rejects malformed 
   const helper = loadExpressionModule('application/lib/ts/orders.js', {
     lib: {
       ts: {
+        orderError,
         send: async (payload) => {
           calls.push(payload);
           return responses.shift();
@@ -3639,6 +4228,265 @@ test('orders REST helper normalizes empty nullable fields and rejects malformed 
   await assert.rejects(helper({ account: 'A1', live: true, token: 'token' }), /Orders/);
 });
 
+test('exact orders 404 reaches RPC as empty with receiver-sensitive console only for current or explicit historical range', async () => {
+  for (const historical of [false, true]) {
+    for (const body of [{ Message: 'Order not found' }, { Error: 'NotFound', Message: 'Order not found', StatusCode: 404 }]) {
+      const calls = [];
+      const globals = {
+        console: {
+          entries: [],
+          log(...args) {
+            this.entries.push(args);
+          },
+          error(...args) {
+            this.entries.push(args);
+          },
+        },
+        fetch: async (url) => {
+          calls.push(url);
+          return new Response(JSON.stringify(body), { status: 404, headers: { 'content-type': 'application/json; charset=utf-8' } });
+        },
+        lib: {
+          utils: {
+            constructDomain: () => 'https://sim.example',
+            constructURL: (method, domain, endpoint, data) => `${domain}/${endpoint.join('/')}?${new URLSearchParams(data)}`,
+          },
+          ts: { orderError },
+        },
+        domain: { ts: { clients: { getClient: async () => ({ tokens: { access: 'access-secret' } }) } } },
+      };
+      globals.lib.ts.send = loadExpressionModule('application/lib/ts/send.js', globals);
+      globals.lib.ts.orders = loadExpressionModule('application/lib/ts/orders.js', globals);
+      globals.lib.ts.ordersBatch = loadExpressionModule('application/lib/ts/ordersBatch.js', globals);
+      const api = loadExpressionModule(`application/api/account/${historical ? 'historicalorders' : 'orders'}.js`, globals);
+      const input = { contracts: [{ account: 'A1', live: false }], orders: ['O1'], start: '2020-01-01' };
+      assert.deepEqual(JSON.parse(JSON.stringify(await api.method(input))), []);
+      assert.equal(globals.console.entries.filter(([, entry]) => entry.state === 'miss').length, 1);
+      assert.equal(calls.length, 1);
+      assert.ok(calls[0].includes(`/accounts/A1/${historical ? 'historicalorders' : 'orders'}/O1`));
+      assert.equal(calls[0].includes('since=2020-01-01'), historical);
+
+      await assert.rejects(api.method({ ...input, orders: [] }), (error) => error.status === 404);
+      assert.equal(calls.length, 2);
+      if (historical) {
+        await assert.rejects(api.method({ ...input, start: null }), (error) => error.code === 'EHISTORICALSTART');
+        assert.equal(calls.length, 2);
+      }
+    }
+  }
+});
+
+test('exact orders reject malformed 404 through the real send helper without retry', async () => {
+  for (const historical of [false, true]) {
+    for (const [body, contentType] of [
+      ['<html>proxy not found</html>', 'text/html'],
+      ['garbage', 'application/json'],
+      ['', 'application/json'],
+      ['{"Message":', 'application/json'],
+      ['null', 'application/json'],
+      ['[]', 'application/json'],
+      ['"Order not found"', 'application/json'],
+      ['{}', 'application/json'],
+      ['{"error":"proxy not found"}', 'application/json'],
+      ['{"Message":null}', 'application/json'],
+      ['{"Message":{}}', 'application/json'],
+      ['{"Message":"   "}', 'application/json'],
+      ['{"Message":"Order not found","Error":{}}', 'application/json'],
+      ['{"Message":"Order not found","StatusCode":500}', 'application/json'],
+      ['{"Message":"Order not found"}', 'text/html'],
+    ]) {
+      let attempts = 0;
+      const globals = {
+        console: { log: () => {}, error: () => {} },
+        fetch: async () => {
+          attempts += 1;
+          return new Response(body, { status: 404, headers: { 'content-type': contentType } });
+        },
+        lib: {
+          utils: { constructDomain: () => 'https://sim.example', constructURL: () => 'https://sim.example/orders/O1' },
+          ts: { orderError },
+        },
+      };
+      globals.lib.ts.send = loadExpressionModule('application/lib/ts/send.js', globals);
+      const helper = loadExpressionModule('application/lib/ts/orders.js', globals);
+      await assert.rejects(helper({ account: 'A1', orderIds: ['O1'], historical, start: '2020-01-01' }), (error) => {
+        assert.equal(error.status, 404);
+        assert.equal(error.code, 'ERESPONSE');
+        return true;
+      });
+      assert.equal(attempts, 1);
+    }
+  }
+});
+
+test('exact historical requires nonblank explicit start before sending; historical lists retain default', async () => {
+  const calls = [];
+  const helper = loadExpressionModule('application/lib/ts/orders.js', {
+    console: { log: () => {}, error: () => {} },
+    lib: {
+      ts: {
+        orderError,
+        send: async (payload) => {
+          calls.push(payload);
+          return { Orders: [] };
+        },
+      },
+    },
+  });
+  for (const start of [undefined, null, '', '   ', false, 0]) {
+    await assert.rejects(helper({ account: 'A1', orderIds: ['O1'], historical: true, start }), (error) => {
+      assert.equal(error.code, 'EHISTORICALSTART');
+      assert.equal(error.retryable, false);
+      return /explicit start/.test(error.message);
+    });
+  }
+  assert.equal(calls.length, 0);
+  await helper({ account: 'A1', historical: true, orderIds: [] });
+  const since = new Date(new Date().setMonth(new Date().getMonth() - 1)).toISOString().split('T')[0];
+  assert.equal(calls[0].data.since, since);
+  assert.equal(calls[0].endpoint.length, 4);
+});
+
+test('exact orders preserve auth, transient, transport and malformed errors', async () => {
+  const failures = [
+    ...[401, 403, 429, 500, 502, 503, 504].map((status) => Object.assign(new Error(`HTTP ${status}`), { status })),
+    Object.assign(new Error('network'), { code: 'ECONNRESET' }),
+    Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }),
+    Object.assign(new Error('malformed JSON'), { code: 'ERESPONSE', status: 404 }),
+  ];
+  for (const historical of [false, true]) {
+    for (const failure of failures) {
+      let attempts = 0;
+      const helper = loadExpressionModule('application/lib/ts/orders.js', {
+        console: { log: () => {}, error: () => {} },
+        setTimeout: (fn, delay) => {
+          if (delay === 100) Promise.resolve().then(fn);
+          return null;
+        },
+        clearTimeout: () => {},
+        lib: {
+          ts: {
+            orderError,
+            send: async () => {
+              attempts += 1;
+              throw failure;
+            },
+          },
+        },
+      });
+      await assert.rejects(helper({ account: 'A1', orderIds: ['O1'], historical, start: '2020-01-01' }), (error) => error === failure);
+      const retry = [429, 502, 503, 504].includes(failure.status) || ['ECONNRESET', 'ETIMEDOUT', 'ETIMEOUT'].includes(failure.code);
+      assert.equal(attempts, retry ? 2 : 1);
+    }
+    for (const response of [
+      null,
+      [],
+      {},
+      { Orders: null },
+      { Orders: {} },
+      { Errors: {} },
+      { Orders: [null] },
+      { Orders: ['O1'] },
+      { Orders: [{}] },
+      { Orders: [{ OrderID: '' }] },
+    ]) {
+      let attempts = 0;
+      const helper = loadExpressionModule('application/lib/ts/orders.js', {
+        console: { log: () => {}, error: () => {} },
+        lib: {
+          ts: {
+            orderError,
+            send: async () => {
+              attempts += 1;
+              return response;
+            },
+          },
+        },
+      });
+      await assert.rejects(
+        helper({ account: 'A1', orderIds: ['O1'], historical, start: '2020-01-01' }),
+        (error) => error.code === 'ERESPONSE',
+      );
+      assert.equal(attempts, 1);
+    }
+  }
+});
+
+test('exact orders diagnostics allow only bounded broker fields and safe request IDs', async () => {
+  for (const [body, headers, message, requestId] of [
+    [
+      { Message: 'Order not found', RequestID: 'body-123', Authorization: 'Bearer access-secret', debug: 'body-secret' },
+      new Map([
+        ['x-request-id', 'header-123'],
+        ['set-cookie', 'cookie-secret'],
+      ]),
+      'Order not found',
+      'header-123',
+    ],
+    [
+      { Errors: [{ Message: 'Order unavailable', requestId: 'body-456', token: 'access-secret' }] },
+      new Map(),
+      'Order unavailable',
+      'body-456',
+    ],
+    [{ Message: 'Authorization: Bearer access-secret', RequestID: 'access-secret' }, new Map(), null, null],
+    [{ Message: 'cookie=cookie-secret' }, new Map([['x-request-id', 'Bearer access-secret']]), null, null],
+    [{ Message: 'm'.repeat(257), RequestID: 'r'.repeat(129) }, new Map(), null, null],
+    ['raw-body-secret', new Map(), null, null],
+  ]) {
+    const logs = [];
+    const globals = {
+      console: { error: (...args) => logs.push(args), log: (...args) => logs.push(args) },
+      fetch: async () => ({
+        ok: false,
+        status: 404,
+        statusText: 'Not Found',
+        headers,
+        text: async () => (typeof body === 'string' ? body : JSON.stringify(body)),
+      }),
+      lib: {
+        utils: { constructDomain: () => 'https://sim.example', constructURL: () => 'https://sim.example/orders/O1' },
+        ts: { orderError },
+      },
+    };
+    const send = loadExpressionModule('application/lib/ts/send.js', globals);
+    await assert.rejects(
+      send({ method: 'GET', endpoint: ['brokerage', 'accounts', 'A1', 'orders', 'O1'], token: 'access-secret' }),
+      (error) => {
+        assert.equal(error.upstream.brokerMessage, message);
+        assert.equal(error.upstream.requestId, requestId);
+        return error.status === 404;
+      },
+    );
+    globals.lib.ts.send = send;
+    const orders = loadExpressionModule('application/lib/ts/orders.js', globals);
+    const input = { account: 'A1', orderIds: ['O1'], token: 'access-secret' };
+    if (typeof body === 'object' && typeof body.Message === 'string') {
+      assert.deepEqual(JSON.parse(JSON.stringify(await orders(input))), { errors: [], orders: [] });
+    } else {
+      await assert.rejects(orders(input), (error) => error.code === 'ERESPONSE' && error.status === 404);
+    }
+    for (const [label, log] of logs) {
+      if (log.state === 'start') continue;
+      if (label === 'TradeStation orders read:') {
+        assert.equal(log.httpStatus, 404);
+        assert.equal(log.endpoint, 'brokerage/accounts/A1/orders/O1');
+        assert.equal(log.mode, 'current');
+        assert.equal(log.account, 'A1');
+      } else {
+        assert.equal(log.status, 404);
+        for (const key of ['endpoint', 'mode', 'account']) assert.equal(Object.hasOwn(log, key), false);
+      }
+      assert.equal(log.brokerMessage, message);
+      assert.equal(log.requestId, requestId);
+    }
+    const serialized = JSON.stringify(logs);
+    for (const secret of ['access-secret', 'body-secret', 'cookie-secret', 'raw-body-secret']) {
+      assert.equal(serialized.includes(secret), false);
+    }
+  }
+});
+
 test('orders REST helper retries only transient reads and keeps request semantics', async () => {
   for (const status of [408, 429, 502, 503, 504]) {
     let attempts = 0;
@@ -3653,6 +4501,7 @@ test('orders REST helper retries only transient reads and keeps request semantic
       },
       lib: {
         ts: {
+          orderError,
           send: async (payload) => {
             attempts += 1;
             assert.equal(payload.method, 'GET');
@@ -3690,6 +4539,7 @@ test('orders REST helper retries only transient reads and keeps request semantic
       },
       lib: {
         ts: {
+          orderError,
           send: async () => {
             attempts += 1;
             throw Object.assign(new Error(`HTTP ${status}`), { status });
@@ -3708,6 +4558,7 @@ test('orders REST helper retries only transient reads and keeps request semantic
     const helper = loadExpressionModule('application/lib/ts/orders.js', {
       lib: {
         ts: {
+          orderError,
           send: async () => {
             attempts += 1;
             throw Object.assign(new Error(`HTTP ${status}`), { status });
@@ -3727,6 +4578,7 @@ test('orders REST helper retries only transient reads and keeps request semantic
     const helper = loadExpressionModule('application/lib/ts/orders.js', {
       lib: {
         ts: {
+          orderError,
           send: async () => {
             attempts += 1;
             throw error;
@@ -3752,6 +4604,7 @@ test('orders REST helper bounds network and read timeouts to two attempts', asyn
     },
     lib: {
       ts: {
+        orderError,
         send: async () => {
           networkAttempts += 1;
           if (networkAttempts === 1) {
@@ -3777,6 +4630,7 @@ test('orders REST helper bounds network and read timeouts to two attempts', asyn
     },
     lib: {
       ts: {
+        orderError,
         send: ({ signal }) => {
           timeoutAttempts += 1;
           return new Promise((resolve, reject) => {
@@ -3807,6 +4661,7 @@ test('orders REST helper bounds native fetch DNS and connect timeout failures', 
         },
         lib: {
           ts: {
+            orderError,
             send: async () => {
               attempts += 1;
               if (recover && attempts === 2) return { Errors: [], Orders: [{ OrderID: code }] };
@@ -3837,6 +4692,7 @@ test('orders REST helper rejects application TypeError without retry', async () 
     const helper = loadExpressionModule('application/lib/ts/orders.js', {
       lib: {
         ts: {
+          orderError,
           send: async () => {
             attempts += 1;
             throw error;
@@ -3860,6 +4716,7 @@ test('orders REST helper stops timeout retry when deadline cannot fit backoff', 
     },
     lib: {
       ts: {
+        orderError,
         send: async () => {
           attempts += 1;
           throw Object.assign(new Error('HTTP 408'), { status: 408 });
@@ -3878,6 +4735,7 @@ test('orders REST helper does not retry parent abort or malformed success', asyn
   const aborted = loadExpressionModule('application/lib/ts/orders.js', {
     lib: {
       ts: {
+        orderError,
         send: async () => {
           abortAttempts += 1;
           controller.abort(new Error('batch failed'));
@@ -3893,6 +4751,7 @@ test('orders REST helper does not retry parent abort or malformed success', asyn
   const malformed = loadExpressionModule('application/lib/ts/orders.js', {
     lib: {
       ts: {
+        orderError,
         send: async () => {
           malformedAttempts += 1;
           return { Errors: [], Orders: {} };
@@ -3913,6 +4772,7 @@ test('orders diagnostics include bounded metadata without credentials or payload
     },
     lib: {
       ts: {
+        orderError,
         send: async ({ meta }) => {
           meta.status = 200;
           return { Errors: [], Orders: [{ AccountID: 'A1', OrderID: 'O1', Secret: 'payload-secret' }] };
@@ -4052,6 +4912,314 @@ test('orders batch deadline aborts active reads with ETIMEOUT', async () => {
   await assert.rejects(batch({ contracts: [{ account: 'A1', live: true }], token: 'token' }), (error) => error.code === 'ETIMEOUT');
   assert.equal(signals.length, 1);
   assert.equal(signals[0].aborted, true);
+});
+
+const ordersOutcomeRow = {
+  AccountID: 'A1',
+  OrderID: 'O1',
+  Status: 'ACK',
+  OrderType: 'Market',
+  Currency: 'USD',
+  Duration: 'DAY',
+  OpenedDateTime: '2026-07-01T15:30:00Z',
+  Legs: [{ Symbol: 'TSLA', BuyOrSell: 'Buy', AssetType: 'STOCK', QuantityOrdered: '2', ExecQuantity: '0' }],
+};
+
+test('opt-in orders API retains five accounts when the sixth body reaches the shared deadline', async () => {
+  let expire;
+  let active = 0;
+  let maximum = 0;
+  let finished = 0;
+  const globals = {
+    setTimeout: (fn) => {
+      expire ??= fn;
+      return {};
+    },
+    clearTimeout: () => {},
+    domain: { ts: { clients: { getClient: async () => ({ tokens: { access: 'access-secret' } }) } } },
+    lib: {
+      ts: {
+        orderError,
+        send: async ({ endpoint, live, signal, meta }) => {
+          active += 1;
+          maximum = Math.max(maximum, active);
+          meta.phase = 'body';
+          meta.status = 200;
+          if (endpoint[2] === 'A1' && !live) {
+            await new Promise((resolve, reject) => {
+              signal.addEventListener('abort', () => reject(new Error('access-secret https://private.example')), { once: true });
+            });
+          }
+          await Promise.resolve();
+          active -= 1;
+          finished += 1;
+          return { Orders: [{ ...ordersOutcomeRow, AccountID: endpoint[2], OrderID: `O-${endpoint[2]}` }] };
+        },
+      },
+    },
+  };
+  globals.lib.ts.orders = loadExpressionModule('application/lib/ts/orders.js', globals);
+  globals.lib.ts.ordersBatch = loadExpressionModule('application/lib/ts/ordersBatch.js', globals);
+  const api = loadExpressionModule('application/api/account/historicalorders.js', globals);
+  const contracts = ['A1', 'A2', 'A1', 'A4', 'A5', 'A6'].map((account, index) => ({ account, live: index % 2 === 0 && index > 0 }));
+  const pending = api.method({ contracts, start: '2026-07-01', withOutcomes: true });
+  for (let turn = 0; turn < 40; turn += 1) await Promise.resolve();
+  assert.equal(finished, 5);
+  expire();
+  const result = JSON.parse(JSON.stringify(await pending));
+  assert.equal(maximum, 3);
+  assert.equal(result.complete, false);
+  assert.deepEqual(
+    result.outcomes.map(({ account, live }) => ({ account, live })),
+    contracts,
+  );
+  assert.deepEqual(
+    result.outcomes.map(({ state }) => state),
+    ['timeout', ...Array(5).fill('complete')],
+  );
+  assert.ok(result.outcomes.every(({ source }) => source === 'historical'));
+  assert.equal(result.outcomes.slice(1).flatMap(({ orders }) => orders).length, 5);
+  assert.ok(result.outcomes.slice(1).every(({ account, orders }) => orders[0].OrderID === `O-${account}`));
+  assert.deepEqual(result.outcomes[0].error, { code: 'ETIMEOUT', phase: 'body', httpStatus: 200 });
+  assert.equal(result.outcomes[0].complete, false);
+  assert.doesNotMatch(JSON.stringify(result), /access-secret|https:|NextToken/);
+});
+
+test('opt-in batch isolates transport errors and retains success across global abort with queued accounts', async () => {
+  for (const stop of ['local_error', 'deadline', 'caller_abort']) {
+    let expire;
+    const controller = new AbortController();
+    const started = [];
+    const batch = loadExpressionModule('application/lib/ts/ordersBatch.js', {
+      setTimeout: (fn) => {
+        expire = fn;
+        return {};
+      },
+      clearTimeout: () => {},
+      lib: {
+        ts: {
+          orders: async ({ account, signal }) => {
+            started.push(account);
+            if (account === 'A1') {
+              return { orders: [{ OrderID: 'O1' }], outcome: { state: 'complete', complete: true, hasMore: false } };
+            }
+            if (stop === 'local_error') {
+              throw Object.assign(new Error('access-secret https://private.example'), {
+                cause: { code: 'ECONNRESET' },
+                phase: 'body',
+                httpStatus: 502,
+              });
+            }
+            return await new Promise((resolve, reject) => {
+              signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+            });
+          },
+        },
+      },
+    });
+    const pending = batch({
+      contracts: Array.from({ length: 6 }, (_, index) => ({ account: `A${index + 1}`, live: true })),
+      token: 'access-secret',
+      withOutcomes: true,
+      signal: controller.signal,
+    });
+    for (let turn = 0; turn < 20; turn += 1) await Promise.resolve();
+    if (stop === 'caller_abort') {
+      controller.abort(new Error('caller cancelled'));
+      await assert.rejects(pending, /caller cancelled/);
+      continue;
+    }
+    if (stop === 'deadline') expire();
+    const result = JSON.parse(JSON.stringify(await pending));
+    assert.equal(result.complete, false);
+    assert.deepEqual(result.outcomes[0].orders, [{ OrderID: 'O1' }]);
+    assert.equal(result.outcomes[0].state, 'complete');
+    if (stop === 'deadline') {
+      assert.deepEqual(
+        result.outcomes.map(({ state }) => state),
+        ['complete', 'timeout', 'timeout', 'timeout', 'not_started', 'not_started'],
+      );
+      assert.equal(started.length, 4);
+    } else {
+      assert.equal(started.length, 6);
+      assert.ok(result.outcomes.slice(1).every(({ state, error }) => state === 'error' && error.code === 'ECONNRESET'));
+    }
+    assert.doesNotMatch(JSON.stringify(result), /access-secret|https:/);
+  }
+});
+
+test('opt-in orders APIs validate positive rows and completeness metadata without exposing continuation tokens', async () => {
+  const row = ordersOutcomeRow;
+  const filled = { ...row, Status: 'FLL', ClosedDateTime: '2026-07-01T15:31:00Z', Legs: [{ ...row.Legs[0], ExecQuantity: '2' }] };
+  const option = { ...row, Legs: [{ ...row.Legs[0], Symbol: 'TSLA 261218C300', AssetType: 'STOCKOPTION', BuyOrSell: 'BuyToOpen' }] };
+  const invalidRows = [
+    { AccountID: 'A1', OrderID: 'O1', Legs: [{ Symbol: 'TSLA' }] },
+    ...[undefined, '', 'UNKNOWN', 'OTHER', 'ASS', 'BRC'].map((Status) => ({ ...row, Status })),
+    { ...row, Duration: 'DYP' },
+    ...['OrderType', 'Currency', 'Duration', 'OpenedDateTime'].map((field) => ({ ...row, [field]: undefined })),
+    ...[
+      { Symbol: '' },
+      { BuyOrSell: undefined },
+      { BuyOrSell: 'invalid' },
+      { AssetType: undefined },
+      { AssetType: 'UNKNOWN' },
+      ...['FUTURE', 'FUTUREOPTION', 'FOREX', 'CURRENCYOPTION', 'INDEX', 'INDEXOPTION'].map((AssetType) => ({ AssetType })),
+      { QuantityOrdered: undefined },
+      { QuantityOrdered: '' },
+      { QuantityOrdered: null },
+      { QuantityOrdered: true },
+      { QuantityOrdered: 'not-a-number' },
+      { QuantityOrdered: '-1' },
+      { QuantityOrdered: Infinity },
+      { ExecQuantity: 'not-a-number' },
+      { ExecQuantity: null },
+      { ExecQuantity: 'Infinity' },
+      { ExecQuantity: '-1' },
+      { ExecQuantity: '3' },
+    ].map((leg) => ({ ...row, Legs: [{ ...row.Legs[0], ...leg }] })),
+    { ...row, OpenedDateTime: 'today' },
+    { ...row, ClosedDateTime: 'tomorrow' },
+    { ...filled, ClosedDateTime: 'not-a-date' },
+    { ...filled, ClosedDateTime: '2026-06-30T15:30:00Z' },
+    { ...row, OrderType: 'Limit' },
+    { ...row, OrderType: 'Limit', LimitPrice: '210', Legs: [{ ...row.Legs[0], ExecutionPrice: 'not-a-number' }] },
+    { ...row, OrderType: 'StopMarket' },
+    { ...row, OrderType: 'StopLimit', LimitPrice: '210' },
+    { ...row, OrderType: 'StopLimit', StopPrice: '200' },
+    { ...row, OrderType: 'StopLimit', Legs: [{ ...row.Legs[0], ExecutionPrice: '210' }] },
+    { ...row, OrderType: 'Limit', Legs: [{ ...row.Legs[0], ExecutionPrice: '210' }, row.Legs[0]] },
+    ...[undefined, 'not-a-number', '0'].map((ExecQuantity) => ({ ...filled, Legs: [{ ...filled.Legs[0], ExecQuantity }] })),
+  ];
+  const cases = [
+    [{ Orders: [] }, 'complete', false, 0],
+    [{ Orders: [row] }, 'complete', false, 1],
+    [{ Orders: [filled] }, 'complete', false, 1],
+    ...[undefined, null, filled.ClosedDateTime].map((ClosedDateTime) => [
+      { Orders: [{ ...filled, Status: 'FLP', ClosedDateTime, Legs: [{ ...filled.Legs[0], ExecQuantity: '1', QuantityRemaining: '1' }] }] },
+      ClosedDateTime === undefined || ClosedDateTime === null ? 'partial' : 'complete',
+      false,
+      1,
+    ]),
+    ...['DON', 'OPN', 'OUT', 'REJ', 'FAILED'].map((Status) => [{ Orders: [{ ...row, Status }] }, 'complete', false, 1]),
+    ...['DAY+', 'GTC', 'GTC+'].map((Duration) => [{ Orders: [{ ...row, Duration }] }, 'complete', false, 1]),
+    ...[undefined, null].flatMap((ClosedDateTime) => [
+      [{ Orders: [{ ...row, ClosedDateTime }] }, 'complete', false, 1],
+      [{ Orders: [{ ...filled, ClosedDateTime }] }, 'partial', false, 1],
+    ]),
+    ...['Buy', 'Sell', 'SellShort', 'BuyToCover'].map((BuyOrSell) => [
+      { Orders: [{ ...row, Legs: [{ ...row.Legs[0], BuyOrSell }] }] },
+      'complete',
+      false,
+      1,
+    ]),
+    ...['BuyToOpen', 'BuyToClose', 'SellToOpen', 'SellToClose'].flatMap((action) =>
+      [action, action.toUpperCase(), action.toLowerCase()].map((BuyOrSell) => [
+        { Orders: [row, { ...option, OrderID: 'O2', Legs: [{ ...option.Legs[0], BuyOrSell }] }] },
+        'complete',
+        false,
+        2,
+      ]),
+    ),
+    ...[
+      { OrderType: 'Limit', LimitPrice: '210' },
+      { OrderType: 'Limit', LimitPrice: '210', Legs: [{ ...row.Legs[0], ExecutionPrice: null }] },
+      { OrderType: 'Limit', Legs: [{ ...row.Legs[0], ExecutionPrice: '210' }] },
+      { OrderType: 'StopMarket', StopPrice: '200' },
+      { OrderType: 'StopLimit', StopPrice: '200', LimitPrice: '210' },
+      { OrderType: 'StopLimit', StopPrice: '200', Legs: [{ ...row.Legs[0], ExecutionPrice: '210' }] },
+    ].map((prices) => [{ Orders: [{ ...row, ...prices }] }, 'complete', false, 1]),
+    [{ Orders: [{ ...row, Status: 'CAN' }] }, 'complete', false, 1],
+    [{ Orders: [{ ...option, Status: 'CAN' }] }, 'complete', false, 1],
+    [{ Orders: [{ ...filled, Legs: [{ ...option.Legs[0], ExecQuantity: '2' }] }] }, 'complete', false, 1],
+    [
+      { Orders: [{ ...filled, Status: 'FPR', ClosedDateTime: null, Legs: [{ ...option.Legs[0], ExecQuantity: '1' }] }] },
+      'complete',
+      false,
+      1,
+    ],
+    [{ Orders: [{ ...row, Legs: [{ ...row.Legs[0], Symbol: '$SPX.X', AssetType: 'IDX' }] }] }, 'complete', false, 1],
+    [{ Orders: [{ ...row, Legs: [{ ...row.Legs[0], QuantityOrdered: '0', ExecQuantity: 0 }] }] }, 'complete', false, 1],
+    [{ Orders: [{ ...row, Legs: [{ ...row.Legs[0], ExecQuantity: undefined }] }] }, 'complete', false, 1],
+    [{ Orders: [{ ...filled, Status: 'FPR', ClosedDateTime: undefined, Legs: [filled.Legs[0], row.Legs[0]] }] }, 'complete', false, 1],
+    [{ Orders: [row], NextToken: 'cursor-secret' }, 'partial', true, 1],
+    [{ Orders: [], NextToken: 'cursor-secret' }, 'partial', true, 0],
+    [{ Orders: [row], Errors: [{ Error: 'FAILED', Message: 'access-secret https://private.example' }] }, 'partial', false, 1],
+    [{ Orders: [row, null, { ...row, AccountID: 'OTHER' }, { OrderID: 'O2' }] }, 'partial', false, 1],
+    [{ Orders: [row], Errors: {} }, 'partial', false, 1],
+    [{ Orders: [row], Errors: null }, 'partial', false, 1],
+    [{ Orders: [row], NextToken: {} }, 'partial', undefined, 1],
+    [{ Orders: [row], Page: { NextToken: 'cursor-secret' } }, 'partial', undefined, 1],
+    [{}, 'error', false, 0],
+    [{ Orders: null }, 'error', false, 0],
+    [{ Orders: {} }, 'error', false, 0],
+    [{ Orders: [null] }, 'error', false, 0],
+    [{ Errors: [{ Error: 'FAILED' }] }, 'error', false, 0],
+    [{ Orders: [row, { ...row, Status: 'CAN' }] }, 'error', false, 0],
+    [{ Orders: [{ ...row, OrderID: 'O3' }] }, 'error', false, 0],
+    ...invalidRows.flatMap((invalid) => [
+      [{ Orders: [invalid] }, 'error', false, 0],
+      [{ Orders: [row, { ...invalid, OrderID: 'O2' }] }, 'partial', false, 1],
+    ]),
+  ];
+  for (const historical of [false, true]) {
+    let response;
+    const globals = {
+      domain: { ts: { clients: { getClient: async () => ({ tokens: { access: 'access-secret' } }) } } },
+      lib: { ts: { orderError, send: async () => response } },
+    };
+    globals.lib.ts.orders = loadExpressionModule('application/lib/ts/orders.js', globals);
+    globals.lib.ts.ordersBatch = loadExpressionModule('application/lib/ts/ordersBatch.js', globals);
+    const api = loadExpressionModule(`application/api/account/${historical ? 'historicalorders' : 'orders'}.js`, globals);
+    const input = { contracts: [{ account: 'A1', live: true }], start: '2026-07-01', orders: ['O1', 'O2'], withOutcomes: true };
+    for (const [body, state, hasMore, count] of cases) {
+      response = body;
+      const result = JSON.parse(JSON.stringify(await api.method(input)));
+      const outcome = result.outcomes[0];
+      assert.equal(outcome.state, state);
+      assert.equal(outcome.hasMore, hasMore);
+      assert.equal(outcome.orders.length, count);
+      assert.equal(outcome.complete, state === 'complete');
+      assert.equal(result.complete, state === 'complete');
+      assert.equal(outcome.source, historical ? 'historical' : 'current');
+      assert.equal(outcome.account, 'A1');
+      assert.equal(outcome.live, true);
+      if (count) assert.deepEqual(outcome.orders, JSON.parse(JSON.stringify(body.Orders.slice(0, count))));
+      assert.doesNotMatch(JSON.stringify(result), /cursor-secret|access-secret|https:|NextToken/);
+      if (outcome.error) assert.deepEqual(Object.keys(outcome.error), ['code', 'phase', 'httpStatus']);
+    }
+    const contracts = Array.from({ length: 6 }, (_, index) => ({ account: `A${index + 1}`, live: index % 2 === 0 }));
+    for (const invalid of [invalidRows[0], ...['ASS', 'BRC'].map((Status) => ({ ...row, Status })), { ...row, OrderType: 'Limit' }]) {
+      globals.lib.ts.send = async ({ endpoint }) => {
+        const evidence = endpoint[2] === 'A6' ? invalid : option;
+        return { Orders: [{ ...evidence, AccountID: endpoint[2], OrderID: `O-${endpoint[2]}` }] };
+      };
+      const mixed = JSON.parse(JSON.stringify(await api.method({ ...input, contracts, orders: [] })));
+      assert.equal(mixed.complete, false);
+      assert.deepEqual(
+        mixed.outcomes.map(({ state }) => state),
+        [...Array(5).fill('complete'), 'error'],
+      );
+      assert.ok(
+        mixed.outcomes.every(
+          ({ account, live, source }, index) =>
+            account === contracts[index].account && live === contracts[index].live && source === (historical ? 'historical' : 'current'),
+        ),
+      );
+      assert.deepEqual(
+        mixed.outcomes.flatMap(({ orders }) => orders.map(({ OrderID }) => OrderID)),
+        ['O-A1', 'O-A2', 'O-A3', 'O-A4', 'O-A5'],
+      );
+      assert.doesNotMatch(JSON.stringify(mixed), /cursor-secret|access-secret|https:|NextToken/);
+    }
+    globals.lib.ts.send = async () => response;
+    response = { Orders: invalidRows };
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(await api.method({ ...input, withOutcomes: false }))),
+      JSON.parse(JSON.stringify(invalidRows)),
+    );
+    response = {};
+    assert.deepEqual(JSON.parse(JSON.stringify(await api.method({ ...input, orders: [], withOutcomes: 'true' }))), []);
+  }
 });
 
 test('orders APIs use token-ready clients and the shared batch policy', async () => {

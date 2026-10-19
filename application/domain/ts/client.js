@@ -5,6 +5,7 @@ async () => ({
   timers: { rtoken: null },
   brokerage: { setup: null, recovery: null, recoveryAuth: false, ready: false, accounts: new Map(), reconciling: {} },
   closed: false,
+  chainSequence: 0,
   streams: {
     charts: {},
     chains: {},
@@ -50,6 +51,9 @@ async () => ({
       return false;
     }
 
+    // Release the registration before awaiting physical shutdown. A replacement
+    // registered during stopStream() must keep its own identity.
+    delete bucket[key];
     try {
       console.debug('stored stream stop requested', { group, streamKey: key, reason });
       await stream.stopStream(reason);
@@ -57,14 +61,18 @@ async () => ({
       console.warn(`Failed to stop stream ${group}:${key}:`, error);
     }
 
-    delete bucket[key];
     console.debug('stored stream stop done', { group, streamKey: key, reason });
     return true;
   },
 
   async setStoredStream({ group, key, stream }) {
-    await this.stopStoredStream({ group, key });
+    if (this.closed) {
+      await stream.stopStream('client.close');
+      throw new Error('TradeStation client is closed');
+    }
+    const stopping = this.stopStoredStream({ group, key });
     this.getStreamBucket(group)[key] = stream;
+    await stopping;
     console.debug('stored stream set', { group, streamKey: key });
     return key;
   },
@@ -705,18 +713,31 @@ async () => ({
     }
   },
 
-  async streamChains({ endpoint, symbol, data, onData, onError, onStatus }) {
+  async streamChains({ endpoint, symbol, data, onData, onError, onStatus, signal }) {
+    // This is a physical registration, independent of the stable managed key.
+    const key = `${this.buildStreamKey({ group: 'chains', symbol, data })}#${++this.chainSequence}`;
+    let stream = null;
+    const stop = () => this.stopStoredStream({ group: 'chains', key, reason: 'snapshot.cancelled' });
     try {
-      const key = this.buildStreamKey({ group: 'chains', symbol, data });
+      if (this.closed) throw new Error('TradeStation client is closed');
+      if (signal?.aborted) throw new Error('Option chain startup cancelled');
       const retryPolicy = { packetErrors: { failedInternalServerError: { retryable: true, maxRetries: 2 } } };
 
-      const stream = lib.ts.stream({ live: true, endpoint, tokens: this.tokens, data, onData, onError, onStatus, retryPolicy });
-      await stream.initiateStream();
+      stream = lib.ts.stream({ live: true, endpoint, tokens: this.tokens, data, onData, onError, onStatus, retryPolicy });
       await this.setStoredStream({ group: 'chains', key, stream });
+      signal?.addEventListener('abort', stop, { once: true });
+      if (this.closed || signal?.aborted || this.streams.chains[key] !== stream) throw new Error('Option chain startup cancelled');
+      await stream.initiateStream();
+      if (this.closed || signal?.aborted || this.streams.chains[key] !== stream) throw new Error('Option chain startup cancelled');
       return key;
     } catch (error) {
+      await stop();
+      // initiateStream may finish after cancellation removed its registration.
+      if (stream) await stream.stopStream('startup.failed');
       console.error('Error in stream chain:', error);
       throw error;
+    } finally {
+      signal?.removeEventListener('abort', stop);
     }
   },
 
@@ -734,11 +755,11 @@ async () => ({
     }
   },
 
-  async streamCharts({ endpoint, symbol, data, onData, onError }) {
+  async streamCharts({ endpoint, symbol, data, onData, onError, onStatus }) {
     try {
       const key = this.buildStreamKey({ group: 'charts', symbol, data });
 
-      const stream = lib.ts.stream({ live: true, endpoint, tokens: this.tokens, data, onData, onError });
+      const stream = lib.ts.stream({ live: true, endpoint, tokens: this.tokens, data, onData, onError, onStatus });
       await stream.initiateStream();
       await this.setStoredStream({ group: 'charts', key, stream });
       return key;

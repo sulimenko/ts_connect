@@ -12,8 +12,15 @@ services:
       ptfin-backend:
         aliases:
           - ts_connect.ptfin.local
+      ptfin-swarm:
+        aliases:
+          - ts_connect.ptfin-swarm.local
 
 networks:
   ptfin-backend:
     external: true
     name: ptfin-backend
+
+  ptfin-swarm:
+    external: true
+    name: ptfin-swarm

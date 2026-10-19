@@ -6,12 +6,18 @@
     return Number.isFinite(number) ? number.toFixed(digits) : null;
   };
 
-  if (!message || !message.Legs || message.Legs.length === 0) return null;
+  if (!message || !message.Legs || message.Legs.length === 0) {
+    return null;
+  }
 
   const leg = message.Legs[0];
-  if (!leg.Symbol || !leg.Expiration || !leg.OptionType) return null;
+  if (!leg.Symbol || !leg.Expiration || !leg.OptionType) {
+    return null;
+  }
   const option = lib.utils.makeSymbol(leg.Symbol);
-  if (!option || option.type !== 'OPT') return null;
+  if (!option || option.type !== 'OPT') {
+    return null;
+  }
 
   const expiration = leg.Expiration.split('T')[0];
 
@@ -25,10 +31,15 @@
     expiration,
     gamma: toFixedString(message.Gamma, 4),
     open_interest: message.DailyOpenInterest,
+    option_metadata: leg,
     prev_close_price: toFixedString(message.PreviousClose, 2),
     strike: option.strike,
+    strike_price: option.strikeValue,
     symbol: option.underlying,
+    symbol_external: leg.Symbol,
     symbol_raw: option.symbol,
+    underlying_symbol: option.underlying,
+    source: 'TS', // TradeStation источник данных пока, больше опционы ниоткуда не едут
     theo: toFixedString(message.TheoreticalValue, 4),
     theta: toFixedString(message.Theta, 4),
     trade_price: toFixedString(message.Last, 2),

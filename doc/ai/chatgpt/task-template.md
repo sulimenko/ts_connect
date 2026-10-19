@@ -1,81 +1,16 @@
-# Task T-XXX: <title>
+# task-template.md - AI Pipeline v8.3
 
-> Draft-only rule:
->
-> ChatGPT must show every task draft to the user in a writing block before creating any GH task file.
->
-> This template is not an active task until the user explicitly says: “создай задачу в GH”.
->
-> ChatGPT must not create, update, or push `doc/tasks/ready/*.md` in GitHub without that explicit command.
+Проект: `sulimenko/ts_connect`; runtime: `node24`.
 
-```ai-task-contract
-version: 1
-task_id: T-XXX
-type: primary
-human_summary: "<short summary>"
-execution_mode: codex
+Читать `AGENTS.md`, `doc/ai/project-invariants.md`, `doc/ai/chatgpt/project-settings.md` и релевантный код/модульную документацию.
 
-git:
-  base_branch: develop
-  queue_branch: ai-task-queue
-  parent_branch: none
-  work_branch: ai/T-XXX-short-title
-  work_branch_policy: create_task_branch
-  allow_new_branch: true
-  allow_codex_git: false
+Canonical правила и шаблоны находятся на ветке `ai-task-queue` в `doc/pipeline/v8.3.0/`:
 
-scope:
-  allowed_files:
-    - application/**
-    - application/test/run.js
-  forbidden_files:
-    - doc/tasks/**
-    - doc/ai/**
-    - node_modules/**
-    - coverage/**
-    - dist/**
-    - "*.log"
+- `contract-schema.md`, `router-policy.md`, `worker-rules.md`, `verification-policy.md`;
+- `implementation.example.md`, `test-only.example.md`, `acceptance.example.json`.
 
-tests:
-  required: true
-  cover_behavior:
-    - "<specific behavior to cover>"
-  allowed_files:
-    - application/test/run.js
+Technical Architect исследует до окончательного ТЗ. ChatGPT принимает/разрешает каждое существенное замечание. Новую задачу создавать только после явного разрешения пользователя. Tests создаются отдельно после ручной приёмки реализации. Docker вне автоматического pipeline; сложный SQL — в ручных сценариях.
 
-pr:
-  mode: create_new
-  base: develop
+Перед review читать exact remote PR head и receipt/handoff на `ai-task-queue`. Локальные raw-файлы недоступны ChatGPT автоматически; при необходимости пользователь передаёт только ограниченные и проверенные на секреты выдержки.
 
-validation:
-  commands:
-    - npm test
-
-diff_budget:
-  max_files_changed: 8
-  max_added_lines: 400
-  max_deleted_lines: 400
-
-commit:
-  message: "<commit message>"
-```
-
-## Naming rule
-
-- Имена функций и переменных лаконичные.
-- 1 слово лучше 2.
-- 2 слова лучше 3.
-- Длинное имя допускается только если короткое теряет смысл.
-
-## Human summary
-
-<Короткое человекочитаемое описание. Runner читает machine contract выше.>
-
-## Notes
-
-- Не менять файлы вне `allowed_files`.
-- Не трогать `doc/tasks/**` и `doc/ai/**`, если задача явно не workflow/documentation.
-- Не коммитить generated artifacts.
-- Если задача меняет behavior, tests должны покрывать `tests.cover_behavior`.
-- Draft задачи всегда сначала показывается человеку в writing block.
-- Не создавать GH task, не писать в `doc/tasks/ready/*.md` и не обновлять `ai-task-queue` без явной команды пользователя: “создай задачу в GH”.
+Не объявлять CLI exit=0, zero tests или `No ready tasks` доказательством полного workflow. Staging только `git add -A`; исполнители не владеют Git. Старые v8.2 task/review mechanics не переопределяют v8.3.

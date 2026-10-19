@@ -1,301 +1,41 @@
-# ts_connect
+# ts_connect — AI Pipeline v8.3
 
-Локальные правила `ts_connect` для AI Pipeline v8.
+Репозиторий: `sulimenko/ts_connect`. Язык задач, объяснений, архитектурных отчётов и review — русский.
 
-Repo: `sulimenko/ts_connect`.
+## Источники и приоритет
 
-Всегда писать задачи, уточняющие вопросы, review, follow-up задачи и критерии готовности на русском языке.
+Явная инструкция пользователя → согласованный контракт → этот файл → `doc/ai/project-invariants.md` и project settings → shared policy.
+Перед новой работой читать этот файл, `doc/ai/chatgpt/project-settings.md`, соответствующие инструкции роли и релевантную архитектуру проекта. Не переносить архитектурные правила из другого проекта.
 
-## Документация
+Shared policy: ветка `ai-task-queue`, каталог `doc/pipeline/v8.3.0/`. Читать `contract-schema.md`, `worker-rules.md`, `verification-policy.md`, `router-policy.md` и подходящий шаблон. Старые v8.2 контракты не исполняются автоматически.
 
-- `doc/blueprint.md` — архитектурные правила, слои, контракт процедур, stream lifecycle.
-- `doc/openapi_20260411.md` — компактный индекс и дополнение по snapshot TradeStation OpenAPI от 2026-04-11.
-- `doc/ai/chatgpt/project-settings.md` — правила AI Pipeline v8 для проекта.
-- `doc/ai/chatgpt/architect.instructions.md` — обязательные role-specific правила Architect для анализа, task draft и архитектурных решений.
-- `doc/ai/chatgpt/reviewer.instructions.md` — обязательные role-specific правила Reviewer.
-- `doc/ai/chatgpt/task-template.md` — шаблон task contract.
-- `doc/ai/chatgpt/followup-template.md` — шаблон follow-up к открытому PR.
-- `doc/ai/chatgpt/review-checklist.md` — review-checklist для PR.
-- `doc/ai/project-checks.sh` — project-specific validation wrapper.
-- `doc/tasks/ready/*.md` — активные задачи для runner.
-- `doc/tasks/done/*.md` — закрытые/перенесённые task files.
-- `doc/task.md` — legacy task history после миграции.
-- `doc/review.md` — legacy review history после миграции.
-- `doc/changelog.md` — архив закрытых задач и заключений.
+## Роли и цикл
 
-## Instruction precedence
+ChatGPT — владелец бизнес-цели, окончательного ТЗ и Final Review. Локальный Technical Architect — один исследовательский проход и единый handoff со всеми рекомендациями, а не критик на каждом повторе. Исполнители: Codex GPT-6 Astra low/medium либо Kimi K3. Runner владеет Git, очередью, командами и отчётами; агент не управляет Git.
 
-Правила читаются и применяются в следующем порядке:
+Цикл: цель → Technical Architect при необходимости → отчёт пользователем в ChatGPT → окончательный draft → явное разрешение пользователя → implementation → автоматические наблюдения → checkpoint/Draft PR → ручная проверка → явное принятие конкретной реализации → отдельная test-only задача → Final Review → решение пользователя о merge.
 
-1. Явная текущая инструкция пользователя для конкретной работы.
-2. Активный `ai-task-contract` — источник истины для scope, routing, validation и PR behavior уже созданной runner-задачи.
-3. `AGENTS.md` — общие обязательные инварианты проекта и эта таблица precedence.
-4. Role-specific instructions:
-   - `doc/ai/chatgpt/architect.instructions.md` для Architect/task preparation;
-   - `doc/ai/chatgpt/reviewer.instructions.md` для review.
-5. `doc/ai/chatgpt/project-settings.md` — shared AI Pipeline v8 rules.
-6. `doc/blueprint.md` — архитектурные и runtime-инварианты сервиса.
-7. `task-template.md`, `followup-template.md`, `review-checklist.md` — templates/checklists; они не могут переопределять документы выше.
-8. `doc/task.md` и `doc/review.md` — только legacy/history и никогда не являются источником активных правил или задач.
+## Git
 
-Если документы одного уровня конфликтуют, действует более узкое правило для текущей роли/области, но оно не может отменить правило более высокого уровня.
+Base: `develop`. Queue: `ai-task-queue`. Work: `ai/T-XXX-*`. Контракт: `version: 8.3.0`.
+Staging только `git add -A` без списка файлов; guards до и после staging. Посторонние изменения блокируют commit, а не включаются молча. Нельзя force-push, автоматический reset --hard или git clean. Очередь не сливается в production-ветку.
 
-Если новая инструкция пользователя меняет уже созданный `ai-task-contract`, Architect не должен молча выполнять задачу вне contract: сначала нужно явно обновить/создать подходящую task/follow-up.
+## Тесты и принятие
 
-### Impress optional metadata
+В implementation нельзя создавать/изменять regression tests, fixtures или test setup, включая скрытый test harness в другой папке. Существующие релевантные проверки можно запускать без изменения. Заранее известные устаревшие expectations перечисляются как deferred; неизвестное падение не считается устаревшим автоматически.
 
-Metarhia/Impress допускает simple API function и extended declaration.
+Test-only допускается только по acceptance-записи с ручными результатами и отдельным разрешением тестов. Принятие фиксирует SHA, revision и contract hash. Изменение только разрешённых тестов не отменяет принятие production; изменение защищённых файлов — отменяет. Test Author не исправляет production и не ослабляет assertions.
 
-Поля extended declaration `access`, `parameters`, `returns`, `errors`, `validate` являются optional по framework contract. Их отсутствие само по себе не является defect или review blocker.
+## Runtime и проверка
 
-Конкретное optional поле становится обязательным только если:
+Runtime профиля: `node24`. Machine-specific bootstrap: `~/.ai-pipeline/projects/<repo-key>/env.sh`.
+Docker не проверяется и не запускается автоматически. SQL только минимальный SELECT/неисполняющий EXPLAIN через подтверждённые readonly-права, с лимитами. Сложные сценарии и миграции пользователь выполняет вручную по согласованным командам. Успешный CLI, ноль выполненных тестов или пустая очередь не доказывают бизнес-корректность.
 
-- пользователь явно потребовал его в текущей работе;
-- `ai-task-contract` явно требует его;
-- существующее поведение уже зависит от этого поля и изменение/удаление изменит runtime semantics.
+## Безопасность и сохранение работы
 
-Если пользователь явно просит не добавлять или не проверять descriptive/optional Impress metadata в текущей задаче, отсутствие этих полей не должно блокировать task или PR.
+Scope задаётся явно. Без разрешения нельзя менять secrets, credentials, зависимости/lockfiles, runtime/production config, схемы и несвязанный код. Raw-логи/DB-данные не публикуются автоматически. Один executor на репозиторий; другой компьютер не перехватывает зависший claim автоматически.
 
-При этом существующие `access`, schemas, validation и error mappings нельзя молча удалять или ослаблять: если они уже влияют на runtime behavior, review проверяет сохранение их семантики.
+## Evidence
 
-## Repo access
-
-ChatGPT работает с `sulimenko/ts_connect` только через GitHub connector или через файлы, приложенные пользователем.
-
-Не предлагать `git clone` для `ts_connect`.
-
-Если нужен локальный запуск, проверка, runner или git-команды — команды даются пользователю или Local Watcher.
-
-## AI Pipeline v8
-
-Base branch: `develop`.
-
-Queue branch: `ai-task-queue`.
-
-Project runner:
-
-```bash
-bash doc/scripts/watch-and-run-tasks.sh
-```
-
-Run once:
-
-```bash
-RUN_ONCE=1 bash doc/scripts/watch-and-run-tasks.sh
-```
-
-Runner читает `ai-task-contract` как источник правды.
-
-Активные задачи создаются только в:
-
-```text
-doc/tasks/ready/*.md
-```
-
-## Task ID and branch naming
-
-- Перед draft новой задачи ChatGPT должен найти максимальный завершённый `T-NNN` в `doc/changelog.md`, `doc/task.md` и `doc/tasks/done/*.md`.
-- Следующий task ID получает `T-NNN`, где `NNN = max existing + 1`.
-- Если создаётся несколько primary tasks одновременно, номера идут последовательно.
-- Work branch должен начинаться с `ai/T-NNN-...`.
-- Название задачи в markdown: `# Task T-NNN: <short title>`.
-- `task_id` в `ai-task-contract` должен быть только `T-NNN`, без slug.
-
-## Naming style
-
-- Имена функций и переменных должны быть лаконичными.
-- 1 слово лучше 2, 2 слова лучше 3.
-- Длинное имя допустимо только если короткое теряет смысл или создаёт ambiguity.
-- Не вводить helper/function/class только ради декоративной абстракции.
-
-`doc/task.md` больше не является источником активных задач.
-
-## Роли
-
-ChatGPT = Architect + Reviewer.
-
-Runner = git / scope / validation / commit / PR executor.
-
-Codex = bounded code editor.
-
-Codex не управляет git: не создаёт branch, commit, push или PR. Это делает runner.
-
-ChatGPT не меняет production code напрямую, кроме явного запроса пользователя.
-
-## Создание задач
-
-Перед созданием каждой GH task ChatGPT обязан сначала показать человеку draft задачи в writing block.
-
-Только после явной команды “создай задачу в GH” ChatGPT создаёт task markdown в `ai-task-queue`.
-
-Task markdown должен содержать machine-readable block:
-
-```ai-task-contract
-...
-```
-
-Opening fence должен быть строго ` ```ai-task-contract ` без `id`, `yaml`, attributes или metadata.
-
-Обязательные поля contract:
-
-- `version`
-- `task_id`
-- `type`
-- `human_summary`
-- `execution_mode`
-- `git`
-- `scope`
-- `tests`
-- `pr`
-- `validation`
-- `diff_budget`
-- `commit`
-
-## Git routing
-
-Primary task:
-
-```yaml
-type: primary
-git:
-  base_branch: develop
-  queue_branch: ai-task-queue
-  parent_branch: none
-  work_branch: ai/T-NNN-short-title
-  work_branch_policy: create_task_branch
-  allow_new_branch: true
-  allow_codex_git: false
-pr:
-  mode: create_new
-  base: develop
-```
-
-ChatGPT не должен придумывать `T-NNN`; сначала проверить историю задач.
-
-Follow-up к открытому PR:
-
-```yaml
-type: follow_up
-git:
-  base_branch: develop
-  queue_branch: ai-task-queue
-  parent_branch: ai/T-XXX-...
-  work_branch_policy: continue_parent_branch
-  allow_new_branch: false
-  allow_codex_git: false
-pr:
-  mode: update_existing_parent_pr
-  base: develop
-```
-
-Follow-up создаётся только после review результата и только при реальном gap.
-
-No silent fallback: если routing follow-up невалидный, задача должна fail, а не превращаться в primary.
-
-## Scope
-
-Каждая задача должна явно задавать `allowed_files` и `forbidden_files`.
-
-По умолчанию запрещать:
-
-- `doc/tasks/**`
-- `doc/ai/**`
-- `node_modules/**`
-- `coverage/**`
-- `dist/**`
-- generated logs / artifacts
-
-В обычных production задачах запрещать `doc/**`, если задача явно не documentation/workflow.
-
-## Слои
-
-- `application/api/` — публичные Impress RPC-процедуры: contract, access, validation, orchestration; не хранит state, не делает reconnect.
-- `application/domain/` — server-side state, lifecycle, registries, cleanup, multiplex subscriptions.
-- `application/lib/` — TradeStation HTTP/stream adapters, protocol, parsing, normalization helpers.
-- `config/` — только `process.env` -> config; без бизнес-логики.
-- `types/` — global/service typing.
-
-## TradeStation
-
-- OAuth lifecycle: `lib.ts.refresh` -> `access_token` + `expires`; auto-refresh до expiry.
-- Stream lifecycle: subscribe -> touch -> unsubscribe; idle cleanup; `client.close` cleanup.
-- `domain.ts.clients` — single-flight setup через `connecting[name]` + `waiters[name]`.
-- `domain.ts.streams` — multiplex подписчиков, stable `streamKey`.
-- `lib.ts.stream` — upstream HTTP stream с reconnect, heartbeat, JSON line parser.
-- Defensive guards на shape ответов TradeStation обязательны.
-- `INVALID SYMBOL` не должен запускать бесконечный reconnect.
-- `GoAway` / `StreamStatus: 'GoAway'` остаются transient stream events, для которых reconnect ожидаем.
-
-## Symbol contract
-
-- Все symbol parsing/formatting должны идти через `lib.utils`.
-- Основные точки входа: `makeSymbol()` и `makeTSSymbol()`.
-- `makeSymbol()` возвращает canonical back/metaterminal symbol.
-- `makeTSSymbol()` возвращает TradeStation upstream symbol.
-- Не собирать OPT symbol вручную через локальные regex + `padStart` / `padEnd` в endpoint-ах, stream parsers или response mappers.
-
-## Impress
-
-- Impress допускает simple API function `async ({ ... }) => ...` и extended declaration `({ ... })`.
-- Для extended declaration `method` является точкой выполнения.
-- `access`, `parameters`, `returns`, `errors`, `validate` optional по framework contract.
-- Не требовать эти optional поля только потому, что public API файл был создан или затронут.
-- Если optional поле уже существует, его runtime semantics должны быть сохранены.
-- Если behavior зависит от `DomainError`, access policy, schema validation или result validation, соответствующий contract должен оставаться согласованным.
-- Явное требование пользователя или `ai-task-contract` имеет приоритет и может сделать конкретные optional fields обязательными для данной задачи.
-- Файлы экспортируют единственную функцию или объект: `({...}) => { ... }` или `({ ... })`.
-- Глобальные пространства: `lib.*`, `domain.*`, `config.*`, `application.*`.
-- Нельзя делать import-time side effects в файлах, которые загружает общий aggregator.
-- Один файл = одна функция в `application/lib/name/`.
-- Не помещать несколько функций в один `lib/` файл через object export.
-- `domain` файлы экспортируют объект `({...})` с методами и state как registry/singleton.
-- Методы `domain` используют `this.*` для доступа к state объекта.
-
-## Ошибки
-
-- `DomainError` — только для предсказуемых бизнес-ошибок публичного контракта.
-- `Error` — для багов, transport failures и unexpected integration failures.
-
-## Validation
-
-Стандартная validation:
-
-```bash
-npm test
-```
-
-При необходимости явно:
-
-```bash
-npm run lint
-npm run types
-npm test
-```
-
-## Review
-
-Review должен проверить:
-
-- branch/base;
-- task contract compliance;
-- changed files vs allowed/forbidden scope;
-- отсутствие workflow artifacts;
-- validation;
-- tests, если required;
-- Impress procedure contract;
-- API/domain/lib boundaries;
-- TradeStation response guards;
-- stream lifecycle;
-- symbol contract;
-- DomainError vs Error;
-- реальные behavioral gaps.
-
-Итог писать строго одним из вариантов:
-
-```text
-Review status: blocked
-```
-
-```text
-Review status: merge-ready
-```
+Локально: `~/.ai-pipeline/runs/`. Shared handoff/receipts: `ai-task-queue:doc/tasks/evidence/`. Architecture: `doc/tasks/research/`. Acceptance: `doc/tasks/acceptance/`.
+Review проверяет exact remote head, контракт, scope, фактические автоматические результаты, ручные результаты и оставшиеся ограничения. Ответ: `Merge ready` либо `Blocked` с конкретной причиной. Не делать заявление о проверках, которых не было.

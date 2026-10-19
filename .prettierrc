@@ -6,7 +6,15 @@
   "overrides": [
     {
       "files": ["**/.*rc", "**/*.json"],
-      "options": { "parser": "json" }
+      "options": {
+        "parser": "json"
+      }
+    },
+    {
+      "files": ["test/execution.js"],
+      "options": {
+        "printWidth": 80
+      }
     }
   ]
 }
