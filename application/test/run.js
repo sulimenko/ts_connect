@@ -4914,6 +4914,17 @@ test('orders batch deadline aborts active reads with ETIMEOUT', async () => {
   assert.equal(signals[0].aborted, true);
 });
 
+const ordersOutcomeRow = {
+  AccountID: 'A1',
+  OrderID: 'O1',
+  Status: 'ACK',
+  OrderType: 'Market',
+  Currency: 'USD',
+  Duration: 'DAY',
+  OpenedDateTime: '2026-07-01T15:30:00Z',
+  Legs: [{ Symbol: 'TSLA', BuyOrSell: 'Buy', AssetType: 'STOCK', QuantityOrdered: '2', ExecQuantity: '0' }],
+};
+
 test('opt-in orders API retains five accounts when the sixth body reaches the shared deadline', async () => {
   let expire;
   let active = 0;
@@ -4942,7 +4953,7 @@ test('opt-in orders API retains five accounts when the sixth body reaches the sh
           await Promise.resolve();
           active -= 1;
           finished += 1;
-          return { Orders: [{ AccountID: endpoint[2], OrderID: `O-${endpoint[2]}`, Legs: [{ Symbol: 'TSLA' }] }] };
+          return { Orders: [{ ...ordersOutcomeRow, AccountID: endpoint[2], OrderID: `O-${endpoint[2]}` }] };
         },
       },
     },
@@ -4968,6 +4979,7 @@ test('opt-in orders API retains five accounts when the sixth body reaches the sh
   );
   assert.ok(result.outcomes.every(({ source }) => source === 'historical'));
   assert.equal(result.outcomes.slice(1).flatMap(({ orders }) => orders).length, 5);
+  assert.ok(result.outcomes.slice(1).every(({ account, orders }) => orders[0].OrderID === `O-${account}`));
   assert.deepEqual(result.outcomes[0].error, { code: 'ETIMEOUT', phase: 'body', httpStatus: 200 });
   assert.equal(result.outcomes[0].complete, false);
   assert.doesNotMatch(JSON.stringify(result), /access-secret|https:|NextToken/);
@@ -5037,10 +5049,43 @@ test('opt-in batch isolates transport errors and retains success across global a
 });
 
 test('opt-in orders APIs validate positive rows and completeness metadata without exposing continuation tokens', async () => {
-  const row = { AccountID: 'A1', OrderID: 'O1', Legs: [{ Symbol: 'TSLA' }] };
+  const row = ordersOutcomeRow;
+  const filled = { ...row, Status: 'FLL', ClosedDateTime: '2026-07-01T15:31:00Z', Legs: [{ ...row.Legs[0], ExecQuantity: '2' }] };
+  const invalidRows = [
+    { AccountID: 'A1', OrderID: 'O1', Legs: [{ Symbol: 'TSLA' }] },
+    ...[undefined, '', 'UNKNOWN', 'OTHER'].map((Status) => ({ ...row, Status })),
+    ...['OrderType', 'Currency', 'Duration', 'OpenedDateTime'].map((field) => ({ ...row, [field]: undefined })),
+    ...[
+      { Symbol: '' },
+      { BuyOrSell: undefined },
+      { BuyOrSell: 'invalid' },
+      { AssetType: undefined },
+      { AssetType: 'UNKNOWN' },
+      { QuantityOrdered: undefined },
+      { QuantityOrdered: '' },
+      { QuantityOrdered: null },
+      { QuantityOrdered: true },
+      { QuantityOrdered: 'not-a-number' },
+      { QuantityOrdered: '-1' },
+      { QuantityOrdered: Infinity },
+      { ExecQuantity: 'not-a-number' },
+      { ExecQuantity: null },
+      { ExecQuantity: 'Infinity' },
+      { ExecQuantity: '-1' },
+      { ExecQuantity: '3' },
+    ].map((leg) => ({ ...row, Legs: [{ ...row.Legs[0], ...leg }] })),
+    { ...filled, ClosedDateTime: undefined },
+    { ...filled, ClosedDateTime: 'not-a-date' },
+    { ...filled, ClosedDateTime: '2026-06-30T15:30:00Z' },
+    ...[undefined, 'not-a-number', '0'].map((ExecQuantity) => ({ ...filled, Legs: [{ ...filled.Legs[0], ExecQuantity }] })),
+  ];
   const cases = [
     [{ Orders: [] }, 'complete', false, 0],
     [{ Orders: [row] }, 'complete', false, 1],
+    [{ Orders: [filled] }, 'complete', false, 1],
+    [{ Orders: [{ ...row, Legs: [{ ...row.Legs[0], QuantityOrdered: '0', ExecQuantity: 0 }] }] }, 'complete', false, 1],
+    [{ Orders: [{ ...row, Legs: [{ ...row.Legs[0], ExecQuantity: undefined }] }] }, 'complete', false, 1],
+    [{ Orders: [{ ...filled, Status: 'FPR', ClosedDateTime: undefined, Legs: [filled.Legs[0], row.Legs[0]] }] }, 'complete', false, 1],
     [{ Orders: [row], NextToken: 'cursor-secret' }, 'partial', true, 1],
     [{ Orders: [], NextToken: 'cursor-secret' }, 'partial', true, 0],
     [{ Orders: [row], Errors: [{ Error: 'FAILED', Message: 'access-secret https://private.example' }] }, 'partial', false, 1],
@@ -5054,6 +5099,12 @@ test('opt-in orders APIs validate positive rows and completeness metadata withou
     [{ Orders: {} }, 'error', false, 0],
     [{ Orders: [null] }, 'error', false, 0],
     [{ Errors: [{ Error: 'FAILED' }] }, 'error', false, 0],
+    [{ Orders: [row, { ...row, Status: 'CAN' }] }, 'error', false, 0],
+    [{ Orders: [{ ...row, OrderID: 'O3' }] }, 'error', false, 0],
+    ...invalidRows.flatMap((invalid) => [
+      [{ Orders: [invalid] }, 'error', false, 0],
+      [{ Orders: [row, { ...invalid, OrderID: 'O2' }] }, 'partial', false, 1],
+    ]),
   ];
   for (const historical of [false, true]) {
     let response;
@@ -5064,7 +5115,7 @@ test('opt-in orders APIs validate positive rows and completeness metadata withou
     globals.lib.ts.orders = loadExpressionModule('application/lib/ts/orders.js', globals);
     globals.lib.ts.ordersBatch = loadExpressionModule('application/lib/ts/ordersBatch.js', globals);
     const api = loadExpressionModule(`application/api/account/${historical ? 'historicalorders' : 'orders'}.js`, globals);
-    const input = { contracts: [{ account: 'A1', live: true }], start: '2026-07-01', orders: ['O1'], withOutcomes: true };
+    const input = { contracts: [{ account: 'A1', live: true }], start: '2026-07-01', orders: ['O1', 'O2'], withOutcomes: true };
     for (const [body, state, hasMore, count] of cases) {
       response = body;
       const result = JSON.parse(JSON.stringify(await api.method(input)));
@@ -5075,9 +5126,38 @@ test('opt-in orders APIs validate positive rows and completeness metadata withou
       assert.equal(outcome.complete, state === 'complete');
       assert.equal(result.complete, state === 'complete');
       assert.equal(outcome.source, historical ? 'historical' : 'current');
+      assert.equal(outcome.account, 'A1');
+      assert.equal(outcome.live, true);
+      if (count) assert.deepEqual(outcome.orders, JSON.parse(JSON.stringify(body.Orders.slice(0, count))));
       assert.doesNotMatch(JSON.stringify(result), /cursor-secret|access-secret|https:|NextToken/);
       if (outcome.error) assert.deepEqual(Object.keys(outcome.error), ['code', 'phase', 'httpStatus']);
     }
+    const contracts = Array.from({ length: 6 }, (_, index) => ({ account: `A${index + 1}`, live: index % 2 === 0 }));
+    globals.lib.ts.send = async ({ endpoint }) => ({
+      Orders: [{ ...row, AccountID: endpoint[2], OrderID: `O-${endpoint[2]}`, Status: endpoint[2] === 'A6' ? undefined : row.Status }],
+    });
+    const mixed = JSON.parse(JSON.stringify(await api.method({ ...input, contracts, orders: [] })));
+    assert.equal(mixed.complete, false);
+    assert.deepEqual(
+      mixed.outcomes.map(({ state }) => state),
+      [...Array(5).fill('complete'), 'error'],
+    );
+    assert.ok(
+      mixed.outcomes.every(
+        ({ account, live, source }, index) =>
+          account === contracts[index].account && live === contracts[index].live && source === (historical ? 'historical' : 'current'),
+      ),
+    );
+    assert.deepEqual(
+      mixed.outcomes.flatMap(({ orders }) => orders.map(({ OrderID }) => OrderID)),
+      ['O-A1', 'O-A2', 'O-A3', 'O-A4', 'O-A5'],
+    );
+    globals.lib.ts.send = async () => response;
+    response = { Orders: invalidRows };
+    assert.deepEqual(
+      JSON.parse(JSON.stringify(await api.method({ ...input, withOutcomes: false }))),
+      JSON.parse(JSON.stringify(invalidRows)),
+    );
     response = {};
     assert.deepEqual(JSON.parse(JSON.stringify(await api.method({ ...input, orders: [], withOutcomes: 'true' }))), []);
   }

@@ -118,22 +118,99 @@ async ({
       if (withOutcomes === true) {
         const record = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
         const text = (value) => typeof value === 'string' && value.trim().length > 0;
-        const seen = new Set();
+        const numeric = (value) =>
+          (typeof value === 'number' || (text(value) && /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value))) &&
+          Number.isFinite(Number(value));
+        const quantity = (value) => numeric(value) && Number(value) >= 0;
+        const timestamp = (value) =>
+          text(value) &&
+          /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) &&
+          Number.isFinite(Date.parse(value));
+        // Broker Status enum, excluding OTHER (explicitly unmapped upstream).
+        const statuses = new Set([
+          'ACK',
+          'ASS',
+          'BRC',
+          'BRF',
+          'BRO',
+          'CHG',
+          'CND',
+          'COR',
+          'DIS',
+          'DOA',
+          'DON',
+          'ECN',
+          'EXE',
+          'FPR',
+          'LAT',
+          'OPN',
+          'OSO',
+          'PLA',
+          'REC',
+          'RJC',
+          'RPD',
+          'RSN',
+          'STP',
+          'STT',
+          'SUS',
+          'UCN',
+          'CAN',
+          'EXP',
+          'OUT',
+          'RJR',
+          'SCN',
+          'TSC',
+          'UCH',
+          'REJ',
+          'FLL',
+          'FLP',
+        ]);
+        const fills = new Set(['FLL', 'FLP', 'FPR']);
+        const assets = new Set(['STOCK', 'STOCKOPTION', 'FUTURE', 'FUTUREOPTION', 'FOREX', 'CURRENCYOPTION', 'INDEX', 'INDEXOPTION']);
+        const counts = new Map();
+        if (Array.isArray(response.Orders)) {
+          for (const order of response.Orders) {
+            if (record(order) && order.AccountID === accountId && text(order.OrderID)) {
+              counts.set(order.OrderID, (counts.get(order.OrderID) ?? 0) + 1);
+            }
+          }
+        }
         validatedOrders = Array.isArray(response.Orders)
-          ? response.Orders.filter((order) => {
-              const valid =
+          ? response.Orders.filter(
+              (order) =>
                 record(order) &&
                 text(order.OrderID) &&
                 order.AccountID === accountId &&
                 (!exact || orderIds.includes(order.OrderID)) &&
-                !seen.has(order.OrderID) &&
+                counts.get(order.OrderID) === 1 &&
                 order.Error === undefined &&
+                statuses.has(order.Status) &&
+                ['Market', 'Limit', 'StopMarket', 'StopLimit'].includes(order.OrderType) &&
+                text(order.Currency) &&
+                text(order.Duration) &&
+                timestamp(order.OpenedDateTime) &&
+                // Open orders need no close time; a terminal fill must have one.
+                (order.ClosedDateTime === undefined
+                  ? !['FLL', 'FLP'].includes(order.Status)
+                  : timestamp(order.ClosedDateTime) && Date.parse(order.ClosedDateTime) >= Date.parse(order.OpenedDateTime)) &&
+                ['FilledPrice', 'LimitPrice', 'StopPrice'].every((field) => order[field] === undefined || numeric(order[field])) &&
                 Array.isArray(order.Legs) &&
                 order.Legs.length > 0 &&
-                order.Legs.every((leg) => record(leg) && text(leg.Symbol));
-              if (valid) seen.add(order.OrderID);
-              return valid;
-            })
+                order.Legs.every(
+                  (leg) =>
+                    record(leg) &&
+                    text(leg.Symbol) &&
+                    ['Buy', 'Sell', 'SellShort', 'BuyToCover'].includes(leg.BuyOrSell) &&
+                    assets.has(leg.AssetType) &&
+                    quantity(leg.QuantityOrdered) &&
+                    (leg.ExecQuantity === undefined
+                      ? !fills.has(order.Status)
+                      : quantity(leg.ExecQuantity) && Number(leg.ExecQuantity) <= Number(leg.QuantityOrdered)) &&
+                    (leg.QuantityRemaining === undefined || quantity(leg.QuantityRemaining)) &&
+                    (leg.ExecutionPrice === undefined || numeric(leg.ExecutionPrice)),
+                ) &&
+                (!fills.has(order.Status) || order.Legs.some((leg) => Number(leg.ExecQuantity) > 0)),
+            )
           : [];
         const errorsValid =
           response.Errors === undefined ||
